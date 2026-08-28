@@ -134,17 +134,24 @@ class DisplayConfiguration:
 class Sdl2ProjectorOutput:
     """Present the projector surface in a separate Pygame window."""
 
-    def __init__(self, projector_resolution: Resolution) -> None:
+    def __init__(self, projector_resolution: Resolution, display_index: int = 1) -> None:
         from pygame._sdl2 import video
 
+        if (
+            not isinstance(display_index, int)
+            or isinstance(display_index, bool)
+            or display_index < 0
+        ):
+            raise ValueError('display_index must be a non-negative integer')
+        centred_position = video.WINDOWPOS_CENTERED + display_index
         window = video.Window(
             'MultiVision Projector',
             size=tuple(projector_resolution),
-            position=video.WINDOWPOS_UNDEFINED,
+            position=(centred_position, centred_position),
             borderless=True,
         )
         try:
-            renderer = video.Renderer.from_window(window)
+            renderer = video.Renderer(window)
         except BaseException:  # noqa: BLE001 (Release a window if renderer setup fails).
             try:
                 window.destroy()
@@ -201,7 +208,7 @@ class ProjectorRenderer:
         """Draw the known pattern in projector-native pixels only."""
         if not isinstance(pattern, CalibrationPattern):
             raise TypeError('pattern must be CalibrationPattern')
-        self.clear(surface)
+        surface.fill(WHITE)
         for marker in pattern.markers:
             marker_width = max(1, round(marker.bounds.right - marker.bounds.left))
             marker_height = max(1, round(marker.bounds.bottom - marker.bounds.top))
@@ -784,7 +791,9 @@ def _make_projector_output(
 ) -> ProjectorOutput | None:
     if not isinstance(pygame_module, types.ModuleType):
         return None
-    return Sdl2ProjectorOutput(configuration.projector_resolution)
+    display_count = pygame_module.display.get_num_displays()
+    display_index = min(1, max(0, display_count - 1))
+    return Sdl2ProjectorOutput(configuration.projector_resolution, display_index)
 
 
 def _frame_to_surface(frame: Frame, pygame_module: Any) -> Any:

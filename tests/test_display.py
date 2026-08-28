@@ -356,8 +356,7 @@ class DisplayTest(unittest.TestCase):
                 self.destroyed = True
 
         class FailingRenderer:
-            @classmethod
-            def from_window(cls, _window: FakeWindow) -> object:
+            def __init__(self, _window: FakeWindow) -> None:
                 raise RuntimeError('temporary renderer failure')
 
         window = FakeWindow()
@@ -369,6 +368,34 @@ class DisplayTest(unittest.TestCase):
                 Sdl2ProjectorOutput(Resolution(1200, 800))
 
         assert window.destroyed, f'{window.destroyed=}'
+
+    def test_projector_window_targets_the_second_display(self) -> None:
+        from pygame._sdl2 import video
+
+        class FakeWindow:
+            def destroy(self) -> None:
+                return None
+
+        window_arguments: list[dict[str, object]] = []
+
+        def make_window(*_args: object, **kwargs: object) -> FakeWindow:
+            window_arguments.append(kwargs)
+            return FakeWindow()
+
+        class FakeRenderer:
+            def __init__(self, _window: FakeWindow) -> None:
+                return None
+
+        with (
+            patch.object(video, 'Window', side_effect=make_window),
+            patch.object(video, 'Renderer', FakeRenderer),
+        ):
+            Sdl2ProjectorOutput(Resolution(1200, 800))
+
+        assert window_arguments[0]['position'] == (
+            video.WINDOWPOS_CENTERED + 1,
+            video.WINDOWPOS_CENTERED + 1,
+        ), f'{window_arguments=}'
 
     def test_early_initialisation_failure_shuts_down_injected_projector(self) -> None:
         pygame_module = FakePygame()
@@ -462,7 +489,7 @@ class DisplayTest(unittest.TestCase):
         )
 
         assert len(marker_calls) == len(pattern.markers), f'{marker_calls=}'
-        assert projector_surface.fills == [(0, 0, 0)], f'{projector_surface.fills=}'
+        assert projector_surface.fills == [(235, 235, 235)], f'{projector_surface.fills=}'
         assert len(projector_surface.blits) == len(pattern.markers), f'{projector_surface.blits=}'
         assert pattern == build_calibration_pattern(
             Resolution(1200, 800),

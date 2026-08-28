@@ -20,6 +20,7 @@ _STABLE_ID_KEYS = (
     'spcamera_device_unique_id',
     'spcamera_device_uid',
     'spcamera_unique_id',
+    'spcamera_unique-id',
     'device_unique_id',
     'device_uid',
     'unique_id',
@@ -87,6 +88,9 @@ class MacOSDeviceDiscovery:
 
         devices: list[DeviceInfo] = []
         capture_index_resolver = self._capture_index_resolver
+        capture_indices: dict[str, int] | None = None
+        if capture_index_resolver is _resolve_avfoundation_capture_index:
+            capture_indices = _resolve_avfoundation_capture_indices()
         for profiler_index, entry in enumerate(
             _system_camera_metadata(self.command_runner),
         ):
@@ -97,7 +101,15 @@ class MacOSDeviceDiscovery:
             capture_index = profiler_index
             is_available = True
             error_message: str | None = None
-            if capture_index_resolver is not None:
+            if capture_indices is not None:
+                capture_index = capture_indices.get(device_id)
+                if capture_index is None:
+                    is_available = False
+                    error_message = (
+                        f'Could not resolve stable device ID {device_id!r} '
+                        'to an AVFoundation capture index'
+                    )
+            elif capture_index_resolver is not None:
                 capture_index = capture_index_resolver(device_id)
                 if capture_index is None:
                     is_available = False
@@ -151,7 +163,7 @@ class PlatformDeviceDiscovery:
         return self._macos_discovery.discover_devices()
 
 
-def _resolve_avfoundation_capture_index(device_id: str) -> int | None:
+def _resolve_avfoundation_capture_indices() -> dict[str, int]:
     try:
         import AVFoundation
     except ImportError as ex:
@@ -170,18 +182,20 @@ def _resolve_avfoundation_capture_index(device_id: str) -> int | None:
     except Exception as ex:  # noqa: BLE001 (AVFoundation is a hardware boundary).
         raise HardwareError('Could not enumerate AVFoundation camera devices') from ex
 
-    matching_index: int | None = None
+    capture_indices: dict[str, int] = {}
     for capture_index, device in enumerate(devices):
         get_unique_id = getattr(device, 'uniqueID', None)
         unique_id = get_unique_id() if callable(get_unique_id) else None
         if not isinstance(unique_id, str) or len(unique_id) == 0:
             continue
-        if unique_id != device_id:
-            continue
-        if matching_index is not None:
-            raise HardwareError(f'AVFoundation returned duplicate camera ID {device_id!r}')
-        matching_index = capture_index
-    return matching_index
+        if unique_id in capture_indices:
+            raise HardwareError(f'AVFoundation returned duplicate camera ID {unique_id!r}')
+        capture_indices[unique_id] = capture_index
+    return capture_indices
+
+
+def _resolve_avfoundation_capture_index(device_id: str) -> int | None:
+    return _resolve_avfoundation_capture_indices().get(device_id)
 
 
 def _group_discovered_devices(

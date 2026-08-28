@@ -262,6 +262,59 @@ class PackageTest(unittest.TestCase):
         assert devices[1].is_stable_id is False, f'{devices=}'
         assert [device.capture_index for device in devices] == [0, 1]
 
+    def test_discovery_accepts_system_profiler_hyphenated_unique_ids(self) -> None:
+        profiler_data = {
+            'SPCameraDataType': [
+                {
+                    '_name': 'GENERAL WEBCAM',
+                    'spcamera_unique-id': 'uvc-camera-id',
+                },
+            ],
+        }
+        completed_process = type(
+            'CompletedProcess',
+            (),
+            {'returncode': 0, 'stdout': json.dumps(profiler_data)},
+        )()
+
+        discovery = MacOSDeviceDiscovery(
+            command_runner=lambda *args, **kwargs: completed_process,
+            platform_name='darwin',
+        )
+
+        devices = discovery.discover_devices()
+
+        assert devices[0].device_id == 'uvc-camera-id', f'{devices=}'
+        assert devices[0].is_stable_id is True, f'{devices=}'
+
+    def test_discovery_resolves_native_indexes_from_one_avfoundation_snapshot(self) -> None:
+        profiler_data = {
+            'SPCameraDataType': [
+                {'_name': 'Camera A', 'spcamera_unique-id': 'device-a'},
+                {'_name': 'Camera B', 'spcamera_unique-id': 'device-b'},
+            ],
+        }
+        completed_process = type(
+            'CompletedProcess',
+            (),
+            {'returncode': 0, 'stdout': json.dumps(profiler_data)},
+        )()
+
+        with (
+            patch(
+                'multivision.discovery.subprocess.run',
+                return_value=completed_process,
+            ),
+            patch(
+                'multivision.discovery._resolve_avfoundation_capture_indices',
+                return_value={'device-a': 1, 'device-b': 0},
+            ) as resolve_capture_indices,
+        ):
+            devices = MacOSDeviceDiscovery(platform_name='darwin').discover_devices()
+
+        assert [device.capture_index for device in devices] == [1, 0], f'{devices=}'
+        resolve_capture_indices.assert_called_once_with()
+
     def test_discovery_uses_native_index_resolution_for_real_commands(self) -> None:
         profiler_data = {
             'SPCameraDataType': [

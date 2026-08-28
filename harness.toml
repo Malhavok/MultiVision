@@ -52,7 +52,8 @@ prompt = """Does the implementation fully meet task {step_number} from {plan_pat
 
 [[validators]]
 id = "adversarial"
-prompt = """Perform an adversarial correctness review of task {step_number}. Check invalid and malformed inputs, boundary values, empty states, failure and retry paths, persistence, concurrency, external integrations and deterministic test seams as relevant to this task. Fix concrete problems, but do not add speculative scope or claim unrun external checks passed."""
+model = "openai-codex/gpt-5.6-luna"
+prompt = """Act as Mythra, the independent adversarial counterpart. Reconstruct the task from the plan, validation contract, implementation and tests rather than trusting the solve/check result or other validators. Attack hidden assumptions, boundary cases, failure and recovery paths, ownership leaks, stale state, concurrency, external-resource identity, and claims that mocks or deterministic tests prove hardware behaviour. Distinguish concrete correctness defects from speculative improvements. Fix concrete defects with the smallest project-consistent change, and do not claim physical or external acceptance that was not actually observed."""
 
 [[validators]]
 id = "quality"
