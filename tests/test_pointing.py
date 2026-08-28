@@ -1,0 +1,493 @@
+import threading
+import unittest
+from types import SimpleNamespace
+
+from multivision.display import DisplayConfiguration, PygameDisplayRuntime
+from multivision.errors import (
+    CameraUnavailableError,
+    InvalidCalibrationStateError,
+    InvalidHomographyError,
+    PointOutsideCalibratedRegionError,
+    PointOutsidePreviewError,
+    PointOutsideProjectorError,
+)
+from multivision.geometry import CoordinateBounds, Point2D, PreviewTransform
+from multivision.service import PointOverlayService, RedCircleOverlay
+from multivision.types import CalibrationStatus, CameraStatus, Frame, Resolution, RuntimeStatus
+
+
+class FakeCameraRuntime:
+    def __init__(self, runtime_status: RuntimeStatus = RuntimeStatus.AVAILABLE) -> None:
+        self.status = CameraStatus(
+            'overhead',
+            'device-a',
+            runtime_status,
+            CalibrationStatus.CALIBRATED,
+            Resolution(800, 600),
+        )
+
+    def get_status(self, logical_name: str) -> CameraStatus:
+        assert logical_name == 'overhead'
+        return self.status
+
+    def get_statuses(self) -> list[CameraStatus]:
+        return [self.status]
+
+    def snapshot(self, logical_name: str) -> Frame:
+        assert logical_name == 'overhead'
+        return Frame('frame', 1, 0.0)
+
+
+class FakeCalibrationRegistry:
+    def __init__(self, status: CalibrationStatus = CalibrationStatus.CALIBRATED) -> None:
+        self.status = status
+        self.calibrations = {
+            'device-a': SimpleNamespace(
+                camera_resolution=Resolution(800, 600),
+                projector_resolution=Resolution(1000, 700),
+            ),
+        }
+        self.camera_points: list[Point2D] = []
+        self.projected_point = Point2D(300, 200)
+
+    def get_status(
+        self,
+        camera_id: str,
+        camera_resolution: Resolution,
+        projector_resolution: Resolution,
+    ) -> CalibrationStatus:
+        assert camera_id == 'device-a'
+        record = self.calibrations.get(camera_id)
+        if record is None:
+            return CalibrationStatus.UNCALIBRATED
+        if record.camera_resolution != camera_resolution:
+            return CalibrationStatus.STALE
+        if record.projector_resolution != projector_resolution:
+            return CalibrationStatus.STALE
+        return self.status
+
+    def get_status_error_code(
+        self,
+        camera_id: str,
+        camera_resolution: Resolution,
+        projector_resolution: Resolution,
+    ) -> str:
+        record = self.calibrations.get(camera_id)
+        if record is None:
+            return 'CALIBRATION_UNCALIBRATED'
+        if record.camera_resolution != camera_resolution:
+            return 'CAMERA_RESOLUTION_CHANGED'
+        if record.projector_resolution != projector_resolution:
+            return 'PROJECTOR_RESOLUTION_CHANGED'
+        return {
+            CalibrationStatus.UNCALIBRATED: 'CALIBRATION_UNCALIBRATED',
+            CalibrationStatus.UNVERIFIED: 'CALIBRATION_UNVERIFIED',
+            CalibrationStatus.STALE: 'CALIBRATION_STALE',
+        }[self.status]
+
+    def project_camera_to_projector(
+        self,
+        _camera_id: str,
+        point: Point2D,
+        camera_resolution: Resolution,
+        projector_resolution: Resolution,
+    ) -> Point2D:
+        assert camera_resolution == Resolution(800, 600)
+        assert projector_resolution == Resolution(1000, 700)
+        self.camera_points.append(point)
+        return self.projected_point
+
+
+class FakeDisplayService:
+    def __init__(
+        self,
+        camera_runtime: FakeCameraRuntime,
+        point_service: PointOverlayService,
+    ) -> None:
+        self.camera_runtime = camera_runtime
+        self.point_service = point_service
+
+    @property
+    def overlay(self) -> RedCircleOverlay | None:
+        return self.point_service.overlay
+
+    @property
+    def calibration_pattern_visible(self) -> bool:
+        return False
+
+    def get_camera_statuses(self) -> list[CameraStatus]:
+        return self.camera_runtime.get_statuses()
+
+    def get_calibration_metrics(self, _logical_name: str) -> None:
+        return None
+
+    def snapshot(self, logical_name: str) -> Frame:
+        return self.camera_runtime.snapshot(logical_name)
+
+    def point_from_preview(
+        self,
+        logical_name: str,
+        preview_point: Point2D,
+        preview_transform: PreviewTransform,
+    ) -> RedCircleOverlay:
+        return self.point_service.point_from_preview(
+            logical_name,
+            preview_point,
+            preview_transform,
+        )
+
+
+class BlockingCalibrationRegistry(FakeCalibrationRegistry):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_projection_started = threading.Event()
+        self.release_first_projection = threading.Event()
+        self.projection_count = 0
+
+    def project_camera_to_projector(
+        self,
+        camera_id: str,
+        point: Point2D,
+        camera_resolution: Resolution,
+        projector_resolution: Resolution,
+    ) -> Point2D:
+        self.projection_count += 1
+        projection_number = self.projection_count
+        if projection_number == 1:
+            self.first_projection_started.set()
+            assert self.release_first_projection.wait(1), f'{self.release_first_projection=}'
+        super().project_camera_to_projector(
+            camera_id,
+            point,
+            camera_resolution,
+            projector_resolution,
+        )
+        return Point2D(300 + projection_number, 200 + projection_number)
+
+
+class PointingTest(unittest.TestCase):
+    def test_preview_and_native_callers_share_replacement_and_clear_path(self) -> None:
+        camera_runtime = FakeCameraRuntime()
+        calibration_registry = FakeCalibrationRegistry()
+        service = PointOverlayService(
+            camera_runtime,
+            calibration_registry,
+            Resolution(1000, 700),
+        )
+        preview_transform = PreviewTransform(
+            Resolution(400, 300),
+            Resolution(800, 600),
+            0.5,
+            CoordinateBounds(0.0, 0.0, 400.0, 300.0),
+        )
+
+        first_overlay = service.point_from_camera('overhead', (10, 20))
+        second_overlay = service.point_from_preview(
+            'overhead',
+            (100, 100),
+            preview_transform,
+        )
+
+        assert first_overlay.projector_point == Point2D(300, 200)
+        assert second_overlay.camera_point == Point2D(200, 200)
+        assert service.overlay is second_overlay
+        assert calibration_registry.camera_points == [
+            Point2D(10, 20),
+            Point2D(200, 200),
+        ]
+        service.clear_overlay()
+        assert service.overlay is None
+
+    def test_preview_padding_is_rejected_without_replacing_overlay(self) -> None:
+        calibration_registry = FakeCalibrationRegistry()
+        service = PointOverlayService(
+            FakeCameraRuntime(),
+            calibration_registry,
+            Resolution(1000, 700),
+        )
+        existing_overlay = service.point_from_camera('overhead', (10, 20))
+        transform = PreviewTransform(
+            Resolution(500, 500),
+            Resolution(800, 600),
+            0.625,
+            CoordinateBounds(0.0, 62.5, 500.0, 437.5),
+        )
+
+        with self.assertRaises(PointOutsidePreviewError) as context:
+            service.point_from_preview('overhead', (20, 20), transform)
+
+        assert context.exception.code == 'POINT_OUTSIDE_PREVIEW'
+        assert service.overlay is existing_overlay
+        assert len(calibration_registry.camera_points) == 1
+
+    def test_every_calibration_failure_is_explicit(self) -> None:
+        for calibration_status, expected_code in [
+            (CalibrationStatus.UNCALIBRATED, 'CALIBRATION_UNCALIBRATED'),
+            (CalibrationStatus.UNVERIFIED, 'CALIBRATION_UNVERIFIED'),
+            (CalibrationStatus.STALE, 'CALIBRATION_STALE'),
+        ]:
+            with self.subTest(calibration_status=calibration_status):
+                service = PointOverlayService(
+                    FakeCameraRuntime(),
+                    FakeCalibrationRegistry(calibration_status),
+                    Resolution(1000, 700),
+                )
+                with self.assertRaises(InvalidCalibrationStateError) as context:
+                    service.point_from_camera('overhead', (10, 20))
+                assert context.exception.code == expected_code
+                assert service.overlay is None
+
+        unavailable_service = PointOverlayService(
+            FakeCameraRuntime(RuntimeStatus.UNAVAILABLE),
+            FakeCalibrationRegistry(),
+            Resolution(1000, 700),
+        )
+        with self.assertRaises(CameraUnavailableError) as context:
+            unavailable_service.point_from_camera('overhead', (10, 20))
+        assert context.exception.code == 'CAMERA_UNAVAILABLE'
+
+    def test_malformed_native_points_and_preview_transforms_are_rejected(self) -> None:
+        service = PointOverlayService(
+            FakeCameraRuntime(),
+            FakeCalibrationRegistry(),
+            Resolution(1000, 700),
+        )
+        with self.assertRaises(ValueError):
+            service.point_from_camera('overhead', (1, 2, 3))
+        with self.assertRaises(ValueError):
+            service.point_from_camera('overhead', (float('inf'), 2))
+        with self.assertRaises(PointOutsideCalibratedRegionError) as context:
+            service.point_from_camera('overhead', (-1, 20))
+        assert context.exception.code == 'POINT_OUTSIDE_CALIBRATED_REGION'
+
+        malformed_transform = PreviewTransform(
+            Resolution(400, 300),
+            Resolution(800, 600),
+            0.0,
+            CoordinateBounds(0.0, 0.0, 400.0, 300.0),
+        )
+        with self.assertRaises(ValueError):
+            service.point_from_preview('overhead', (10, 20), malformed_transform)
+
+    def test_invalid_status_identity_and_metadata_fail_closed(self) -> None:
+        camera_runtime = FakeCameraRuntime()
+        camera_runtime.status = CameraStatus(
+            'side-left',
+            'device-a',
+            RuntimeStatus.AVAILABLE,
+            CalibrationStatus.CALIBRATED,
+            Resolution(800, 600),
+        )
+        service = PointOverlayService(
+            camera_runtime,
+            FakeCalibrationRegistry(),
+            Resolution(1000, 700),
+        )
+        with self.assertRaises(CameraUnavailableError):
+            service.point_from_camera('overhead', (10, 20))
+
+        camera_runtime.status = CameraStatus(
+            'overhead',
+            '',
+            RuntimeStatus.AVAILABLE,
+            CalibrationStatus.CALIBRATED,
+            Resolution(800, 600),
+        )
+        with self.assertRaises(CameraUnavailableError):
+            service.point_from_camera('overhead', (10, 20))
+
+    def test_concurrent_points_are_serialised_and_latest_success_replaces(self) -> None:
+        registry = BlockingCalibrationRegistry()
+        service = PointOverlayService(
+            FakeCameraRuntime(),
+            registry,
+            Resolution(1000, 700),
+        )
+        errors: list[BaseException] = []
+
+        def point_first() -> None:
+            try:
+                service.point_from_camera('overhead', (10, 20))
+            except BaseException as ex:  # noqa: BLE001 (test thread cleanup).
+                errors.append(ex)
+
+        def point_second() -> None:
+            try:
+                service.point_from_camera('overhead', (30, 40))
+            except BaseException as ex:  # noqa: BLE001 (test thread cleanup).
+                errors.append(ex)
+
+        first_thread = threading.Thread(target=point_first)
+        second_thread = threading.Thread(target=point_second)
+        first_thread.start()
+        assert registry.first_projection_started.wait(1), f'{registry.first_projection_started=}'
+        second_thread.start()
+        assert not registry.release_first_projection.is_set()
+        registry.release_first_projection.set()
+        first_thread.join(2)
+        second_thread.join(2)
+
+        assert not first_thread.is_alive(), f'{first_thread=}'
+        assert not second_thread.is_alive(), f'{second_thread=}'
+        assert errors == [], f'{errors=}'
+        assert registry.projection_count == 2, f'{registry.projection_count=}'
+        assert service.overlay is not None
+        assert service.overlay.projector_point == Point2D(302, 202)
+
+    def test_resolution_homography_region_and_projector_failures_are_explicit(self) -> None:
+        camera_runtime = FakeCameraRuntime()
+        registry = FakeCalibrationRegistry()
+        registry.calibrations['device-a'].camera_resolution = Resolution(640, 480)
+        service = PointOverlayService(camera_runtime, registry, Resolution(1000, 700))
+        with self.assertRaises(InvalidCalibrationStateError) as context:
+            service.point_from_camera('overhead', (10, 20))
+        assert context.exception.code == 'CAMERA_RESOLUTION_CHANGED'
+
+        registry = FakeCalibrationRegistry()
+        registry.calibrations['device-a'].projector_resolution = Resolution(900, 700)
+        service = PointOverlayService(camera_runtime, registry, Resolution(1000, 700))
+        with self.assertRaises(InvalidCalibrationStateError) as context:
+            service.point_from_camera('overhead', (10, 20))
+        assert context.exception.code == 'PROJECTOR_RESOLUTION_CHANGED'
+
+        registry = FakeCalibrationRegistry()
+        registry.project_camera_to_projector = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PointOutsideCalibratedRegionError('outside region'),
+        )
+        with self.assertRaises(PointOutsideCalibratedRegionError) as context:
+            PointOverlayService(camera_runtime, registry, Resolution(1000, 700)).point_from_camera(
+                'overhead',
+                (10, 20),
+            )
+        assert context.exception.code == 'POINT_OUTSIDE_CALIBRATED_REGION'
+
+        registry = FakeCalibrationRegistry()
+        registry.projected_point = Point2D(float('nan'), 20)
+        with self.assertRaises(InvalidHomographyError):
+            PointOverlayService(camera_runtime, registry, Resolution(1000, 700)).point_from_camera(
+                'overhead',
+                (10, 20),
+            )
+
+        registry = FakeCalibrationRegistry()
+        registry.projected_point = Point2D(1000, 20)
+        with self.assertRaises(PointOutsideProjectorError):
+            PointOverlayService(camera_runtime, registry, Resolution(1000, 700)).point_from_camera(
+                'overhead',
+                (10, 20),
+            )
+
+
+class FakePygame:
+    MOUSEBUTTONDOWN = 3
+    QUIT = 1
+    KEYDOWN = 2
+    K_ESCAPE = 27
+    def __init__(self) -> None:
+        self.events: list[object] = []
+        self.circles: list[tuple[object, object, object, object]] = []
+        self.window_surface = SimpleNamespace(fill=lambda _colour: None, blit=lambda *_args: None)
+        self.Surface = lambda _size: SimpleNamespace(
+            fill=lambda _colour: None,
+            blit=lambda *_args: None,
+        )
+        self.display = SimpleNamespace(
+            set_mode=lambda _size: self.window_surface,
+            set_caption=lambda _caption: None,
+            flip=lambda: None,
+        )
+        self.event = SimpleNamespace(get=lambda: self.events)
+        self.font = SimpleNamespace(
+            Font=lambda _name, _size: SimpleNamespace(
+                render=lambda *_args: self.window_surface,
+            ),
+        )
+        self.time = SimpleNamespace(Clock=lambda: SimpleNamespace(tick=lambda _rate: None))
+        self.draw = SimpleNamespace(
+            rect=lambda *_args: None,
+            circle=lambda *args: self.circles.append(args),
+        )
+        self.transform = SimpleNamespace(smoothscale=lambda *_args: self.window_surface)
+
+    def init(self) -> None:
+        pass
+
+    def quit(self) -> None:
+        pass
+
+
+class DisplayPointingTest(unittest.TestCase):
+    def test_gui_click_failure_is_reported_without_stopping_event_loop(self) -> None:
+        pygame_module = FakePygame()
+        camera_runtime = FakeCameraRuntime(RuntimeStatus.UNAVAILABLE)
+        service = PointOverlayService(
+            camera_runtime,
+            FakeCalibrationRegistry(),
+            Resolution(1000, 700),
+        )
+        display_runtime = PygameDisplayRuntime(
+            FakeDisplayService(camera_runtime, service),
+            DisplayConfiguration(
+                window_resolution=Resolution(500, 400),
+                projector_resolution=Resolution(1000, 700),
+            ),
+            pygame_module=pygame_module,
+        )
+
+        display_runtime.render_once()
+        layout = display_runtime.preview_layouts['overhead']
+        pygame_module.events.append(
+            SimpleNamespace(
+                type=pygame_module.MOUSEBUTTONDOWN,
+                button=1,
+                pos=(
+                    round(layout.preview_bounds.left + 100),
+                    round(layout.preview_bounds.top + 100),
+                ),
+            ),
+        )
+
+        display_runtime.process_events()
+
+        assert display_runtime.last_point_error is not None
+        assert display_runtime.last_point_error.startswith('CAMERA_UNAVAILABLE:')
+        assert service.overlay is None
+
+    def test_gui_click_uses_shared_service_and_renders_overlay(self) -> None:
+        pygame_module = FakePygame()
+        camera_runtime = FakeCameraRuntime()
+        registry = FakeCalibrationRegistry()
+        service = PointOverlayService(camera_runtime, registry, Resolution(1000, 700))
+        display_runtime = PygameDisplayRuntime(
+            FakeDisplayService(camera_runtime, service),
+            DisplayConfiguration(
+                window_resolution=Resolution(500, 400),
+                projector_resolution=Resolution(1000, 700),
+            ),
+            pygame_module=pygame_module,
+            frame_surface_converter=lambda _frame, _pygame: pygame_module.window_surface,
+        )
+
+        display_runtime.render_once()
+        layout = display_runtime.preview_layouts['overhead']
+        assert layout.preview_transform is not None
+        click_x = round(layout.preview_bounds.left + 100)
+        click_y = round(layout.preview_bounds.top + 100)
+        pygame_module.events.append(
+            SimpleNamespace(
+                type=pygame_module.MOUSEBUTTONDOWN,
+                button=1,
+                pos=(click_x, click_y),
+            ),
+        )
+        display_runtime.process_events()
+        display_runtime.render_once()
+
+        assert service.overlay is not None
+        assert service.overlay.logical_name == 'overhead'
+        assert len(pygame_module.circles) == 1
+        assert pygame_module.circles[0][2] == (300, 200)
+
+
+if __name__ == '__main__':
+    unittest.main()

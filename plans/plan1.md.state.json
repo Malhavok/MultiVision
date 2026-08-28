@@ -1,0 +1,124 @@
+{
+  "steps": {
+    "1": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "2": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "3": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "4": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "5": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "6": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "7": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "8": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "9": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "10": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "11": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "12": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "13": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "14": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    },
+    "15": {
+      "done": true,
+      "validators": [
+        "complete",
+        "adversarial",
+        "quality"
+      ]
+    }
+  }
+}

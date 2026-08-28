@@ -1,0 +1,5 @@
+#!/bin/sh
+
+project_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$project_root" || exit 1
+exec "$project_root/.venv/bin/python" -m multivision.cli "$@"

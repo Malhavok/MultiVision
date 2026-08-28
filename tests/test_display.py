@@ -1,0 +1,474 @@
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from multivision.calibration import CalibrationMetrics
+from multivision.display import (
+    DisplayConfiguration,
+    PygameDisplayRuntime,
+    ProjectorRenderer,
+    Sdl2ProjectorOutput,
+    build_camera_preview_layouts,
+)
+from multivision.geometry import CoordinateBounds
+from multivision.pattern import build_calibration_pattern
+from multivision.types import (
+    CalibrationStatus,
+    CameraStatus,
+    Frame,
+    Resolution,
+    RuntimeStatus,
+)
+
+
+class FakeSurface:
+    def __init__(self, size: tuple[int, int]) -> None:
+        self.size = size
+        self.fills: list[tuple[int, int, int]] = []
+        self.blits: list[tuple[object, tuple[int, int]]] = []
+
+    def fill(self, colour: tuple[int, int, int]) -> None:
+        self.fills.append(colour)
+
+    def blit(self, surface: object, position: tuple[int, int]) -> None:
+        self.blits.append((surface, position))
+
+
+class FakeProjectorOutput:
+    def __init__(self) -> None:
+        self.presented_surfaces: list[FakeSurface] = []
+        self.shutdown_called = False
+
+    def present(self, surface: FakeSurface) -> None:
+        self.presented_surfaces.append(surface)
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+
+
+class FakeFont:
+    def __init__(self, rendered_text: list[str]) -> None:
+        self.rendered_text = rendered_text
+
+    def render(
+        self,
+        text: str,
+        _antialias: bool,
+        _colour: tuple[int, int, int],
+    ) -> FakeSurface:
+        self.rendered_text.append(text)
+        return FakeSurface((1, 1))
+
+
+class FakePygame:
+    Surface = FakeSurface
+    QUIT = 1
+    KEYDOWN = 2
+    K_ESCAPE = 27
+
+    def __init__(self) -> None:
+        self.window_surface = FakeSurface((1280, 720))
+        self.rendered_text: list[str] = []
+        self.display = SimpleNamespace(
+            set_mode=lambda _size: self.window_surface,
+            set_caption=lambda _caption: None,
+            flip=lambda: None,
+        )
+        self.font = SimpleNamespace(
+            Font=lambda _name, _size: FakeFont(self.rendered_text),
+        )
+        self.time = SimpleNamespace(Clock=lambda: SimpleNamespace(tick=lambda _rate: None))
+        self.event = SimpleNamespace(get=lambda: [])
+        self.draw = SimpleNamespace(rect=lambda *_arguments: None)
+        self.transform = SimpleNamespace(
+            smoothscale=lambda _surface, size: FakeSurface(size),
+        )
+        self.initialise_count = 0
+        self.quit_count = 0
+        self.Surface = FakeSurface
+
+    def init(self) -> None:
+        self.initialise_count += 1
+
+    def quit(self) -> None:
+        self.quit_count += 1
+
+
+class FakeCameraRuntime:
+    def __init__(self) -> None:
+        self.statuses = [
+            CameraStatus(
+                'overhead',
+                'overhead-device',
+                RuntimeStatus.AVAILABLE,
+                CalibrationStatus.CALIBRATED,
+                Resolution(1920, 1080),
+            ),
+        ]
+        self.snapshot_count = 0
+        self.open_count = 0
+        self.calibration_metrics: CalibrationMetrics | None = None
+        self.calibration_pattern_visible = False
+        self.overlay = None
+
+    def get_camera_statuses(self) -> list[CameraStatus]:
+        return self.statuses
+
+    def get_calibration_metrics(self, _logical_name: str) -> CalibrationMetrics | None:
+        return self.calibration_metrics
+
+    def point_from_preview(
+        self,
+        _logical_name: str,
+        _preview_point: object,
+        _preview_transform: object,
+    ) -> object:
+        raise AssertionError('pointing is not used by this fake')
+
+    def snapshot(self, logical_name: str) -> Frame:
+        assert logical_name == 'overhead'
+        self.snapshot_count += 1
+        return Frame(f'frame-{self.snapshot_count}', self.snapshot_count, 0.0)
+
+
+class DisplayTest(unittest.TestCase):
+    def test_layout_keeps_native_resolution_out_of_window_geometry(self) -> None:
+        layouts = build_camera_preview_layouts(
+            [
+                CameraStatus(
+                    'overhead',
+                    'device',
+                    RuntimeStatus.AVAILABLE,
+                    CalibrationStatus.UNCALIBRATED,
+                    Resolution(1920, 1080),
+                ),
+            ],
+            Resolution(1000, 700),
+        )
+
+        layout = layouts['overhead']
+        assert layout.preview_transform is not None
+        assert layout.preview_transform.camera_resolution == Resolution(1920, 1080)
+        assert layout.preview_transform.preview_size != Resolution(1920, 1080)
+
+    def test_run_presents_the_projector_surface_and_shuts_it_down(self) -> None:
+        pygame_module = FakePygame()
+        projector_output = FakeProjectorOutput()
+        display_runtime = PygameDisplayRuntime(
+            FakeCameraRuntime(),
+            pygame_module=pygame_module,
+            projector_output=projector_output,
+        )
+
+        display_runtime.run(max_frames=1)
+        display_runtime.shutdown()
+
+        assert len(projector_output.presented_surfaces) == 1
+        assert projector_output.presented_surfaces[0] is not None
+        assert projector_output.shutdown_called
+
+    def test_render_uses_latest_snapshot_without_opening_camera(self) -> None:
+        pygame_module = FakePygame()
+        camera_runtime = FakeCameraRuntime()
+        converted_frames: list[str] = []
+
+        def convert_frame(frame: Frame, _pygame_module: object) -> FakeSurface:
+            converted_frames.append(frame.data)
+            return FakeSurface((1920, 1080))
+
+        calibration_metrics = CalibrationMetrics(9, 36, 34, 34 / 36, 1.2, 3.4, 0.8)
+        camera_runtime.calibration_metrics = calibration_metrics
+        display_runtime = PygameDisplayRuntime(
+            camera_runtime,
+            DisplayConfiguration(
+                window_resolution=Resolution(1000, 700),
+                projector_resolution=Resolution(1200, 800),
+            ),
+            pygame_module=pygame_module,
+            frame_surface_converter=convert_frame,
+        )
+        display_runtime.render_once()
+        display_runtime.render_once()
+
+        assert converted_frames == ['frame-1', 'frame-2'], f'{converted_frames=}'
+        assert camera_runtime.open_count == 0, f'{camera_runtime.open_count=}'
+        assert 'overhead  connection: AVAILABLE' in pygame_module.rendered_text
+        assert 'calibration: CALIBRATED' in pygame_module.rendered_text
+        assert 'native: 1920x1080' in pygame_module.rendered_text
+        assert any(
+            text.startswith('tags: 9  corners: 36  inliers: 34')
+            for text in pygame_module.rendered_text
+        ), f'{pygame_module.rendered_text=}'
+
+        display_runtime.shutdown()
+        assert pygame_module.quit_count == 1, f'{pygame_module.quit_count=}'
+        assert camera_runtime.open_count == 0, f'{camera_runtime.open_count=}'
+
+    def test_layout_order_is_deterministic_and_duplicate_names_are_rejected(self) -> None:
+        statuses = [
+            CameraStatus(
+                'side-left',
+                'left-device',
+                RuntimeStatus.UNAVAILABLE,
+                CalibrationStatus.UNCALIBRATED,
+                Resolution(1280, 720),
+            ),
+            CameraStatus(
+                'overhead',
+                'overhead-device',
+                RuntimeStatus.UNAVAILABLE,
+                CalibrationStatus.UNCALIBRATED,
+                Resolution(1280, 720),
+            ),
+        ]
+        forward_layouts = build_camera_preview_layouts(statuses, Resolution(1000, 700))
+        reverse_layouts = build_camera_preview_layouts(
+            list(reversed(statuses)),
+            Resolution(1000, 700),
+        )
+
+        assert forward_layouts == reverse_layouts, (
+            f'{forward_layouts=}, {reverse_layouts=}'
+        )
+        duplicate_statuses = statuses + [statuses[0]]
+        with self.assertRaises(ValueError):
+            build_camera_preview_layouts(duplicate_statuses, Resolution(1000, 700))
+
+    def test_tiny_window_keeps_preview_bounds_valid(self) -> None:
+        layouts = build_camera_preview_layouts(
+            [
+                CameraStatus(
+                    'overhead',
+                    'device',
+                    RuntimeStatus.UNAVAILABLE,
+                    CalibrationStatus.UNCALIBRATED,
+                    Resolution(1920, 1080),
+                ),
+            ],
+            Resolution(1, 1),
+        )
+
+        preview_bounds = layouts['overhead'].preview_bounds
+        assert preview_bounds.right > preview_bounds.left, f'{preview_bounds=}'
+        assert preview_bounds.bottom > preview_bounds.top, f'{preview_bounds=}'
+
+    def test_malformed_event_does_not_stop_event_processing(self) -> None:
+        pygame_module = FakePygame()
+        pygame_module.event = SimpleNamespace(get=lambda: [SimpleNamespace()])
+        display_runtime = PygameDisplayRuntime(
+            FakeCameraRuntime(),
+            pygame_module=pygame_module,
+        )
+
+        display_runtime.process_events()
+
+    def test_error_status_keeps_the_latest_usable_preview(self) -> None:
+        pygame_module = FakePygame()
+        camera_runtime = FakeCameraRuntime()
+        camera_runtime.statuses[0] = camera_runtime.statuses[0]._replace(
+            runtime_status=RuntimeStatus.ERROR,
+            error_message='temporary read failure',
+        )
+        converted_frames: list[str] = []
+
+        def convert_frame(frame: Frame, _pygame: object) -> FakeSurface:
+            converted_frames.append(frame.data)
+            return FakeSurface((1, 1))
+
+        display_runtime = PygameDisplayRuntime(
+            camera_runtime,
+            pygame_module=pygame_module,
+            frame_surface_converter=convert_frame,
+        )
+
+        display_runtime.render_once()
+
+        assert converted_frames == ['frame-1'], f'{converted_frames=}'
+
+    def test_frame_rendering_failure_is_visible_and_retryable(self) -> None:
+        pygame_module = FakePygame()
+        conversion_count = 0
+
+        def convert_frame(_frame: Frame, _pygame: object) -> FakeSurface:
+            nonlocal conversion_count
+            conversion_count += 1
+            if conversion_count == 1:
+                raise RuntimeError('temporary display failure')
+            return FakeSurface((1, 1))
+
+        display_runtime = PygameDisplayRuntime(
+            FakeCameraRuntime(),
+            pygame_module=pygame_module,
+            frame_surface_converter=convert_frame,
+        )
+
+        display_runtime.render_once()
+        display_runtime.render_once()
+        assert conversion_count == 2, f'{conversion_count=}'
+        assert any(
+            text.startswith('Preview unavailable: temporary display failure')
+            for text in pygame_module.rendered_text
+        ), f'{pygame_module.rendered_text=}'
+
+    def test_projector_rendering_failure_is_visible_and_retryable(self) -> None:
+        pygame_module = FakePygame()
+        pattern = build_calibration_pattern(Resolution(1200, 800))
+        marker_count = 0
+
+        def render_marker(
+            _family: str,
+            _marker_id: int,
+            _pixel_size: int,
+            _pygame_module: object,
+        ) -> FakeSurface:
+            nonlocal marker_count
+            marker_count += 1
+            if marker_count == 1:
+                raise RuntimeError('temporary marker failure')
+            return FakeSurface((_pixel_size, _pixel_size))
+
+        camera_runtime = FakeCameraRuntime()
+        camera_runtime.calibration_pattern_visible = True
+        display_runtime = PygameDisplayRuntime(
+            camera_runtime,
+            DisplayConfiguration(projector_resolution=Resolution(1200, 800)),
+            calibration_pattern=pattern,
+            pygame_module=pygame_module,
+            marker_image_renderer=render_marker,
+        )
+
+        display_runtime.render_once()
+        display_runtime.render_once()
+        assert marker_count == len(pattern.markers) + 1, f'{marker_count=}'
+        assert any(
+            text.startswith('Projector unavailable: temporary marker failure')
+            for text in pygame_module.rendered_text
+        ), f'{pygame_module.rendered_text=}'
+
+    def test_projector_window_is_destroyed_if_renderer_initialisation_fails(self) -> None:
+        from pygame._sdl2 import video
+
+        class FakeWindow:
+            def __init__(self) -> None:
+                self.destroyed = False
+
+            def destroy(self) -> None:
+                self.destroyed = True
+
+        class FailingRenderer:
+            @classmethod
+            def from_window(cls, _window: FakeWindow) -> object:
+                raise RuntimeError('temporary renderer failure')
+
+        window = FakeWindow()
+        with (
+            patch.object(video, 'Window', return_value=window),
+            patch.object(video, 'Renderer', FailingRenderer),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'temporary renderer failure'):
+                Sdl2ProjectorOutput(Resolution(1200, 800))
+
+        assert window.destroyed, f'{window.destroyed=}'
+
+    def test_early_initialisation_failure_shuts_down_injected_projector(self) -> None:
+        pygame_module = FakePygame()
+        projector_output = FakeProjectorOutput()
+
+        def fail_initialisation() -> None:
+            raise RuntimeError('temporary Pygame initialisation failure')
+
+        pygame_module.init = fail_initialisation  # type: ignore[method-assign]
+        display_runtime = PygameDisplayRuntime(
+            FakeCameraRuntime(),
+            pygame_module=pygame_module,
+            projector_output=projector_output,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, 'temporary Pygame initialisation failure'):
+            display_runtime.initialise()
+
+        assert projector_output.shutdown_called, f'{projector_output=}'
+        assert pygame_module.quit_count == 1, f'{pygame_module.quit_count=}'
+
+    def test_initialisation_failure_cleans_up_for_retry(self) -> None:
+        pygame_module = FakePygame()
+        font_call_count = 0
+
+        def make_font(_name: object, _size: int) -> FakeFont:
+            nonlocal font_call_count
+            font_call_count += 1
+            if font_call_count == 1:
+                raise RuntimeError('temporary font failure')
+            return FakeFont(pygame_module.rendered_text)
+
+        pygame_module.font = SimpleNamespace(Font=make_font)
+        display_runtime = PygameDisplayRuntime(
+            FakeCameraRuntime(),
+            pygame_module=pygame_module,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, 'temporary font failure'):
+            display_runtime.initialise()
+        assert not display_runtime.is_running, f'{display_runtime.is_running=}'
+        assert display_runtime.window_surface is None
+        assert display_runtime.projector_surface is None
+        assert pygame_module.quit_count == 1, f'{pygame_module.quit_count=}'
+
+        display_runtime.initialise()
+        assert display_runtime.window_surface is pygame_module.window_surface
+        assert pygame_module.initialise_count == 2, f'{pygame_module.initialise_count=}'
+
+    def test_initialisation_cleans_up_when_interrupted(self) -> None:
+        pygame_module = FakePygame()
+
+        def interrupt_font(_name: object, _size: int) -> FakeFont:
+            raise KeyboardInterrupt()
+
+        pygame_module.font = SimpleNamespace(Font=interrupt_font)
+        display_runtime = PygameDisplayRuntime(
+            FakeCameraRuntime(),
+            pygame_module=pygame_module,
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            display_runtime.initialise()
+
+        assert not display_runtime.is_running, f'{display_runtime.is_running=}'
+        assert display_runtime.window_surface is None
+        assert display_runtime.projector_surface is None
+        assert pygame_module.quit_count == 1, f'{pygame_module.quit_count=}'
+
+    def test_projector_pattern_rendering_is_independent_of_camera_runtime(self) -> None:
+        pygame_module = FakePygame()
+        marker_calls: list[tuple[str, int, int]] = []
+
+        def render_marker(
+            family: str,
+            marker_id: int,
+            pixel_size: int,
+            _pygame_module: object,
+        ) -> FakeSurface:
+            marker_calls.append((family, marker_id, pixel_size))
+            return FakeSurface((pixel_size, pixel_size))
+
+        pattern = build_calibration_pattern(
+            Resolution(1200, 800),
+            usable_area=CoordinateBounds(50, 50, 1150, 750),
+        )
+        projector_surface = FakeSurface((1200, 800))
+        ProjectorRenderer(pygame_module, render_marker).render_calibration_pattern(
+            projector_surface,
+            pattern,
+        )
+
+        assert len(marker_calls) == len(pattern.markers), f'{marker_calls=}'
+        assert projector_surface.fills == [(0, 0, 0)], f'{projector_surface.fills=}'
+        assert len(projector_surface.blits) == len(pattern.markers), f'{projector_surface.blits=}'
+        assert pattern == build_calibration_pattern(
+            Resolution(1200, 800),
+            usable_area=CoordinateBounds(50, 50, 1150, 750),
+        )
+
+
+if __name__ == '__main__':
+    unittest.main()
