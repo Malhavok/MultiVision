@@ -1,7 +1,6 @@
 # Reusable harness configuration for this Python project.
 # Select a plan explicitly when running the harness, for example:
-# python3 /Users/malhavok/Coding/Harness/Pi/harness.py \
-#   --config harness.toml --plan plans/plan1.md
+# python /Users/malhavok/Coding/Harness/Pi/harness.py --config harness.toml --plan plans/plan1.md
 
 [models]
 solve = "openai-codex/gpt-5.6-luna"
