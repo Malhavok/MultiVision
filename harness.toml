@@ -1,0 +1,60 @@
+# Reusable harness configuration for this Python project.
+# Select a plan explicitly when running the harness, for example:
+# python3 /Users/malhavok/Coding/Harness/Pi/harness.py \
+#   --config harness.toml --plan plans/plan1.md
+
+[models]
+solve = "openai-codex/gpt-5.6-luna"
+check = "openai-codex/gpt-5.6-luna"
+validate = "openai-codex/gpt-5.6-luna"
+
+[prompts]
+solve = """Solve task {step_number} from file {plan_path}.
+
+The task text is: "{step_text}"
+
+Read the relevant project documentation, repository instructions and any
+validation contract linked by the plan before editing. This is a Python
+project: use the advised .venv/bin/python and existing project commands.
+Work only on this task, preserve unrelated working-tree changes, and make the
+smallest change that fully satisfies the task. Keep external resources behind
+testable seams where practical. Do not modify the harness configuration, plan
+state or authoritative decision documents unless the task explicitly requires
+it, and do not claim unrun manual or external checks passed.
+"""
+
+check = """Check whether task {step_number} from {plan_path} is fully done.
+
+The task text is: "{step_text}"
+
+Read the relevant project documentation, validation contract, implementation
+and diff before deciding. If the task is incomplete, finish it with the
+smallest project-consistent change. Use the advised .venv/bin/python and run
+deterministic project checks. Do not expand scope, modify the harness
+configuration or authoritative decision documents unless required by the
+task, or claim unrun manual/external checks passed.
+
+Once the task is fully done, close it by running:
+python3 {plan_state_path} --plan {plan_path} --step {step_number} --mark-done
+"""
+
+[harness]
+max_solve_attempts = 5
+max_validate_attempts = 5
+keep_sessions = true
+run_timeout_minutes = 30
+
+# Validators run against every closed task in order. A task counts as complete
+# only after every validator id below has been recorded in its state.
+
+[[validators]]
+id = "complete"
+prompt = """Does the implementation fully meet task {step_number} from {plan_path}? Read the task, relevant project documentation, validation contract and resulting diff together. Check observable behaviour in the actual Python code and deterministic tests rather than accepting descriptions or placeholders."""
+
+[[validators]]
+id = "adversarial"
+prompt = """Perform an adversarial correctness review of task {step_number}. Check invalid and malformed inputs, boundary values, empty states, failure and retry paths, persistence, concurrency, external integrations and deterministic test seams as relevant to this task. Fix concrete problems, but do not add speculative scope or claim unrun external checks passed."""
+
+[[validators]]
+id = "quality"
+prompt = """Review the changed Python work for minimal, readable quality. Remove unrelated edits, dead code, duplicate logic, speculative abstractions, debug output and unnecessary dependencies. Check typing, pathlib use, naming, project conventions, deterministic ordering, focused tests and clean boundaries around external resources."""
