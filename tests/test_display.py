@@ -12,12 +12,15 @@ from multivision.display import (
 )
 from multivision.geometry import CoordinateBounds
 from multivision.pattern import build_calibration_pattern
+from multivision.session import SessionCameraRegistry
 from multivision.types import (
     CalibrationStatus,
     CameraStatus,
+    DeviceInfo,
     Frame,
     Resolution,
     RuntimeStatus,
+    SessionCameraState,
 )
 
 
@@ -131,7 +134,141 @@ class FakeCameraRuntime:
         return Frame(f'frame-{self.snapshot_count}', self.snapshot_count, 0.0)
 
 
+class SessionDisplayService:
+    def __init__(self, camera_count: int) -> None:
+        self.registry = SessionCameraRegistry.from_devices(
+            [
+                DeviceInfo(
+                    f'device-{idx}',
+                    f'Camera {idx}',
+                    capture_index=idx,
+                    native_resolution=Resolution(640, 480),
+                )
+                for idx in range(camera_count)
+            ],
+        )
+        self.snapshot_requests: list[str] = []
+
+    def get_session_cameras(self) -> list[object]:
+        return self.registry.get_cameras()
+
+    def get_camera_statuses(self) -> list[CameraStatus]:
+        statuses: list[CameraStatus] = []
+        for camera in self.registry.get_cameras():
+            assert camera.device_info is not None
+            runtime_status = {
+                SessionCameraState.OPEN: RuntimeStatus.AVAILABLE,
+                SessionCameraState.CLOSED: RuntimeStatus.STOPPED,
+                SessionCameraState.UNAVAILABLE: RuntimeStatus.UNAVAILABLE,
+            }[camera.state]
+            frame_counter = (
+                0
+                if camera.frame_metadata is None
+                else camera.frame_metadata.frame_counter
+            )
+            statuses.append(
+                CameraStatus(
+                    camera.slot_id,
+                    None,
+                    runtime_status,
+                    camera.calibration_status,
+                    camera.device_info.native_resolution,
+                    frame_counter,
+                ),
+            )
+        return statuses
+
+    def snapshot(self, slot_id: str) -> Frame:
+        self.snapshot_requests.append(slot_id)
+        return Frame(slot_id, len(self.snapshot_requests), 0.0)
+
+    def get_calibration_metrics(self, _slot_id: str) -> CalibrationMetrics | None:
+        return None
+
+    def point_from_preview(
+        self,
+        _slot_id: str,
+        _preview_point: object,
+        _preview_transform: object,
+    ) -> object:
+        raise AssertionError('pointing is not used by this fake')
+
+    @property
+    def calibration_pattern_visible(self) -> bool:
+        return False
+
+    @property
+    def overlay(self) -> None:
+        return None
+
+
 class DisplayTest(unittest.TestCase):
+    def test_session_previews_follow_slot_order_and_rebuild_after_lifecycle_changes(self) -> None:
+        pygame_module = FakePygame()
+        service = SessionDisplayService(5)
+        display_runtime = PygameDisplayRuntime(
+            service,  # type: ignore[arg-type]
+            DisplayConfiguration(window_resolution=Resolution(1000, 700)),
+            pygame_module=pygame_module,
+            frame_surface_converter=lambda _frame, _pygame: FakeSurface((1, 1)),
+        )
+
+        display_runtime.render_once()
+
+        assert list(display_runtime.preview_layouts) == [
+            'camera-0',
+            'camera-1',
+            'camera-2',
+            'camera-3',
+            'camera-4',
+        ]
+        assert service.snapshot_requests == [
+            'camera-0',
+            'camera-1',
+            'camera-2',
+            'camera-3',
+        ], f'{service.snapshot_requests=}'
+        assert 'slot: camera-0  state: OPEN' in pygame_module.rendered_text
+
+        service.registry.rename('camera-1', 'overhead')
+        service.registry.close('camera-0')
+        display_runtime.render_once()
+
+        assert display_runtime.preview_layouts['camera-1'].logical_name == 'overhead'
+        assert service.snapshot_requests[-3:] == [
+            'camera-1',
+            'camera-2',
+            'camera-3',
+        ], f'{service.snapshot_requests=}'
+        assert 'overhead  connection: AVAILABLE' in pygame_module.rendered_text
+        assert 'slot: camera-0  state: CLOSED' in pygame_module.rendered_text
+
+        service.registry.open('camera-4')
+        display_runtime.render_once()
+        assert service.snapshot_requests[-4:] == [
+            'camera-1',
+            'camera-2',
+            'camera-3',
+            'camera-4',
+        ], f'{service.snapshot_requests=}'
+
+    def test_lifecycle_change_clears_uncalibrated_click_frame_before_reopen(self) -> None:
+        display_runtime = PygameDisplayRuntime(
+            SessionDisplayService(1),  # type: ignore[arg-type]
+            DisplayConfiguration(window_resolution=Resolution(500, 400)),
+            pygame_module=FakePygame(),
+            frame_surface_converter=lambda _frame, _pygame: FakeSurface((1, 1)),
+        )
+        display_runtime.render_once()
+        display_runtime._uncalibrated_click_cameras.add('camera-0')
+
+        service = display_runtime.service
+        service.registry.close('camera-0')
+        service.registry.open('camera-0')
+        display_runtime.render_once()
+
+        assert 'camera-0' not in display_runtime._uncalibrated_click_cameras
+
     def test_layout_keeps_native_resolution_out_of_window_geometry(self) -> None:
         layouts = build_camera_preview_layouts(
             [
@@ -233,6 +370,14 @@ class DisplayTest(unittest.TestCase):
         duplicate_statuses = statuses + [statuses[0]]
         with self.assertRaises(ValueError):
             build_camera_preview_layouts(duplicate_statuses, Resolution(1000, 700))
+        with self.assertRaises(ValueError):
+            build_camera_preview_layouts(
+                statuses,
+                Resolution(1000, 700),
+                session_cameras=SessionCameraRegistry.from_capture_indexes(
+                    [0],
+                ).get_cameras(),
+            )
 
     def test_tiny_window_keeps_preview_bounds_valid(self) -> None:
         layouts = build_camera_preview_layouts(

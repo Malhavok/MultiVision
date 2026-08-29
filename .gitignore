@@ -36,3 +36,5 @@ htmlcov/
 # Editors and IDEs
 .vscode/
 .idea/
+
+plans/*.md.state.json

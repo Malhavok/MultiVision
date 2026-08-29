@@ -14,7 +14,6 @@ from multivision.config import (
     load_configuration,
     save_configuration,
 )
-from multivision.discovery import MacOSDeviceDiscovery
 from multivision.errors import (
     CameraOpenError,
     ConfigurationError,
@@ -41,14 +40,7 @@ class PackageTest(unittest.TestCase):
         assert CalibrationStatus.UNVERIFIED.value == 'UNVERIFIED'
 
     def test_configuration_round_trip(self) -> None:
-        configuration = Configuration(
-            camera_bindings={
-                'overhead': 'device-overhead',
-                'side-left': 'device-left',
-                'side-right': 'device-right',
-                'macbook': 'device-macbook',
-            },
-        )
+        configuration = Configuration()
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / 'config.json'
             save_configuration(configuration, path)
@@ -69,16 +61,12 @@ class PackageTest(unittest.TestCase):
             configuration = load_configuration(Path(temporary_directory) / 'missing.json')
 
         assert configuration.projector_resolution == Resolution(1920, 1080), f'{configuration=}'
-        assert configuration.camera_bindings == {}, f'{configuration=}'
 
     def test_configuration_paths_and_values_are_rejected_at_save_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / 'config.json'
-            configuration = Configuration(camera_bindings={'overhead': 'device-id'})
-            configuration.camera_bindings['overhead'] = None  # type: ignore[assignment]
+            configuration = Configuration()
 
-            with self.assertRaises(ConfigurationError):
-                save_configuration(configuration, path)
             with self.assertRaises(ConfigurationError):
                 load_configuration(str(path))  # type: ignore[arg-type]
             with self.assertRaises(ConfigurationError):
@@ -90,7 +78,6 @@ class PackageTest(unittest.TestCase):
     def test_malformed_configuration_is_rejected(self) -> None:
         malformed_values = [
             [],
-            {'camera_bindings': []},
             {'projector_resolution': {'width': 0}},
             {'calibration_thresholds': {'min_inlier_ratio': True}},
             {'calibration_version': 0},
@@ -107,7 +94,7 @@ class PackageTest(unittest.TestCase):
                     CalibrationThresholds(max_mean_reprojection_error=invalid_value)
 
     def test_save_is_valid_json_even_when_replaced(self) -> None:
-        configuration = Configuration(camera_bindings={'side-left': 'device-b'})
+        configuration = Configuration()
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / 'config.json'
             save_configuration(configuration, path)
@@ -222,141 +209,3 @@ class PackageTest(unittest.TestCase):
             capture.release()
 
         assert capture_arguments == [(3, 42)], f'{capture_arguments=}'
-
-    def test_discovery_exposes_platform_metadata_and_stable_ids(self) -> None:
-        profiler_data = {
-            'SPCameraDataType': [
-                {
-                    '_name': 'Continuity Camera',
-                    'spcamera_device_unique_id': 'iphone-camera-id',
-                    'spcamera_device_type': 'Continuity Camera',
-                    'spcamera_video_control': {'auto_exposure': True},
-                },
-                {
-                    '_name': 'MacBook Camera',
-                    'spcamera_model_id': 'built-in-camera-model',
-                },
-            ],
-        }
-        completed_process = type(
-            'CompletedProcess',
-            (),
-            {'returncode': 0, 'stdout': json.dumps(profiler_data)},
-        )()
-
-        discovery = MacOSDeviceDiscovery(
-            command_runner=lambda *args, **kwargs: completed_process,
-            platform_name='darwin',
-        )
-
-        devices = discovery.discover_devices()
-
-        assert [device.device_id for device in devices] == [
-            'iphone-camera-id',
-            'unstable-macos-name:MacBook Camera',
-        ], f'{devices=}'
-        assert devices[0].metadata == profiler_data['SPCameraDataType'][0], f'{devices=}'
-        assert devices[0].native_resolution is None, f'{devices=}'
-        assert devices[0].backend_name == 'avfoundation', f'{devices=}'
-        assert devices[0].is_stable_id is True, f'{devices=}'
-        assert devices[1].is_stable_id is False, f'{devices=}'
-        assert [device.capture_index for device in devices] == [0, 1]
-
-    def test_discovery_accepts_system_profiler_hyphenated_unique_ids(self) -> None:
-        profiler_data = {
-            'SPCameraDataType': [
-                {
-                    '_name': 'GENERAL WEBCAM',
-                    'spcamera_unique-id': 'uvc-camera-id',
-                },
-            ],
-        }
-        completed_process = type(
-            'CompletedProcess',
-            (),
-            {'returncode': 0, 'stdout': json.dumps(profiler_data)},
-        )()
-
-        discovery = MacOSDeviceDiscovery(
-            command_runner=lambda *args, **kwargs: completed_process,
-            platform_name='darwin',
-        )
-
-        devices = discovery.discover_devices()
-
-        assert devices[0].device_id == 'uvc-camera-id', f'{devices=}'
-        assert devices[0].is_stable_id is True, f'{devices=}'
-
-    def test_discovery_resolves_native_indexes_from_one_avfoundation_snapshot(self) -> None:
-        profiler_data = {
-            'SPCameraDataType': [
-                {'_name': 'Camera A', 'spcamera_unique-id': 'device-a'},
-                {'_name': 'Camera B', 'spcamera_unique-id': 'device-b'},
-            ],
-        }
-        completed_process = type(
-            'CompletedProcess',
-            (),
-            {'returncode': 0, 'stdout': json.dumps(profiler_data)},
-        )()
-
-        with (
-            patch(
-                'multivision.discovery.subprocess.run',
-                return_value=completed_process,
-            ),
-            patch(
-                'multivision.discovery._resolve_avfoundation_capture_indices',
-                return_value={'device-a': 1, 'device-b': 0},
-            ) as resolve_capture_indices,
-        ):
-            devices = MacOSDeviceDiscovery(platform_name='darwin').discover_devices()
-
-        assert [device.capture_index for device in devices] == [1, 0], f'{devices=}'
-        resolve_capture_indices.assert_called_once_with()
-
-    def test_discovery_uses_native_index_resolution_for_real_commands(self) -> None:
-        profiler_data = {
-            'SPCameraDataType': [
-                {'_name': 'Camera A', 'spcamera_device_unique_id': 'device-a'},
-                {'_name': 'Camera B', 'spcamera_device_unique_id': 'device-b'},
-            ],
-        }
-        completed_process = type(
-            'CompletedProcess',
-            (),
-            {'returncode': 0, 'stdout': json.dumps(profiler_data)},
-        )()
-        discovery = MacOSDeviceDiscovery(
-            command_runner=lambda *args, **kwargs: completed_process,
-            platform_name='darwin',
-            capture_index_resolver=lambda device_id: {
-                'device-a': 1,
-                'device-b': 0,
-            }.get(device_id),
-        )
-
-        devices = discovery.discover_devices()
-
-        assert [device.capture_index for device in devices] == [1, 0], f'{devices=}'
-
-    def test_malformed_system_profiler_results_are_explicit_errors(self) -> None:
-        malformed_results = [None, object()]
-        for malformed_result in malformed_results:
-            with self.subTest(malformed_result=malformed_result.__class__.__name__):
-                discovery = MacOSDeviceDiscovery(
-                    command_runner=lambda *args, **kwargs: malformed_result,
-                    platform_name='darwin',
-                )
-                with self.assertRaises(HardwareError):
-                    discovery.discover_devices()
-
-        def failing_command(*args: object, **kwargs: object) -> object:
-            raise RuntimeError('system_profiler failed')
-
-        discovery = MacOSDeviceDiscovery(
-            command_runner=failing_command,
-            platform_name='darwin',
-        )
-        with self.assertRaises(HardwareError):
-            discovery.discover_devices()

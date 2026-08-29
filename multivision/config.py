@@ -47,7 +47,6 @@ class CalibrationThresholds:
 
 @dataclass(frozen=True)
 class Configuration:
-    camera_bindings: dict[str, str] = field(default_factory=dict)
     projector_resolution: Resolution = field(
         default_factory=lambda: Resolution(1920, 1080),
     )
@@ -57,40 +56,31 @@ class Configuration:
     calibration_version: int = 1
 
     def __post_init__(self) -> None:
-        validate_camera_bindings(self.camera_bindings)
         _validate_resolution(self.projector_resolution, 'projector_resolution')
         if not isinstance(self.calibration_thresholds, CalibrationThresholds):
             raise ConfigurationError('calibration_thresholds must be CalibrationThresholds')
         _validate_positive_integer(self.calibration_version, 'calibration_version')
 
     @classmethod
-    def from_data(cls, data: Mapping[str, Any]) -> 'Configuration':
+    def from_data(
+        cls,
+        data: Mapping[str, Any],
+    ) -> 'Configuration':
         if not isinstance(data, Mapping):
             raise ConfigurationError('The configuration root must be an object')
 
-        camera_bindings_data = data.get('camera_bindings', {})
-        if not isinstance(camera_bindings_data, Mapping):
-            raise ConfigurationError('camera_bindings must be an object')
-
-        camera_bindings = dict(camera_bindings_data)
         projector_resolution = _parse_resolution(data.get('projector_resolution', {}))
         thresholds = _parse_thresholds(data.get('calibration_thresholds', {}))
         calibration_version = data.get('calibration_version', 1)
 
         return cls(
-            camera_bindings=camera_bindings,
             projector_resolution=projector_resolution,
             calibration_thresholds=thresholds,
             calibration_version=calibration_version,
         )
 
     def to_data(self) -> dict[str, Any]:
-        validate_camera_bindings(self.camera_bindings)
         return {
-            'camera_bindings': {
-                logical_name: self.camera_bindings[logical_name]
-                for logical_name in sorted(self.camera_bindings)
-            },
             'projector_resolution': {
                 'width': self.projector_resolution.width,
                 'height': self.projector_resolution.height,
@@ -239,19 +229,6 @@ def _load_existing_document_for_update(config_path: pathlib.Path) -> dict[str, A
     if not isinstance(data, dict):
         raise ConfigurationError(f'Configuration at {config_path} must be an object')
     return data
-
-
-def validate_camera_bindings(value: Any) -> None:
-    if not isinstance(value, Mapping):
-        raise ConfigurationError('camera_bindings must be an object')
-
-    for logical_name, device_id in value.items():
-        if not isinstance(logical_name, str) or len(logical_name) == 0:
-            raise ConfigurationError('camera binding names must be non-empty strings')
-        if not isinstance(device_id, str) or len(device_id) == 0:
-            raise ConfigurationError(
-                f'camera binding for {logical_name!r} must contain a non-empty device ID',
-            )
 
 
 def _validate_resolution(value: Any, field_name: str) -> None:

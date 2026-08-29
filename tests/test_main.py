@@ -116,7 +116,6 @@ class MainTest(unittest.TestCase):
         FakeDisplayRuntime.instances.clear()
         FakeApiServerRuntime.instances.clear()
         configuration = Configuration(
-            camera_bindings={'overhead': 'missing-device'},
         )
         camera_runtime = FakeCameraRuntime()
         camera_runtime.statuses = [
@@ -148,7 +147,6 @@ class MainTest(unittest.TestCase):
         FakeApiServerRuntime.instances.clear()
         LIFECYCLE_EVENTS.clear()
         configuration = Configuration(
-            camera_bindings={'overhead': 'camera-a'},
             projector_resolution=Resolution(1600, 900),
         )
 

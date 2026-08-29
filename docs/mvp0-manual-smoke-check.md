@@ -1,55 +1,28 @@
-# MVP0 manual smoke checks
+# Plan2 manual hardware smoke check
 
-These checks are hardware procedures, not automated acceptance. Run them on the
-target Mac with the intended cameras and display/projector; record the command
-output and observations without treating fake-camera tests as hardware results.
+This is a hardware procedure for the plan2 session-local camera model, not an
+automated acceptance test. Run it on the target Mac with the intended cameras
+and display/projector. Record the commands and physical observations; fake
+camera tests and deterministic suite results are not hardware evidence. The
+shared requirements are in the [plan2 validation contract](../plans/plan2-validation-contract.md).
 
-## One-camera check
+## 1. Start one session with the complete startup snapshot
 
-From the project root, install the declared dependencies if needed. The
-service must have at least one persisted logical-camera binding before the
-check. On a clean target Mac, discover device IDs and their stability without
-opening cameras:
+From the project root, connect all devices currently available for the smoke
+test before starting the service. Do not use `cameras bind`: plan2 assigns
+immutable session slots (`camera-0`, `camera-1`, and so on) from this startup
+snapshot. The capture indexes are valid only for this run, and names and
+calibrations are not persisted.
+
+Install dependencies if needed, then start the service and leave it running:
 
 ```sh
 PYTHON="$PWD/.venv/bin/python"
 "$PYTHON" -m pip install -r requirements.txt
-"$PYTHON" -c '
-from multivision.discovery import PlatformDeviceDiscovery
-for device in PlatformDeviceDiscovery().discover_devices():
-    print(device.device_id, device.name, f'stable={device.is_stable_id}')
-'
-```
-
-If the configuration has no binding, start the service in one terminal:
-
-```sh
 "$PYTHON" main.py
 ```
 
-In a second terminal, choose an entry marked `stable=True`, bind its ID, then
-close and restart the first service because binding changes take effect on
-restart. Do not bind an entry marked `stable=False`.
-
-```sh
-PYTHON="$PWD/.venv/bin/python"
-printf 'Logical camera name: '
-read -r CAMERA
-printf 'Stable device ID: '
-read -r DEVICE_ID
-"$PYTHON" -m multivision.cli cameras bind "$CAMERA" "$DEVICE_ID"
-# Close the UI in the first terminal, then start `main.py` there again.
-```
-
-Start the integrated service and UI (with the existing binding, or after the
-restart above):
-
-```sh
-"$PYTHON" main.py
-```
-
-In a second terminal, inspect available devices and configured logical
-cameras:
+In a second terminal, list the session inventory:
 
 ```sh
 PYTHON="$PWD/.venv/bin/python"
@@ -57,195 +30,181 @@ PYTHON="$PWD/.venv/bin/python"
 "$PYTHON" -m multivision.cli status
 ```
 
-`cameras list` reports the currently discoverable devices and stable-ID
-metadata; `status` reports the configured logical names. Choose a configured
-logical camera from `status` (do not assume a particular name or number of
-cameras), then enter it when prompted. The UI shows live previews but not a
-frame counter, so wait until the service reports a positive `frame_counter`
-before requesting the first snapshot:
+Wait until each initially `OPEN` slot reports `runtime_status: AVAILABLE` and a
+positive `frame_counter` in the `cameras list` response. The Pygame window must
+show live previews in ascending slot order. Each card shows its slot, current
+display name, connection and calibration state, native resolution and any
+available calibration metrics; use the list response for frame diagnostics.
+Identify each `camera-N` slot from its live preview, match it to the physical
+camera, and record:
 
-```sh
-printf 'Logical camera name from the list: '
-read -r CAMERA
-"$PYTHON" - "$CAMERA" <<'PY'
-import json
-import sys
-import time
-import urllib.request
-
-camera_name = sys.argv[1]
-deadline = time.monotonic() + 30
-while True:
-    with urllib.request.urlopen(
-        'http://127.0.0.1:8000/cameras/' + camera_name + '/status',
-        timeout=5,
-    ) as response:
-        status = json.load(response)
-    print(status)
-    if status['runtime_status'] == 'AVAILABLE' and status['frame_counter'] > 0:
-        break
-    if time.monotonic() >= deadline:
-        raise SystemExit('No first frame within 30 seconds')
-    time.sleep(1)
-PY
-"$PYTHON" -m multivision.cli snapshot "$CAMERA" --output /tmp/multivision-"$CAMERA".jpg
-```
-If the first request reports a frame-unavailable error, wait for the counter and
-retry this command against the same running service; it must not reopen the
-camera.
-
-Before calibration, prepare the known surface: the service renders the
-deterministic AprilTag pattern during calibration/verification. Alternatively,
-place a flat printed copy of that pattern on the observed surface with its
-projector-native scale and coordinates known. Then run:
-
-```sh
-"$PYTHON" -m multivision.cli calibrate --camera "$CAMERA"
-"$PYTHON" -m multivision.cli calibration verify --camera "$CAMERA"
+```text
+slot | display name | physical camera description/aim | capture index | resolution | first frame counter
 ```
 
-The UI should show the camera's live preview and an explicit
-connection/calibration state. The service's `cameras list` or per-camera status
-response should report a frame counter that continues increasing. The
-calibration response should include tag/corner, inlier, reprojection-error and
-coverage metrics; verification returns the resulting status and the separate
-`calibration status` command exposes the persisted metrics. A missing camera
-should remain `UNAVAILABLE` with an explicit error rather than being replaced
-by another device. If calibration or verification races the first retained
-frame and returns a frame-unavailable error, wait for the frame counter to
-become positive and retry against the same running service; it must not reopen
-the camera.
+The slot is the authority, not the capture index. If more than four devices
+were connected, the remaining startup slots are discovered but initially
+`CLOSED` because at most four cameras can be active. Record those slots too;
+identify each one by opening it during the management check below rather than
+assuming its order means a physical identity.
 
-Pick a visible point whose camera-native coordinates can be read from the
-preview/captured image. First click that point in the corresponding live UI
-preview and confirm that a red circle appears at the mapped projector
-location. Then enter the same measured native coordinates and run the CLI
-request:
+## 2. Manage slots through the CLI without restarting
+
+Use slot IDs for management commands. Choose an initially open slot and record
+its frame counter, then rename it through the running service:
 
 ```sh
-printf 'Camera-native x y: '
-read -r CAMERA_NATIVE_X CAMERA_NATIVE_Y
-"$PYTHON" -m multivision.cli point --camera "$CAMERA" --x "$CAMERA_NATIVE_X" --y "$CAMERA_NATIVE_Y"
-```
-
-Expected observation: the UI preview click and the CLI point request use the
-same camera-to-projector path, and the red circle remains until replaced or
-cleared. Capture the reported projected coordinates and all calibration
-metrics. Then clear it:
-
-```sh
-"$PYTHON" -m multivision.cli overlay clear
-```
-
-The circle should disappear. Close the Pygame window (or press Escape) and
-observe that the process exits without hanging. `Ctrl-C` in the service
-terminal is an equivalent shutdown check. After restarting, run `cameras list`
-and `calibration status` to check that bindings recover and persisted
-calibrations are `UNVERIFIED` until verification succeeds.
-
-## Cross-camera check
-
-Use the same running service and enumerate every currently configured camera
-without hard-coding a camera count:
-
-```sh
-PYTHON="$PWD/.venv/bin/python"
-BASE_URL=http://127.0.0.1:8000
-"$PYTHON" - "$BASE_URL" <<'PY'
-import json
-import sys
-import time
-import urllib.request
-
-base_url = sys.argv[1]
-deadline = time.monotonic() + 30
-while True:
-    with urllib.request.urlopen(f'{base_url}/cameras', timeout=5) as response:
-        cameras = json.load(response)
-    pending = [
-        camera['camera']
-        for camera in cameras
-        if camera['runtime_status'] == 'STARTING'
-        or (
-            camera['runtime_status'] == 'AVAILABLE'
-            and camera['frame_counter'] <= 0
-        )
-    ]
-    if len(pending) == 0:
-        print('All currently available cameras have a retained frame:', cameras)
-        break
-    if time.monotonic() >= deadline:
-        raise SystemExit(f'No first frame within 30 seconds: {pending}')
-    time.sleep(1)
-PY
-CAMERA_DATA=$(curl --fail --silent --show-error "$BASE_URL/cameras")
-printf '%s\n' "$CAMERA_DATA" | "$PYTHON" -c '
-import json
-import sys
-for camera in json.load(sys.stdin):
-    print(camera["camera"], camera["runtime_status"])
-'
-CAMERAS=$(printf '%s\n' "$CAMERA_DATA" | "$PYTHON" -c '
-import json
-import sys
-for camera in json.load(sys.stdin):
-    if camera["runtime_status"] == "AVAILABLE":
-        print(camera["camera"])
-')
-UNAVAILABLE_CAMERAS=$(printf '%s\n' "$CAMERA_DATA" | "$PYTHON" -c '
-import json
-import sys
-for camera in json.load(sys.stdin):
-    if camera["runtime_status"] != "AVAILABLE":
-        print('{}: {} – {}'.format(camera["camera"], camera["runtime_status"], camera["error_message"]))
-')
-printf 'Unavailable configured cameras (recorded and skipped):\n%s\n' "${UNAVAILABLE_CAMERAS:-none}"
-```
-
-Calibrate and verify each available configured camera. The status output above
-records unavailable configured cameras and the loop skips them, not silently
-substituting another device:
-
-```sh
-while IFS= read -r CAMERA; do
-    [ -n "$CAMERA" ] || continue
-    "$PYTHON" -m multivision.cli calibrate --camera "$CAMERA"
-    "$PYTHON" -m multivision.cli calibration verify --camera "$CAMERA"
-done <<EOF
-$CAMERAS
-EOF
+SLOT=camera-0                 # replace with a slot from `cameras list`
+NEW_NAME=overhead              # choose a unique name
+"$PYTHON" -m multivision.cli cameras rename "$SLOT" "$NEW_NAME"
 "$PYTHON" -m multivision.cli cameras list
 ```
 
-For several physical points distributed across the usable surface, use each
-camera preview that can see that point and click the same point. Record the
-logical camera, camera-native click coordinates, returned projector coordinates,
-calibration status, inlier ratio, reprojection errors and coverage for every
-attempt. The red circles should land at approximately the same physical
-location for cameras that share visibility; do not compare cameras that cannot
-see that point. Also exercise one point near each useful calibrated-region edge
-and confirm unsupported clicks fail explicitly rather than extrapolating.
+Confirm in the same Pygame window and list response that the slot now has the
+new name, its live physical view is unchanged, and its frame counter continues
+increasing. Renaming must not move the preview or its session state.
 
-These commands provide the procedure only. No hardware observation is claimed
-until they have been run on the target Mac.
+Close an open slot through the CLI and observe that its preview disappears and
+its state becomes `CLOSED`:
 
-## Remaining hardware-only acceptance work
+```sh
+"$PYTHON" -m multivision.cli cameras close "$SLOT"
+"$PYTHON" -m multivision.cli cameras list
+```
 
-The following acceptance work remains to be run and recorded on the target Mac;
-this repository does not claim any of it passed:
+Reopen that same slot, still without stopping or restarting `main.py`:
 
-- confirm stable device IDs remain attached to the same physical cameras across
-  reconnect and restart, and that a changed capture index cannot select another
-  binding;
-- confirm at least three intended cameras stay open simultaneously and their
-  frame counters continue increasing without snapshot-triggered reopen;
-- calibrate and verify each usable camera against the projector, recording
-  tag/corner counts, inlier ratio, reprojection errors and coverage;
-- measure click-to-projection accuracy at several shared physical points across
-  cameras, including useful region edges, and record the empirical tolerance;
-- exercise restart recovery, missing-camera failure and stale-calibration
-  refusal with the actual devices.
+```sh
+"$PYTHON" -m multivision.cli cameras open "$SLOT"
+"$PYTHON" -m multivision.cli cameras list
+```
 
-Run the procedures above on the target hardware and attach the observed output
-and measurements before declaring MVP0 physically accepted. The automated suite
-and fake-device tests are not substitutes for these checks.
+Confirm that its preview returns, its state becomes `OPEN`/`AVAILABLE`, and a
+new frame counter starts increasing. Confirm that the slot is still mapped to
+the same physical camera. A close/reopen deliberately clears that slot's
+calibration and overlay, so it must be recalibrated before pointing.
+
+For initially closed slots, open them directly through the CLI to view and
+identify them, then close and reopen them if desired. Never use a later
+discovery or a changed capture index to reinterpret an existing slot.
+
+## 3. Check the uncalibrated-click frame
+
+Before calibrating a camera, choose an `OPEN` and `AVAILABLE` slot whose
+calibration state is `UNCALIBRATED`. Click inside that camera's live preview in
+the Pygame window. Expected observations:
+
+- the click fails explicitly as an uncalibrated-camera point operation;
+- no projector overlay is created;
+- that camera's preview is persistently outlined with a red frame while it
+  remains uncalibrated;
+- another camera's preview is not red-framed; and
+- a click outside a preview does not create a red frame.
+
+Record the slot/name, the visible error, and the red-frame observation. This
+red frame is debug-camera UI state, not the projector's red-circle overlay.
+
+## 4. Calibrate and point two independently aimed cameras
+
+Choose at least two different physical cameras with independently aimed views
+of the known surface. Record which physical camera was used for each slot;
+do not treat two names or two capture indexes as evidence of independent
+cameras. With the calibration pattern visible on the projector/display, run
+these commands against the same service:
+
+```sh
+CAMERA_A=camera-0              # replace with the first selected slot
+CAMERA_B=camera-1              # replace with the second selected slot
+"$PYTHON" -m multivision.cli calibrate --camera "$CAMERA_A"
+"$PYTHON" -m multivision.cli calibration verify --camera "$CAMERA_A"
+"$PYTHON" -m multivision.cli calibrate --camera "$CAMERA_B"
+"$PYTHON" -m multivision.cli calibration verify --camera "$CAMERA_B"
+"$PYTHON" -m multivision.cli calibration status
+```
+
+Capture each result's unique tag/corner counts, inlier count and ratio,
+reprojection errors, coverage and final calibration status. The red frame for
+each successfully calibrated camera must clear. If a camera has no retained
+frame or cannot detect the pattern, wait for the live frame and retry against
+the same running service; do not restart it as a calibration workaround.
+
+Choose a physical point visible in both independently aimed views. Click that
+point in each camera's preview and record the slot, current display name,
+camera-native click coordinates and returned projector coordinates. The two
+projector marks should land at approximately the same physical location.
+Optionally confirm the same shared path with native-coordinate CLI requests:
+
+```sh
+printf 'Camera A native x y: '
+read -r AX AY
+printf 'Camera B native x y: '
+read -r BX BY
+"$PYTHON" -m multivision.cli point --camera "$CAMERA_A" --x "$AX" --y "$AY"
+"$PYTHON" -m multivision.cli point --camera "$CAMERA_B" --x "$BX" --y "$BY"
+"$PYTHON" -m multivision.cli overlay clear
+```
+
+The native coordinates need not be the same numbers for the two views. Record
+the physical pointing observations rather than declaring accuracy from the
+JSON responses alone.
+
+## 5. Unplug one startup camera and check fail-closed behaviour
+
+Choose one identified startup camera, preferably one of the calibrated
+cameras, and unplug it while `main.py` continues running. Then run:
+
+```sh
+UNPLUGGED_SLOT=camera-0        # replace with the unplugged slot
+"$PYTHON" -m multivision.cli cameras list
+"$PYTHON" -m multivision.cli snapshot "$UNPLUGGED_SLOT"
+```
+
+The list must retain the same slot and report `state: UNAVAILABLE`,
+`runtime_status: UNAVAILABLE`, an explicit error message and no usable frame
+metadata. The snapshot command must return a non-zero result containing an
+explicit camera-unavailable error. The live preview must not be replaced by
+another camera, and the remaining cameras must retain their own slots and
+views. Record the slot, error text, last frame counter and the physical
+observation.
+
+If the unplugged camera had a calibration, confirm that its calibration is no
+longer usable and that a point request fails closed; do not accept a projected
+point from it.
+
+## 6. Record the intentional hot-plug boundary
+
+While the same service is still running, connect a camera that was absent from
+the startup snapshot. If no spare camera is available, reconnect the camera
+just unplugged and check that its old slot does not recover automatically.
+Run:
+
+```sh
+"$PYTHON" -m multivision.cli cameras list
+```
+
+Record the observation explicitly as:
+
+```text
+hot-plug-in: intentionally unsupported
+new device added to this session: no
+restart required for a newly connected device: yes
+```
+
+A later device must not silently appear as a new `camera-N`, and a disconnected
+slot must not be remapped to it. A newly connected device can be considered
+only after a deliberate next startup; do not restart during this check to make
+it pass.
+
+## Result record and acceptance boundary
+
+Attach the `cameras list` and calibration/point command output to a log with the
+Mac, date, connected hardware, slot-to-live-preview identifications, management
+observations, calibration metrics, red-frame observation, unplugged-slot error,
+and hot-plug observation. These are the required physical observations from
+the [shared validation contract](../plans/plan2-validation-contract.md).
+
+This document does not claim that any manual step has passed. Do not claim
+physical plan2 acceptance until this procedure has been run on the target Mac
+with the actual cameras and projector/display and the observations have been
+recorded. Automated tests and fake-device runs do not substitute for that
+record.

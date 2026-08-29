@@ -44,12 +44,12 @@ class CalibrationPersistenceTest(unittest.TestCase):
         calibration = _calibration()
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / 'config.json'
-            save_configuration(Configuration(camera_bindings={'overhead': 'camera-a'}), path)
+            save_configuration(Configuration(), path)
             CalibrationStore(path).save(calibration)
             configuration = load_configuration(path)
             saved_data = json.loads(path.read_text(encoding='utf-8'))
 
-        assert configuration.camera_bindings == {'overhead': 'camera-a'}, f'{configuration=}'
+        assert configuration == Configuration(), f'{configuration=}'
         assert 'camera-a' in saved_data['calibrations'], f'{saved_data=}'
 
     def test_restart_loaded_calibration_is_unverified(self) -> None:

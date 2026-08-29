@@ -105,6 +105,10 @@ class OpenCVCaptureDeviceFactory:
     def __init__(self, backend: int | None = None) -> None:
         self.backend = backend
 
+    def adopt_capture(self, capture: Any) -> CaptureDevice:
+        """Adopt a discovery probe so startup does not open the device twice."""
+        return OpenCVCaptureDevice(capture)
+
     def open_capture(self, device: DeviceInfo) -> CaptureDevice:
         if not isinstance(device, DeviceInfo):
             raise CameraOpenError('Device must be discovered device information')

@@ -32,7 +32,9 @@ class CliTest(unittest.TestCase):
         commands = [
             ['status'],
             ['cameras', 'list'],
-            ['cameras', 'bind', 'overhead', 'device/one'],
+            ['cameras', 'rename', 'camera-0', 'overhead'],
+            ['cameras', 'close', 'camera-1'],
+            ['cameras', 'open', 'camera-1'],
             ['calibrate', '--camera', 'overhead'],
             ['calibration', 'verify', '--camera', 'overhead'],
             ['calibration', 'status'],
@@ -46,12 +48,14 @@ class CliTest(unittest.TestCase):
 
         assert [(method, url, payload) for method, url, payload, _ in requests] == [
             ('GET', 'http://service.test/health', None),
-            ('GET', 'http://service.test/cameras/discovered', None),
+            ('GET', 'http://service.test/cameras', None),
             (
                 'POST',
-                'http://service.test/cameras/overhead/binding',
-                {'device_id': 'device/one'},
+                'http://service.test/cameras/camera-0/rename',
+                {'name': 'overhead'},
             ),
+            ('POST', 'http://service.test/cameras/camera-1/close', None),
+            ('POST', 'http://service.test/cameras/camera-1/open', None),
             ('POST', 'http://service.test/calibration', {'camera': 'overhead'}),
             ('POST', 'http://service.test/calibration/verify', {'camera': 'overhead'}),
             ('GET', 'http://service.test/calibration/status', None),

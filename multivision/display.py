@@ -24,12 +24,14 @@ from multivision.geometry import (
 )
 from multivision.pattern import CalibrationPattern
 from multivision.service import RedCircleOverlay
+from multivision.session import SessionCamera
 from multivision.types import (
     CalibrationStatus,
     CameraStatus,
     Frame,
     Resolution,
     RuntimeStatus,
+    SessionCameraState,
     is_valid_resolution,
 )
 
@@ -107,6 +109,14 @@ class CameraPreviewLayout(NamedTuple):
     panel_bounds: CoordinateBounds
     preview_bounds: CoordinateBounds
     preview_transform: PreviewTransform | None
+    slot_id: str | None = None
+
+
+class _DisplayCamera(NamedTuple):
+    slot_id: str
+    logical_name: str
+    status: CameraStatus
+    session_camera: SessionCamera | None
 
 
 @dataclass(frozen=True)
@@ -298,6 +308,8 @@ class PygameDisplayRuntime:
         self._is_running = False
         self._is_initialised = False
         self._preview_layouts: dict[str, CameraPreviewLayout] = {}
+        self._uncalibrated_click_cameras: set[str] = set()
+        self._camera_lifecycle_generations: dict[str, int] = {}
 
     @property
     def window_surface(self) -> Any | None:
@@ -395,11 +407,7 @@ class PygameDisplayRuntime:
         self._require_main_thread()
         self.initialise()
         pygame_module = self._get_pygame()
-        if len(self._preview_layouts) == 0:
-            self._preview_layouts = build_camera_preview_layouts(
-                self.service.get_camera_statuses(),
-                self.configuration.window_resolution,
-            )
+        self._preview_layouts = self._build_preview_layouts()
         quit_event = getattr(pygame_module, 'QUIT', None)
         key_down_event = getattr(pygame_module, 'KEYDOWN', None)
         escape_key = getattr(pygame_module, 'K_ESCAPE', None)
@@ -432,18 +440,14 @@ class PygameDisplayRuntime:
         assert self._projector_surface is not None
         assert self._projector_renderer is not None
         self._window_surface.fill(DARK_GREY)
-        statuses = tuple(
-            sorted(
-                self.service.get_camera_statuses(),
-                key=lambda status: status.logical_name,
-            ),
-        )
-        self._preview_layouts = build_camera_preview_layouts(
-            statuses,
-            self.configuration.window_resolution,
-        )
-        for status in statuses:
-            self._render_camera_card(status, self._preview_layouts[status.logical_name])
+        display_cameras = self._get_display_cameras()
+        self._preview_layouts = self._build_preview_layouts(display_cameras)
+        for camera in display_cameras:
+            self._render_camera_card(
+                camera.status,
+                self._preview_layouts[camera.slot_id],
+                camera.session_camera,
+            )
 
         projector_is_ready = True
         pattern_visible = self.service.calibration_pattern_visible
@@ -526,14 +530,17 @@ class PygameDisplayRuntime:
         self,
         status: CameraStatus,
         layout: CameraPreviewLayout,
+        session_camera: SessionCamera | None = None,
     ) -> None:
         assert self._window_surface is not None
         self._draw_rectangle(self._window_surface, layout.panel_bounds, DARK_GREY)
         connection_colour = _status_colour(status.runtime_status)
         calibration_status = self._get_calibration_status(status)
         calibration_colour = _calibration_colour(calibration_status)
+        slot_id = layout.slot_id or status.logical_name
+        camera_state = _get_camera_state(status, session_camera)
         self._draw_text(
-            f'{status.logical_name}  connection: {status.runtime_status.value}',
+            f'{layout.logical_name}  connection: {status.runtime_status.value}',
             layout.panel_bounds.left + 8,
             layout.panel_bounds.top + 6,
             connection_colour,
@@ -544,11 +551,17 @@ class PygameDisplayRuntime:
             layout.panel_bounds.top + 24,
             calibration_colour,
         )
+        self._draw_text(
+            f'slot: {slot_id}  state: {camera_state.value}',
+            layout.panel_bounds.left + 8,
+            layout.panel_bounds.top + 42,
+            WHITE,
+        )
         resolution_text = _format_resolution(status.native_resolution)
         self._draw_text(
             f'native: {resolution_text}',
             layout.panel_bounds.left + 8,
-            layout.panel_bounds.top + 42,
+            layout.panel_bounds.top + 60,
             WHITE,
         )
         metrics = self._get_calibration_metrics(status)
@@ -556,7 +569,7 @@ class PygameDisplayRuntime:
             self._draw_text(
                 _format_metrics(metrics),
                 layout.panel_bounds.left + 8,
-                layout.panel_bounds.top + 60,
+                layout.panel_bounds.top + 78,
                 WHITE,
             )
 
@@ -567,8 +580,12 @@ class PygameDisplayRuntime:
                 layout.preview_bounds.top + 8,
                 GREY,
             )
+            self._draw_uncalibrated_click_frame(slot_id, layout)
             return
-        if status.runtime_status in {
+        if camera_state in {
+            SessionCameraState.CLOSED,
+            SessionCameraState.UNAVAILABLE,
+        } or status.runtime_status in {
             RuntimeStatus.UNAVAILABLE,
             RuntimeStatus.STOPPED,
         }:
@@ -578,9 +595,10 @@ class PygameDisplayRuntime:
                 layout.preview_bounds.top + 8,
                 GREY,
             )
+            self._draw_uncalibrated_click_frame(slot_id, layout)
             return
         try:
-            frame = self.service.snapshot(status.logical_name)
+            frame = self.service.snapshot(slot_id)
             frame_surface = self._frame_surface_converter(frame, self._get_pygame())
             self._render_frame_surface(frame_surface, layout)
         except Exception as ex:  # noqa: BLE001 (A bad frame must not stop the UI loop).
@@ -590,6 +608,7 @@ class PygameDisplayRuntime:
                 layout.preview_bounds.top + 8,
                 RED,
             )
+        self._draw_uncalibrated_click_frame(slot_id, layout)
 
     def _handle_preview_click(self, window_position: object) -> None:
         if not isinstance(window_position, (tuple, list)) or len(window_position) != 2:
@@ -599,7 +618,7 @@ class PygameDisplayRuntime:
         except (OverflowError, TypeError, ValueError) as ex:
             self._last_point_error = f'INVALID_POINT: {ex}'
             return
-        for logical_name, layout in self._preview_layouts.items():
+        for slot_id, layout in self._preview_layouts.items():
             if not layout.preview_bounds.contains(window_point):
                 continue
             if layout.preview_transform is None:
@@ -610,13 +629,15 @@ class PygameDisplayRuntime:
             )
             try:
                 self.service.point_from_preview(
-                    logical_name,
+                    layout.slot_id or slot_id,
                     preview_point,
                     layout.preview_transform,
                 )
             except (MultiVisionError, OverflowError, TypeError, ValueError) as ex:
                 error_code = getattr(ex, 'code', type(ex).__name__)
                 self._last_point_error = f'{error_code}: {ex}'
+                if error_code == 'CALIBRATION_UNCALIBRATED':
+                    self._uncalibrated_click_cameras.add(layout.slot_id or slot_id)
             else:
                 self._last_point_error = None
             return
@@ -677,6 +698,101 @@ class PygameDisplayRuntime:
             ),
         )
 
+    def _build_preview_layouts(
+        self,
+        display_cameras: Sequence[_DisplayCamera] | None = None,
+    ) -> dict[str, CameraPreviewLayout]:
+        if display_cameras is None:
+            display_cameras = self._get_display_cameras()
+        statuses = [camera.status for camera in display_cameras]
+        session_cameras = [
+            camera.session_camera
+            for camera in display_cameras
+            if camera.session_camera is not None
+        ]
+        return build_camera_preview_layouts(
+            statuses,
+            self.configuration.window_resolution,
+            session_cameras=session_cameras if len(session_cameras) > 0 else None,
+        )
+
+    def _get_display_cameras(self) -> list[_DisplayCamera]:
+        statuses = self.service.get_camera_statuses()
+        if not isinstance(statuses, list):
+            raise TypeError('service returned an invalid camera status list')
+        session_camera_getter = getattr(self.service, 'get_session_cameras', None)
+        if not callable(session_camera_getter):
+            display_cameras = list(_build_display_cameras(statuses))
+        else:
+            session_cameras = session_camera_getter()
+            if not isinstance(session_cameras, list):
+                raise TypeError('service returned an invalid session camera list')
+            display_cameras = list(
+                _build_display_cameras(
+                    statuses,
+                    session_cameras if len(session_cameras) > 0 else None,
+                ),
+            )
+        self._clear_lifecycle_invalidated_clicks(display_cameras)
+        self._prune_uncalibrated_click_cameras(display_cameras)
+        return display_cameras
+
+    def _clear_lifecycle_invalidated_clicks(
+        self,
+        display_cameras: Sequence[_DisplayCamera],
+    ) -> None:
+        for camera in display_cameras:
+            session_camera = camera.session_camera
+            if session_camera is None:
+                continue
+            previous_generation = self._camera_lifecycle_generations.get(camera.slot_id)
+            if (
+                previous_generation is not None
+                and previous_generation != session_camera.lifecycle_generation
+            ):
+                self._uncalibrated_click_cameras.discard(camera.slot_id)
+            self._camera_lifecycle_generations[camera.slot_id] = (
+                session_camera.lifecycle_generation
+            )
+
+    def _prune_uncalibrated_click_cameras(
+        self,
+        display_cameras: Sequence[_DisplayCamera],
+    ) -> None:
+        eligible_cameras = {
+            camera.slot_id
+            for camera in display_cameras
+            if (
+                camera.status.runtime_status is RuntimeStatus.AVAILABLE
+                and _get_camera_state(camera.status, camera.session_camera)
+                is SessionCameraState.OPEN
+                and camera.status.native_resolution is not None
+                and camera.status.calibration_status is CalibrationStatus.UNCALIBRATED
+            )
+        }
+        self._uncalibrated_click_cameras.intersection_update(eligible_cameras)
+
+    def _draw_uncalibrated_click_frame(
+        self,
+        slot_id: str,
+        layout: CameraPreviewLayout,
+    ) -> None:
+        if slot_id not in self._uncalibrated_click_cameras:
+            return
+        assert self._window_surface is not None
+        bounds = layout.preview_bounds
+        self._get_pygame().draw.rect(
+            self._window_surface,
+            RED,
+            (
+                round(bounds.left),
+                round(bounds.top),
+                max(1, round(bounds.right - bounds.left)),
+                max(1, round(bounds.bottom - bounds.top)),
+            ),
+            3,
+        )
+
     def _get_calibration_status(self, status: CameraStatus) -> CalibrationStatus:
         return status.calibration_status
 
@@ -704,8 +820,10 @@ class PygameDisplayRuntime:
 def build_camera_preview_layouts(
     statuses: Sequence[CameraStatus],
     window_resolution: Resolution,
+    *,
+    session_cameras: Sequence[SessionCamera] | None = None,
 ) -> dict[str, CameraPreviewLayout]:
-    """Build a configuration-driven grid without changing camera-native geometry."""
+    """Build a deterministic grid without changing camera-native geometry."""
     _validate_resolution(window_resolution, 'window_resolution')
     status_values = tuple(statuses)
     if len(status_values) == 0:
@@ -738,13 +856,14 @@ def build_camera_preview_layouts(
     logical_names = [status.logical_name for status in status_values]
     if len(set(logical_names)) != len(logical_names):
         raise ValueError('camera logical names must be unique')
-    status_values = tuple(sorted(status_values, key=lambda status: status.logical_name))
-    column_count = max(1, math.ceil(math.sqrt(len(status_values))))
-    row_count = math.ceil(len(status_values) / column_count)
+    camera_values = _build_display_cameras(status_values, session_cameras)
+    column_count = max(1, math.ceil(math.sqrt(len(camera_values))))
+    row_count = math.ceil(len(camera_values) / column_count)
     panel_width = window_resolution.width / column_count
     panel_height = window_resolution.height / row_count
     layouts: dict[str, CameraPreviewLayout] = {}
-    for idx, status in enumerate(status_values):
+    for idx, camera in enumerate(camera_values):
+        status = camera.status
         x_idx = idx % column_count
         y_idx = idx // column_count
         panel_bounds = CoordinateBounds(
@@ -757,8 +876,8 @@ def build_camera_preview_layouts(
             panel_bounds.left + 8
             if panel_width > 16
             else panel_bounds.left,
-            panel_bounds.top + 82
-            if panel_height > 90
+            panel_bounds.top + 100
+            if panel_height > 108
             else panel_bounds.top,
             panel_bounds.right - 8
             if panel_width > 16
@@ -776,11 +895,12 @@ def build_camera_preview_layouts(
             if status.native_resolution is not None
             else None
         )
-        layouts[status.logical_name] = CameraPreviewLayout(
-            status.logical_name,
+        layouts[camera.slot_id] = CameraPreviewLayout(
+            camera.logical_name,
             panel_bounds,
             preview_bounds,
             preview_transform,
+            camera.slot_id if camera.session_camera is not None else None,
         )
     return layouts
 
@@ -848,6 +968,82 @@ def _render_apriltag_image(
         (pixel_size, pixel_size),
         'RGB',
     )
+
+
+def _build_display_cameras(
+    statuses: Sequence[CameraStatus],
+    session_cameras: Sequence[SessionCamera] | None = None,
+) -> tuple[_DisplayCamera, ...]:
+    if session_cameras is None:
+        return tuple(
+            _DisplayCamera(
+                status.logical_name,
+                status.logical_name,
+                status,
+                None,
+            )
+            for status in sorted(statuses, key=_camera_status_sort_key)
+        )
+
+    session_camera_values = tuple(session_cameras)
+    if any(
+        not isinstance(camera, SessionCamera)
+        for camera in session_camera_values
+    ):
+        raise TypeError('session_cameras must contain SessionCamera values')
+    if len({camera.slot_id for camera in session_camera_values}) != len(
+        session_camera_values,
+    ):
+        raise ValueError('session camera slots must be unique')
+    statuses_by_slot = {
+        status.logical_name: status
+        for status in statuses
+    }
+    if len(statuses_by_slot) != len(session_camera_values):
+        raise ValueError('session cameras and statuses must describe the same slots')
+    display_cameras: list[_DisplayCamera] = []
+    for camera in sorted(
+        session_camera_values,
+        key=lambda value: _slot_sort_key(value.slot_id),
+    ):
+        status = statuses_by_slot.get(camera.slot_id)
+        if status is None:
+            raise ValueError(
+                f'No runtime status was returned for session camera {camera.slot_id!r}',
+            )
+        display_cameras.append(
+            _DisplayCamera(
+                camera.slot_id,
+                camera.display_name,
+                status,
+                camera,
+            ),
+        )
+    return tuple(display_cameras)
+
+
+def _slot_sort_key(slot_id: str) -> tuple[int, int | str]:
+    prefix, separator, index = slot_id.rpartition('-')
+    if prefix == 'camera' and separator and index.isdigit():
+        return (0, int(index))
+    return (1, slot_id)
+
+
+def _camera_status_sort_key(status: CameraStatus) -> tuple[int, int | str]:
+    return _slot_sort_key(status.logical_name)
+
+
+def _get_camera_state(
+    status: CameraStatus,
+    session_camera: SessionCamera | None,
+) -> SessionCameraState:
+    if session_camera is not None:
+        return session_camera.state
+    if status.runtime_status is RuntimeStatus.STOPPED:
+        return SessionCameraState.CLOSED
+    if status.runtime_status is RuntimeStatus.UNAVAILABLE:
+        return SessionCameraState.UNAVAILABLE
+    return SessionCameraState.OPEN
 
 
 def _status_colour(status: RuntimeStatus) -> tuple[int, int, int]:

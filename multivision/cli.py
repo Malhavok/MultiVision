@@ -157,15 +157,38 @@ def _build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser('status', help='show service health')
     status_parser.set_defaults(command_handler='status')
 
-    cameras_parser = subparsers.add_parser('cameras', help='list or bind cameras')
-    camera_subparsers = cameras_parser.add_subparsers(dest='cameras_command', required=True)
-    list_parser = camera_subparsers.add_parser('list', help='list discovered camera devices')
+    cameras_parser = subparsers.add_parser(
+        'cameras',
+        help='list or manage session cameras',
+    )
+    camera_subparsers = cameras_parser.add_subparsers(
+        dest='cameras_command',
+        required=True,
+    )
+    list_parser = camera_subparsers.add_parser(
+        'list',
+        help='list session cameras',
+    )
     list_parser.set_defaults(command_handler='cameras_list')
-    bind_parser = camera_subparsers.add_parser('bind', help='bind a logical name to a device')
-    bind_parser.add_argument('logical_name')
-    bind_parser.add_argument('device_id')
-    bind_parser.set_defaults(command_handler='cameras_bind')
-
+    rename_parser = camera_subparsers.add_parser(
+        'rename',
+        help='rename a session camera',
+    )
+    rename_parser.add_argument('slot_id')
+    rename_parser.add_argument('name')
+    rename_parser.set_defaults(command_handler='cameras_rename')
+    close_parser = camera_subparsers.add_parser(
+        'close',
+        help='close a session camera',
+    )
+    close_parser.add_argument('slot_id')
+    close_parser.set_defaults(command_handler='cameras_close')
+    open_parser = camera_subparsers.add_parser(
+        'open',
+        help='open a session camera',
+    )
+    open_parser.add_argument('slot_id')
+    open_parser.set_defaults(command_handler='cameras_open')
     calibrate_parser = subparsers.add_parser('calibrate', help='calibrate one or all cameras')
     calibrate_parser.add_argument('--camera', dest='camera', default=None)
     calibrate_parser.set_defaults(command_handler='calibrate')
@@ -217,7 +240,9 @@ def _run_command(
     ] = {
         'status': _status,
         'cameras_list': _cameras_list,
-        'cameras_bind': _cameras_bind,
+        'cameras_rename': _cameras_rename,
+        'cameras_close': _cameras_close,
+        'cameras_open': _cameras_open,
         'calibrate': _calibrate,
         'calibration_verify': _calibration_verify,
         'calibration_status': _calibration_status,
@@ -240,18 +265,34 @@ def _cameras_list(
     client: MultiVisionClient,
     _arguments: argparse.Namespace,
 ) -> ServiceResponse:
-    return client.get('/cameras/discovered')
+    return client.get('/cameras')
 
 
-def _cameras_bind(
+def _cameras_rename(
     client: MultiVisionClient,
     arguments: argparse.Namespace,
 ) -> ServiceResponse:
-    logical_name = _quote_path_component(arguments.logical_name)
+    slot_id = _quote_path_component(arguments.slot_id)
     return client.post(
-        f'/cameras/{logical_name}/binding',
-        {'device_id': arguments.device_id},
+        f'/cameras/{slot_id}/rename',
+        {'name': arguments.name},
     )
+
+
+def _cameras_close(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    slot_id = _quote_path_component(arguments.slot_id)
+    return client.post(f'/cameras/{slot_id}/close')
+
+
+def _cameras_open(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    slot_id = _quote_path_component(arguments.slot_id)
+    return client.post(f'/cameras/{slot_id}/open')
 
 
 def _calibrate(client: MultiVisionClient, arguments: argparse.Namespace) -> ServiceResponse:

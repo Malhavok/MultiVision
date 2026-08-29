@@ -1,3 +1,4 @@
+import copy
 import math
 from enum import Enum
 from numbers import Real
@@ -13,6 +14,12 @@ class RuntimeStatus(str, Enum):
     UNAVAILABLE = 'UNAVAILABLE'
     ERROR = 'ERROR'
     STOPPED = 'STOPPED'
+
+
+class SessionCameraState(str, Enum):
+    OPEN = 'OPEN'
+    CLOSED = 'CLOSED'
+    UNAVAILABLE = 'UNAVAILABLE'
 
 
 class CalibrationStatus(str, Enum):
@@ -60,6 +67,13 @@ class DeviceInfo(NamedTuple):
     is_available: bool = True
     error_message: str | None = None
     is_stable_id: bool = True
+
+
+def copy_device_info(device: DeviceInfo) -> DeviceInfo:
+    """Copy a device record without sharing its mutable metadata."""
+    return device._replace(
+        metadata=None if device.metadata is None else copy.deepcopy(device.metadata),
+    )
 
 
 class Frame(NamedTuple):

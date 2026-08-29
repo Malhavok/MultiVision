@@ -25,12 +25,16 @@ from multivision.geometry import (
     coerce_point,
     is_finite_point,
     is_point_in_resolution,
+    project_camera_to_projector,
 )
+from multivision.persistence import PersistedCalibration
+from multivision.session import SessionCamera
 from multivision.types import (
     CalibrationStatus,
     CameraStatus,
     Resolution,
     RuntimeStatus,
+    SessionCameraState,
     is_finite_real,
     is_valid_resolution,
 )
@@ -68,6 +72,12 @@ class CalibrationPointRegistry(Protocol):
         ...
 
 
+class _ResolvedCamera(NamedTuple):
+    status: CameraStatus
+    session_camera: SessionCamera | None
+    calibration_id: str
+
+
 class RedCircleOverlay(NamedTuple):
     """The one overlay primitive required by MVP0."""
 
@@ -98,6 +108,7 @@ class PointOverlayService:
         calibration_registry: CalibrationPointRegistry,
         projector_resolution: Resolution,
         overlay_radius: int = 12,
+        calibration_version: int = 1,
     ) -> None:
         if not is_valid_resolution(projector_resolution):
             raise ValueError('projector_resolution must be a positive Resolution')
@@ -107,11 +118,18 @@ class PointOverlayService:
             or overlay_radius <= 0
         ):
             raise ValueError('overlay_radius must be a positive integer')
+        if (
+            not isinstance(calibration_version, int)
+            or isinstance(calibration_version, bool)
+            or calibration_version <= 0
+        ):
+            raise ValueError('calibration_version must be a positive integer')
 
         self.camera_runtime = camera_runtime
         self.calibration_registry = calibration_registry
         self.projector_resolution = projector_resolution
         self.overlay_radius = overlay_radius
+        self.calibration_version = calibration_version
         self._overlay: RedCircleOverlay | None = None
         self._lock = threading.RLock()
 
@@ -129,14 +147,14 @@ class PointOverlayService:
         """Convert one preview-local click through the native point path."""
         _validate_preview_transform(preview_transform)
         with self._lock:
-            status = self._get_available_status(logical_name)
-            if status.native_resolution != preview_transform.camera_resolution:
+            camera = self._get_available_camera(logical_name)
+            if camera.status.native_resolution != preview_transform.camera_resolution:
                 raise self._calibration_error(
                     'CAMERA_RESOLUTION_CHANGED',
                     f'Camera {logical_name!r} resolution does not match the preview',
                 )
             camera_point = preview_transform.to_camera_native(preview_point)
-            return self._point_from_camera_status(status, camera_point)
+            return self._point_from_camera(camera, camera_point)
 
     def point_from_camera(
         self,
@@ -146,64 +164,130 @@ class PointOverlayService:
         """Validate and project a camera-native point, replacing the overlay on success."""
         checked_camera_point = coerce_point(camera_point)
         with self._lock:
-            status = self._get_available_status(logical_name)
-            return self._point_from_camera_status(status, checked_camera_point)
+            camera = self._get_available_camera(logical_name)
+            return self._point_from_camera(camera, checked_camera_point)
 
     def clear_overlay(self) -> None:
         """Remove the current overlay without changing calibration state."""
         with self._lock:
             self._overlay = None
 
-    def _get_available_status(self, logical_name: str) -> CameraStatus:
+    def clear_overlay_for_camera(self, camera_id: str) -> None:
+        """Remove an overlay only when it belongs to the changed camera."""
+        if not isinstance(camera_id, str) or len(camera_id) == 0:
+            raise ValueError('camera_id must be a non-empty string')
+        with self._lock:
+            overlay = self._overlay
+            if overlay is None or overlay.camera_id != camera_id:
+                return
+            self._overlay = None
+
+    def rename_overlay_camera(self, camera_id: str, logical_name: str) -> None:
+        """Keep an owned overlay associated with a renamed session camera."""
+        if not isinstance(camera_id, str) or len(camera_id) == 0:
+            raise ValueError('camera_id must be a non-empty string')
         if not isinstance(logical_name, str) or len(logical_name) == 0:
             raise ValueError('logical_name must be a non-empty string')
+        with self._lock:
+            overlay = self._overlay
+            if overlay is None:
+                return
+            if overlay.camera_id != camera_id:
+                return
+            self._overlay = overlay._replace(logical_name=logical_name)
+
+    def _get_available_camera(self, camera_reference: str) -> _ResolvedCamera:
+        if not isinstance(camera_reference, str) or len(camera_reference) == 0:
+            raise ValueError('camera_reference must be a non-empty string')
+        session_camera = self._find_session_camera(camera_reference)
+        resolved_reference = (
+            session_camera.slot_id
+            if session_camera is not None
+            else camera_reference
+        )
         try:
-            status = self.camera_runtime.get_status(logical_name)
+            status = self.camera_runtime.get_status(resolved_reference)
         except CameraUnavailableError:
             raise
         except (KeyError, ValueError) as ex:
             raise CameraUnavailableError(
-                f'Camera {logical_name!r} is not configured',
+                f'Camera {camera_reference!r} is not configured',
             ) from ex
         if not isinstance(status, CameraStatus):
             raise CameraUnavailableError(
-                f'Camera {logical_name!r} returned an invalid status',
+                f'Camera {camera_reference!r} returned an invalid status',
             )
-        if status.logical_name != logical_name:
+        if status.logical_name != resolved_reference:
             raise CameraUnavailableError(
-                f'Camera {logical_name!r} returned a status for another camera',
+                f'Camera {camera_reference!r} returned a status for another camera',
+            )
+        if session_camera is not None and session_camera.state is not SessionCameraState.OPEN:
+            raise CameraUnavailableError(
+                session_camera.error_message
+                or f'Camera {camera_reference!r} is not available',
             )
         if status.runtime_status is not RuntimeStatus.AVAILABLE:
             raise CameraUnavailableError(
                 status.error_message
-                or f'Camera {logical_name!r} is not available',
+                or f'Camera {camera_reference!r} is not available',
             )
-        if (
-            not isinstance(status.device_id, str)
-            or len(status.device_id) == 0
-            or not is_valid_resolution(status.native_resolution)
-        ):
+        if not is_valid_resolution(status.native_resolution):
             raise CameraUnavailableError(
-                f'Camera {logical_name!r} has no stable device or native resolution',
+                f'Camera {camera_reference!r} has no native resolution',
             )
-        return status
+        calibration_id = (
+            session_camera.slot_id
+            if session_camera is not None
+            else status.device_id
+        )
+        if not isinstance(calibration_id, str) or len(calibration_id) == 0:
+            raise CameraUnavailableError(
+                f'Camera {camera_reference!r} has no calibration identity',
+            )
+        return _ResolvedCamera(status, session_camera, calibration_id)
 
-    def _point_from_camera_status(
+    def _find_session_camera(self, camera_reference: str) -> SessionCamera | None:
+        get_session_cameras = getattr(self.camera_runtime, 'get_session_cameras', None)
+        if not callable(get_session_cameras):
+            return None
+        session_cameras = get_session_cameras()
+        if not isinstance(session_cameras, list) or any(
+            not isinstance(camera, SessionCamera)
+            for camera in session_cameras
+        ):
+            raise CameraUnavailableError('Camera runtime returned an invalid session camera list')
+        for camera in session_cameras:
+            if camera.slot_id == camera_reference:
+                return camera
+        matches = [
+            camera
+            for camera in session_cameras
+            if camera.display_name == camera_reference
+        ]
+        if len(matches) > 1:
+            raise CameraUnavailableError(
+                f'Camera name {camera_reference!r} is ambiguous',
+            )
+        return matches[0] if len(matches) == 1 else None
+
+    def _point_from_camera(
         self,
-        status: CameraStatus,
+        camera: _ResolvedCamera,
         camera_point: Point2D,
     ) -> RedCircleOverlay:
-        assert status.device_id is not None
+        status = camera.status
         assert status.native_resolution is not None
         if not is_point_in_resolution(camera_point, status.native_resolution):
             raise PointOutsideCalibratedRegionError(
                 f'Camera point {camera_point!r} is outside the native camera bounds',
             )
-        calibration_status = self.calibration_registry.get_status(
-            status.device_id,
-            camera_resolution=status.native_resolution,
-            projector_resolution=self.projector_resolution,
-        )
+        session_calibration_error_code = self._get_session_calibration_error_code(camera)
+        if session_calibration_error_code is not None:
+            raise self._calibration_error(
+                session_calibration_error_code,
+                f'Camera {status.logical_name!r} calibration is not applicable',
+            )
+        calibration_status = self._get_calibration_status(camera)
         if not isinstance(calibration_status, CalibrationStatus):
             raise self._calibration_error(
                 'CALIBRATION_INVALID',
@@ -215,25 +299,18 @@ class PointOverlayService:
                 'get_status_error_code',
                 None,
             )
-            error_code = (
-                get_status_error_code(
-                    status.device_id,
+            error_code = _calibration_error_code(calibration_status)
+            if camera.session_camera is None and callable(get_status_error_code):
+                error_code = get_status_error_code(
+                    camera.calibration_id,
                     camera_resolution=status.native_resolution,
                     projector_resolution=self.projector_resolution,
                 )
-                if callable(get_status_error_code)
-                else _calibration_error_code(calibration_status)
-            )
             raise self._calibration_error(
                 error_code,
                 f'Camera {status.logical_name!r} calibration is {calibration_status.value}',
             )
-        projector_point = self.calibration_registry.project_camera_to_projector(
-            status.device_id,
-            camera_point,
-            camera_resolution=status.native_resolution,
-            projector_resolution=self.projector_resolution,
-        )
+        projector_point = self._project_camera_point(camera, camera_point)
         if not isinstance(projector_point, Point2D) or not is_finite_point(projector_point):
             raise InvalidHomographyError(
                 'Camera-to-projector homography produced a non-finite point',
@@ -244,8 +321,10 @@ class PointOverlayService:
             )
 
         overlay = RedCircleOverlay(
-            status.logical_name,
-            status.device_id,
+            camera.session_camera.display_name
+            if camera.session_camera is not None
+            else status.logical_name,
+            camera.calibration_id,
             camera_point,
             projector_point,
             self.overlay_radius,
@@ -253,6 +332,70 @@ class PointOverlayService:
         with self._lock:
             self._overlay = overlay
         return overlay
+
+    def _get_session_calibration_error_code(
+        self,
+        camera: _ResolvedCamera,
+    ) -> str | None:
+        session_camera = camera.session_camera
+        if session_camera is None:
+            return None
+        calibration = session_camera.calibration
+        if calibration is None:
+            return None
+        if not isinstance(calibration, PersistedCalibration):
+            return None
+        if calibration.camera_id != session_camera.slot_id:
+            return 'CALIBRATION_INVALID'
+        if calibration.version != self.calibration_version:
+            return 'CALIBRATION_STALE'
+        if calibration.camera_resolution != camera.status.native_resolution:
+            return 'CAMERA_RESOLUTION_CHANGED'
+        if calibration.projector_resolution != self.projector_resolution:
+            return 'PROJECTOR_RESOLUTION_CHANGED'
+        return None
+
+    def _get_calibration_status(self, camera: _ResolvedCamera) -> CalibrationStatus:
+        session_camera = camera.session_camera
+        if session_camera is not None:
+            return session_camera.calibration_status
+        return self.calibration_registry.get_status(
+            camera.calibration_id,
+            camera_resolution=camera.status.native_resolution,
+            projector_resolution=self.projector_resolution,
+        )
+
+    def _project_camera_point(
+        self,
+        camera: _ResolvedCamera,
+        camera_point: Point2D,
+    ) -> Point2D:
+        session_camera = camera.session_camera
+        if session_camera is None:
+            return self.calibration_registry.project_camera_to_projector(
+                camera.calibration_id,
+                camera_point,
+                camera_resolution=camera.status.native_resolution,
+                projector_resolution=self.projector_resolution,
+            )
+        if session_camera.calibration is None:
+            raise InvalidHomographyError(
+                'Session camera has no current calibration transform',
+            )
+
+        calibration = session_camera.calibration
+        camera_to_projector = getattr(calibration, 'camera_to_projector', None)
+        valid_region = getattr(calibration, 'valid_region', None)
+        if camera_to_projector is None or valid_region is None:
+            raise InvalidHomographyError(
+                'Session camera calibration has no camera-to-projector transform',
+            )
+        return project_camera_to_projector(
+            camera_point,
+            camera_to_projector,
+            calibrated_region=valid_region,
+            projector_resolution=self.projector_resolution,
+        )
 
     @staticmethod
     def _calibration_error(

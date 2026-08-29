@@ -1,254 +1,269 @@
-"""Camera discovery and binding-status reporting."""
+"""Session-local camera discovery."""
 
-import json
-import subprocess
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from typing import Any
 
 from multivision.errors import HardwareError
 from multivision.hardware import DeviceDiscovery
+from multivision.session import MAX_ACTIVE_CAMERAS
 from multivision.types import (
     DeviceInfo,
+    Resolution,
+    copy_device_info,
+    is_finite_real,
     is_valid_resolution,
 )
 
-CommandRunner = Callable[..., Any]
-CaptureIndexResolver = Callable[[str], int | None]
-
-_STABLE_ID_KEYS = (
-    'spcamera_device_unique_id',
-    'spcamera_device_uid',
-    'spcamera_unique_id',
-    'spcamera_unique-id',
-    'device_unique_id',
-    'device_uid',
-    'unique_id',
-)
+CaptureOpener = Callable[[int], Any]
 
 
-def _system_camera_metadata(command_runner: CommandRunner) -> list[dict[str, Any]]:
-    try:
-        result = command_runner(
-            ['system_profiler', 'SPCameraDataType', '-json'],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=5,
-        )
-        if getattr(result, 'returncode', 1) != 0:
-            raise HardwareError('macOS camera metadata command failed')
-        output = getattr(result, 'stdout', None)
-        if not isinstance(output, (str, bytes, bytearray)):
-            raise HardwareError('macOS camera metadata output was malformed')
-        profile = json.loads(output)
-    except HardwareError:
-        raise
-    except Exception as ex:  # noqa: BLE001 (Discovery is a hardware boundary).
-        raise HardwareError('Could not read macOS camera metadata') from ex
-
-    if not isinstance(profile, dict):
-        raise HardwareError('macOS camera metadata root was malformed')
-    entries = profile.get('SPCameraDataType', [])
-    if not isinstance(entries, list):
-        raise HardwareError('macOS camera metadata entries were malformed')
-    if any(not isinstance(entry, dict) for entry in entries):
-        raise HardwareError('macOS camera metadata contained a malformed device')
-    return entries
-
-
-def _device_id_from_entry(entry: Mapping[str, Any], name: str) -> tuple[str, bool]:
-    for key in _STABLE_ID_KEYS:
-        value = entry.get(key)
-        if isinstance(value, str) and len(value) > 0:
-            return value, True
-    return f'unstable-macos-name:{name}', False
-
-
-class MacOSDeviceDiscovery:
-    """Discover macOS cameras using native metadata without opening them."""
+class OpenCVCaptureIndexDiscovery:
+    """Probe current OpenCV indexes once and retain that session snapshot."""
 
     def __init__(
         self,
-        command_runner: CommandRunner | None = None,
-        platform_name: str | None = None,
-        capture_index_resolver: CaptureIndexResolver | None = None,
+        max_capture_index: int = 10,
+        capture_opener: CaptureOpener | None = None,
+        backend: int | None = None,
     ) -> None:
-        self.command_runner = subprocess.run if command_runner is None else command_runner
-        self.platform_name = sys.platform if platform_name is None else platform_name
-        self._capture_index_resolver = (
-            _resolve_avfoundation_capture_index
-            if command_runner is None
-            else capture_index_resolver
-        )
+        if (
+            not isinstance(max_capture_index, int)
+            or isinstance(max_capture_index, bool)
+            or max_capture_index <= 0
+        ):
+            raise ValueError('max_capture_index must be a positive integer')
+        if backend is not None and (
+            not isinstance(backend, int) or isinstance(backend, bool)
+        ):
+            raise ValueError('backend must be an integer or None')
+        self.max_capture_index = max_capture_index
+        self._capture_opener = capture_opener
+        self.backend = backend
+        self._snapshot: tuple[DeviceInfo, ...] | None = None
+        self._retain_probes = False
+        self._probed_captures: dict[int, Any] = {}
+
+    def prepare_for_runtime(self) -> None:
+        """Keep the selected startup probes for the owning runtime to adopt."""
+        self._retain_probes = True
+
+    def take_capture(self, capture_index: int) -> Any | None:
+        """Transfer one retained startup probe to the persistent capture owner."""
+        return self._probed_captures.pop(capture_index, None)
+
+    def release_unused_captures(self) -> None:
+        """Release startup probes that were not selected for persistent capture."""
+        captures = list(self._probed_captures.items())
+        self._probed_captures.clear()
+        release_error: HardwareError | None = None
+        for capture_index, capture in captures:
+            try:
+                _release_probe_capture(capture, capture_index)
+            except HardwareError as ex:
+                if release_error is None:
+                    release_error = ex
+        if release_error is not None:
+            raise release_error
 
     def discover_devices(self) -> list[DeviceInfo]:
-        if self.platform_name != 'darwin':
-            return []
+        """Return the fixed startup inventory without remapping its slots."""
+        if self._snapshot is None:
+            devices: list[DeviceInfo] = []
+            try:
+                for capture_index in range(self.max_capture_index):
+                    device = self._probe_capture_index(
+                        capture_index,
+                        retain_capture=(
+                            self._retain_probes
+                            and len(devices) < MAX_ACTIVE_CAMERAS
+                        ),
+                    )
+                    if device is not None:
+                        devices.append(device)
+            except BaseException:
+                self.release_unused_captures()
+                raise
+            self._snapshot = tuple(devices)
+        return [copy_device_info(device) for device in self._snapshot]
 
-        devices: list[DeviceInfo] = []
-        capture_index_resolver = self._capture_index_resolver
-        capture_indices: dict[str, int] | None = None
-        if capture_index_resolver is _resolve_avfoundation_capture_index:
-            capture_indices = _resolve_avfoundation_capture_indices()
-        for profiler_index, entry in enumerate(
-            _system_camera_metadata(self.command_runner),
-        ):
-            name = entry.get('_name')
-            if not isinstance(name, str) or len(name) == 0:
-                name = f'Camera {profiler_index + 1}'
-            device_id, is_stable_id = _device_id_from_entry(entry, name)
-            capture_index = profiler_index
-            is_available = True
-            error_message: str | None = None
-            if capture_indices is not None:
-                capture_index = capture_indices.get(device_id)
-                if capture_index is None:
-                    is_available = False
-                    error_message = (
-                        f'Could not resolve stable device ID {device_id!r} '
-                        'to an AVFoundation capture index'
-                    )
-            elif capture_index_resolver is not None:
-                capture_index = capture_index_resolver(device_id)
-                if capture_index is None:
-                    is_available = False
-                    error_message = (
-                        f'Could not resolve stable device ID {device_id!r} '
-                        'to an AVFoundation capture index'
-                    )
-                elif (
-                    not isinstance(capture_index, int)
-                    or isinstance(capture_index, bool)
-                    or capture_index < 0
-                ):
-                    raise HardwareError(
-                        'AVFoundation capture-index resolver returned an invalid index',
-                    )
-            device = DeviceInfo(
-                device_id=device_id,
-                name=name,
-                capture_index=capture_index,
-                backend_name='avfoundation',
-                metadata=dict(entry),
-                is_available=is_available,
-                error_message=error_message,
-                is_stable_id=is_stable_id,
+    def _probe_capture_index(
+        self,
+        capture_index: int,
+        retain_capture: bool = False,
+    ) -> DeviceInfo | None:
+        capture = self._open_capture(capture_index)
+        if capture is None:
+            raise HardwareError(
+                f'OpenCV returned no capture probe for index {capture_index}',
             )
-            devices.append(device)
-        return devices
+
+        keep_capture = False
+        try:
+            is_opened = getattr(capture, 'isOpened', None)
+            if not callable(is_opened):
+                raise HardwareError(
+                    f'OpenCV capture probe {capture_index} has no isOpened method',
+                )
+            try:
+                opened = is_opened()
+            except Exception as ex:  # noqa: BLE001 (OpenCV is a hardware boundary).
+                raise HardwareError(
+                    f'Could not probe OpenCV capture index {capture_index}',
+                ) from ex
+            if not isinstance(opened, bool):
+                raise HardwareError(
+                    f'OpenCV capture probe {capture_index} returned a malformed open state',
+                )
+            if not opened:
+                return None
+
+            native_resolution, resolution_metadata = _probe_native_resolution(
+                capture,
+                capture_index,
+            )
+            metadata: dict[str, Any] = {
+                'capture_index': capture_index,
+                'probe': 'opencv',
+            }
+            metadata.update(resolution_metadata)
+            device = DeviceInfo(
+                device_id=f'capture-index-{capture_index}',
+                name=f'Camera {capture_index}',
+                capture_index=capture_index,
+                native_resolution=native_resolution,
+                backend_name='opencv',
+                metadata=metadata,
+                is_available=True,
+                is_stable_id=False,
+            )
+            if retain_capture:
+                self._probed_captures[capture_index] = capture
+                keep_capture = True
+            return device
+        finally:
+            if not keep_capture:
+                _release_probe_capture(capture, capture_index)
+
+    def _open_capture(self, capture_index: int) -> Any:
+        if self._capture_opener is not None:
+            try:
+                return self._capture_opener(capture_index)
+            except Exception as ex:  # noqa: BLE001 (OpenCV is a hardware boundary).
+                raise HardwareError(
+                    f'Could not open OpenCV capture index {capture_index}',
+                ) from ex
+
+        try:
+            import cv2
+        except ImportError as ex:
+            raise HardwareError('OpenCV is not installed') from ex
+
+        try:
+            if self.backend is None:
+                return cv2.VideoCapture(capture_index)
+            return cv2.VideoCapture(capture_index, self.backend)
+        except Exception as ex:  # noqa: BLE001 (OpenCV is a hardware boundary).
+            raise HardwareError(
+                f'Could not open OpenCV capture index {capture_index}',
+            ) from ex
 
 
 class PlatformDeviceDiscovery:
-    """Select the platform implementation without leaking it to callers."""
+    """Select the session-local OpenCV inventory for the current platform."""
 
     def __init__(
         self,
         platform_name: str | None = None,
-        macos_discovery: DeviceDiscovery | None = None,
-        command_runner: CommandRunner | None = None,
+        opencv_discovery: DeviceDiscovery | None = None,
     ) -> None:
         self.platform_name = sys.platform if platform_name is None else platform_name
-        self._macos_discovery = macos_discovery
-        if self.platform_name == 'darwin' and self._macos_discovery is None:
-            self._macos_discovery = MacOSDeviceDiscovery(
-                command_runner=command_runner,
-                platform_name=self.platform_name,
-            )
+        self._discovery = opencv_discovery
+        if self._discovery is None and self.platform_name == 'darwin':
+            self._discovery = OpenCVCaptureIndexDiscovery()
 
     def discover_devices(self) -> list[DeviceInfo]:
-        if self.platform_name != 'darwin':
+        if self._discovery is None:
             return []
-        assert self._macos_discovery is not None, 'macOS discovery must be configured'
-        return self._macos_discovery.discover_devices()
+        return self._discovery.discover_devices()
 
 
-def _resolve_avfoundation_capture_indices() -> dict[str, int]:
+def _probe_native_resolution(
+    capture: Any,
+    capture_index: int,
+) -> tuple[Resolution | None, dict[str, int | float]]:
+    get_native_resolution = getattr(capture, 'get_native_resolution', None)
+    if callable(get_native_resolution):
+        try:
+            native_resolution = get_native_resolution()
+        except Exception as ex:  # noqa: BLE001 (OpenCV is a hardware boundary).
+            raise HardwareError(
+                f'Could not read metadata for OpenCV capture index {capture_index}',
+            ) from ex
+        if native_resolution is not None and not is_valid_resolution(native_resolution):
+            raise HardwareError(
+                f'OpenCV capture index {capture_index} returned a malformed resolution',
+            )
+        if native_resolution is None:
+            return None, {}
+        return native_resolution, {
+            'native_width': native_resolution.width,
+            'native_height': native_resolution.height,
+        }
+
+    get_property = getattr(capture, 'get', None)
+    if not callable(get_property):
+        return None, {}
     try:
-        import AVFoundation
-    except ImportError as ex:
+        import cv2
+
+        width = get_property(cv2.CAP_PROP_FRAME_WIDTH)
+        height = get_property(cv2.CAP_PROP_FRAME_HEIGHT)
+    except Exception as ex:  # noqa: BLE001 (OpenCV is a hardware boundary).
         raise HardwareError(
-            'PyObjC AVFoundation support is required to resolve macOS camera IDs',
+            f'Could not read metadata for OpenCV capture index {capture_index}',
         ) from ex
-
-    media_type = getattr(AVFoundation, 'AVMediaTypeVideo', None)
-    capture_device_class = getattr(AVFoundation, 'AVCaptureDevice', None)
-    list_devices = getattr(capture_device_class, 'devicesWithMediaType_', None)
-    if media_type is None or not callable(list_devices):
-        raise HardwareError('AVFoundation does not provide video-device enumeration')
-
-    try:
-        devices = list_devices(media_type)
-    except Exception as ex:  # noqa: BLE001 (AVFoundation is a hardware boundary).
-        raise HardwareError('Could not enumerate AVFoundation camera devices') from ex
-
-    capture_indices: dict[str, int] = {}
-    for capture_index, device in enumerate(devices):
-        get_unique_id = getattr(device, 'uniqueID', None)
-        unique_id = get_unique_id() if callable(get_unique_id) else None
-        if not isinstance(unique_id, str) or len(unique_id) == 0:
-            continue
-        if unique_id in capture_indices:
-            raise HardwareError(f'AVFoundation returned duplicate camera ID {unique_id!r}')
-        capture_indices[unique_id] = capture_index
-    return capture_indices
-
-
-def _resolve_avfoundation_capture_index(device_id: str) -> int | None:
-    return _resolve_avfoundation_capture_indices().get(device_id)
-
-
-def _group_discovered_devices(
-    discovered_devices: Any,
-) -> dict[str, list[DeviceInfo]]:
-    if not isinstance(discovered_devices, list):
-        raise HardwareError('Discovery returned a malformed device list')
-
-    devices_by_id: dict[str, list[DeviceInfo]] = {}
-    for device in discovered_devices:
-        _validate_discovered_device(device)
-        devices_by_id.setdefault(device.device_id, []).append(device)
-    return devices_by_id
-
-
-def _validate_discovered_device(device: DeviceInfo) -> None:
-    if not isinstance(device, DeviceInfo):
-        raise HardwareError('Discovery returned malformed device information')
-    if not isinstance(device.device_id, str) or len(device.device_id) == 0:
-        raise HardwareError('Discovery returned a device without an ID')
-    if not isinstance(device.name, str) or len(device.name) == 0:
-        raise HardwareError('Discovery returned a device without a name')
-    if (
-        device.capture_index is not None
-        and (
-            not isinstance(device.capture_index, int)
-            or isinstance(device.capture_index, bool)
-            or device.capture_index < 0
+    if not isinstance(width, (int, float)) or isinstance(width, bool):
+        raise HardwareError(
+            f'OpenCV capture index {capture_index} returned a malformed width',
         )
-    ):
-        raise HardwareError('Discovery returned a device with an invalid capture index')
-    if device.backend_name is not None and not isinstance(device.backend_name, str):
-        raise HardwareError('Discovery returned a device with an invalid backend name')
-    if device.metadata is not None and not isinstance(device.metadata, dict):
-        raise HardwareError('Discovery returned a device with invalid metadata')
-    if (
-        not isinstance(device.is_available, bool)
-        or not isinstance(device.is_stable_id, bool)
-    ):
-        raise HardwareError('Discovery returned malformed device status')
-    if (
-        device.error_message is not None
-        and not isinstance(device.error_message, str)
-    ):
-        raise HardwareError('Discovery returned a device with an invalid error message')
-    if (
-        device.native_resolution is not None
-        and not is_valid_resolution(device.native_resolution)
-    ):
-        raise HardwareError('Discovery returned a malformed resolution')
+    if not isinstance(height, (int, float)) or isinstance(height, bool):
+        raise HardwareError(
+            f'OpenCV capture index {capture_index} returned a malformed height',
+        )
+    if not is_finite_real(width) or not is_finite_real(height):
+        raise HardwareError(
+            f'OpenCV capture index {capture_index} returned a non-finite resolution',
+        )
+    if width <= 0 or height <= 0:
+        return None, {}
+
+    native_resolution = Resolution(round(width), round(height))
+    if not is_valid_resolution(native_resolution):
+        raise HardwareError(
+            f'OpenCV capture index {capture_index} returned a malformed resolution',
+        )
+    return native_resolution, {
+        'native_width': native_resolution.width,
+        'native_height': native_resolution.height,
+    }
+
+
+def _release_probe_capture(capture: Any, capture_index: int) -> None:
+    release = getattr(capture, 'release', None)
+    if not callable(release):
+        raise HardwareError(
+            f'OpenCV capture probe {capture_index} has no release method',
+        )
+    try:
+        release()
+    except Exception as ex:  # noqa: BLE001 (OpenCV is a hardware boundary).
+        raise HardwareError(
+            f'Could not release OpenCV capture probe {capture_index}',
+        ) from ex
 
 
 __all__ = [
-    'MacOSDeviceDiscovery',
+    'OpenCVCaptureIndexDiscovery',
     'PlatformDeviceDiscovery',
 ]

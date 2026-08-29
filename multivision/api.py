@@ -1,4 +1,4 @@
-"""Local FastAPI boundary for the persistent MultiVision service."""
+"""Local FastAPI boundary for the session-local MultiVision service."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from pydantic import (
 from multivision.application import MultiVisionService
 from multivision.errors import (
     CalibrationError,
+    CameraSlotNotFoundError,
     CameraUnavailableError,
     ConfigurationError,
     FiducialDetectionError,
@@ -32,11 +33,16 @@ from multivision.errors import (
     GeometryError,
     HardwareError,
     MultiVisionError,
+    SessionCameraError,
 )
 from multivision.fiducials import FiducialCorrespondence
 from multivision.geometry import Point2D
 from multivision.persistence import PersistedCalibration
 from multivision.service import RedCircleOverlay
+from multivision.session import (
+    FrameMetadata,
+    SessionCamera,
+)
 from multivision.types import (
     CalibrationStatus,
     CameraStatus,
@@ -86,12 +92,12 @@ class CalibrationRequest(BaseModel):
     correspondences: list[CorrespondenceRequest] | None = None
 
 
-class CameraBindingRequest(BaseModel):
-    """A stable device ID to persist for one logical camera name."""
+class CameraRenameRequest(BaseModel):
+    """The new display name for a session camera slot."""
 
     model_config = ConfigDict(extra='forbid')
 
-    device_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
 
 
 class PointRequest(BaseModel):
@@ -194,7 +200,35 @@ def create_app(
 
     @app.get('/cameras')
     def get_cameras() -> list[dict[str, Any]]:
+        session_cameras = owned_service.get_session_cameras()
+        if len(session_cameras) > 0:
+            return [
+                _session_camera_to_data(owned_service, camera)
+                for camera in session_cameras
+            ]
         return [_camera_to_data(status) for status in owned_service.get_camera_statuses()]
+
+    @app.post('/cameras/{slot_id}/rename')
+    def rename_camera(
+        slot_id: Annotated[str, Path(min_length=1)],
+        request: CameraRenameRequest,
+    ) -> dict[str, Any]:
+        camera = owned_service.rename_camera(slot_id, request.name)
+        return _session_camera_to_data(owned_service, camera)
+
+    @app.post('/cameras/{slot_id}/close')
+    def close_camera(
+        slot_id: Annotated[str, Path(min_length=1)],
+    ) -> dict[str, Any]:
+        camera = owned_service.close_camera(slot_id)
+        return _session_camera_to_data(owned_service, camera)
+
+    @app.post('/cameras/{slot_id}/open')
+    def open_camera(
+        slot_id: Annotated[str, Path(min_length=1)],
+    ) -> dict[str, Any]:
+        camera = owned_service.open_camera(slot_id)
+        return _session_camera_to_data(owned_service, camera)
 
     @app.get('/cameras/discovered')
     def get_discovered_cameras() -> list[dict[str, Any]]:
@@ -208,13 +242,6 @@ def create_app(
         logical_name: Annotated[str, Path(min_length=1)],
     ) -> dict[str, Any]:
         return _camera_to_data(owned_service.get_camera_status(logical_name))
-
-    @app.post('/cameras/{logical_name}/binding')
-    def bind_camera(
-        logical_name: Annotated[str, Path(min_length=1)],
-        request: CameraBindingRequest,
-    ) -> dict[str, str | bool]:
-        return owned_service.bind_camera(logical_name, request.device_id)
 
     @app.get('/cameras/{logical_name}/snapshot')
     def get_camera_snapshot(
@@ -368,6 +395,41 @@ def _camera_to_data(status: CameraStatus) -> dict[str, Any]:
     }
 
 
+def _session_camera_to_data(
+    service: MultiVisionService,
+    camera: SessionCamera,
+) -> dict[str, Any]:
+    status = service.get_camera_status(camera.slot_id)
+    device_info = camera.device_info
+    frame_metadata = camera.frame_metadata
+    return {
+        'camera': camera.display_name,
+        'slot': camera.slot_id,
+        'name': camera.display_name,
+        'device_id': device_info.device_id if device_info is not None else None,
+        'capture_index': camera.capture_index,
+        'state': camera.state.value,
+        'runtime_status': status.runtime_status.value,
+        'calibration_status': status.calibration_status.value,
+        'native_resolution': _resolution_to_data(status.native_resolution),
+        'frame_counter': status.frame_counter,
+        'frame_metadata': _frame_metadata_to_data(frame_metadata),
+        'error_message': status.error_message or camera.error_message,
+    }
+
+
+def _frame_metadata_to_data(
+    frame_metadata: FrameMetadata | None,
+) -> dict[str, Any] | None:
+    if frame_metadata is None:
+        return None
+    return {
+        'frame_counter': frame_metadata.frame_counter,
+        'captured_at_seconds': frame_metadata.captured_at_seconds,
+        'native_resolution': _resolution_to_data(frame_metadata.native_resolution),
+    }
+
+
 def _resolution_to_data(resolution: Resolution | None) -> dict[str, int] | None:
     if resolution is None:
         return None
@@ -455,6 +517,7 @@ def _error_code(exception: MultiVisionError) -> str:
     if isinstance(explicit_code, str) and len(explicit_code) > 0:
         return explicit_code
     error_codes: tuple[tuple[type[MultiVisionError], str], ...] = (
+        (SessionCameraError, 'SESSION_CAMERA_ERROR'),
         (CameraUnavailableError, 'CAMERA_UNAVAILABLE'),
         (FrameCaptureError, 'FRAME_UNAVAILABLE'),
         (ConfigurationError, 'CONFIGURATION_ERROR'),
@@ -470,6 +533,10 @@ def _error_code(exception: MultiVisionError) -> str:
 
 
 def _error_status(exception: MultiVisionError) -> int:
+    if isinstance(exception, CameraSlotNotFoundError):
+        return 404
+    if isinstance(exception, SessionCameraError):
+        return 409
     if isinstance(exception, (CameraUnavailableError, FrameCaptureError)):
         return 503
     if isinstance(exception, GeometryError):
@@ -495,7 +562,7 @@ app = create_app()
 
 __all__ = [
     'CalibrationRequest',
-    'CameraBindingRequest',
+    'CameraRenameRequest',
     'CorrespondenceRequest',
     'PointPairRequest',
     'PointRequest',

@@ -1,4 +1,4 @@
-"""Persistent service composition for MultiVision capabilities."""
+"""Service composition for MultiVision capabilities."""
 
 from __future__ import annotations
 
@@ -12,14 +12,13 @@ from multivision.camera import CameraRuntime
 from multivision.config import (
     Configuration,
     load_configuration,
-    save_configuration,
-    validate_camera_bindings,
 )
 from multivision.discovery import PlatformDeviceDiscovery
 from multivision.errors import (
     CalibrationError,
     CameraUnavailableError,
     FrameCaptureError,
+    SessionCameraError,
 )
 from multivision.geometry import Point2D, PreviewTransform
 from multivision.fiducials import (
@@ -42,12 +41,14 @@ from multivision.persistence import (
     PersistedCalibration,
 )
 from multivision.service import PointOverlayService, RedCircleOverlay
+from multivision.session import SessionCamera
 from multivision.types import (
     CalibrationStatus,
     CameraStatus,
     DeviceInfo,
     Frame,
     RuntimeStatus,
+    SessionCameraState,
     is_valid_resolution,
 )
 
@@ -57,7 +58,7 @@ CALIBRATION_PATTERN_SETTLE_SECONDS = 0.1
 
 
 class MultiVisionService:
-    """Own the persistent camera, calibration and overlay capabilities."""
+    """Own camera, calibration and overlay capabilities for one service run."""
 
     def __init__(
         self,
@@ -96,7 +97,6 @@ class MultiVisionService:
         if not isinstance(configuration, Configuration):
             raise ValueError('configuration must be Configuration')
         self.configuration = configuration
-        self._config_path = effective_config_path
 
         self.calibration_store = (
             calibration_store
@@ -110,16 +110,6 @@ class MultiVisionService:
         )
         if not isinstance(self.calibration_pattern, CalibrationPattern):
             raise ValueError('calibration_pattern must be CalibrationPattern')
-        self.calibration_registry = (
-            calibration_registry
-            if calibration_registry is not None
-            else CalibrationRegistry.from_store(
-                self.calibration_store,
-                calibration_version=configuration.calibration_version,
-                projector_resolution=configuration.projector_resolution,
-            )
-        )
-
         self.camera_runtime = (
             camera_runtime
             if camera_runtime is not None
@@ -128,7 +118,14 @@ class MultiVisionService:
                 capture_factory
                 if capture_factory is not None
                 else OpenCVCaptureDeviceFactory(),
-                configuration.camera_bindings,
+            )
+        )
+        self.calibration_registry = (
+            calibration_registry
+            if calibration_registry is not None
+            else CalibrationRegistry(
+                calibration_version=self.configuration.calibration_version,
+                projector_resolution=self.configuration.projector_resolution,
             )
         )
         self.point_service = (
@@ -138,10 +135,12 @@ class MultiVisionService:
                 self.camera_runtime,
                 self.calibration_registry,
                 configuration.projector_resolution,
+                calibration_version=self.configuration.calibration_version,
             )
         )
         self.detector = detector
         self._lifecycle_lock = threading.RLock()
+        self._camera_management_lock = threading.RLock()
         self._calibration_capture_count = 0
         self._calibration_capture_lock = threading.RLock()
         self._calibration_pattern_presented = threading.Event()
@@ -154,7 +153,15 @@ class MultiVisionService:
 
     @property
     def overlay(self) -> RedCircleOverlay | None:
-        return self.point_service.overlay
+        with self._camera_management_lock:
+            overlay = self.point_service.overlay
+            if overlay is None:
+                return None
+            camera = self._get_session_camera(overlay.camera_id)
+            if camera is not None and camera.state is not SessionCameraState.OPEN:
+                self.point_service.clear_overlay_for_camera(overlay.camera_id)
+                return None
+            return overlay
 
     @property
     def calibration_pattern_visible(self) -> bool:
@@ -193,12 +200,13 @@ class MultiVisionService:
                 raise shutdown_error
 
     def get_camera_status(self, logical_name: str) -> CameraStatus:
-        runtime_status = self.camera_runtime.get_status(logical_name)
+        resolved_slot = self._resolve_camera_reference(logical_name)
+        runtime_status = self.camera_runtime.get_status(resolved_slot)
         if not isinstance(runtime_status, CameraStatus):
             raise CameraUnavailableError(
                 f'Camera {logical_name!r} returned an invalid status',
             )
-        _validate_camera_status(runtime_status, logical_name)
+        _validate_camera_status(runtime_status, resolved_slot)
         calibration_status = self._get_calibration_status(runtime_status)
         return runtime_status._replace(calibration_status=calibration_status)
 
@@ -228,32 +236,60 @@ class MultiVisionService:
 
     def snapshot(self, logical_name: str) -> Frame:
         """Return the latest frame retained by the persistent camera runtime."""
-        frame = self.camera_runtime.snapshot(logical_name)
+        frame = self.camera_runtime.snapshot(self._resolve_camera_reference(logical_name))
         if not isinstance(frame, Frame):
             raise FrameCaptureError(
                 f'Camera {logical_name!r} returned an invalid frame',
             )
         return frame
 
-    def bind_camera(self, logical_name: str, device_id: str) -> dict[str, str | bool]:
-        """Persist a logical camera binding for the next service startup."""
-        candidate_bindings = dict(self.configuration.camera_bindings)
-        candidate_bindings[logical_name] = device_id
-        validate_camera_bindings(candidate_bindings)
-        configuration = Configuration(
-            camera_bindings=candidate_bindings,
-            projector_resolution=self.configuration.projector_resolution,
-            calibration_thresholds=self.configuration.calibration_thresholds,
-            calibration_version=self.configuration.calibration_version,
-        )
-        save_configuration(configuration, self._config_path)
-        self.configuration = configuration
-        return {
-            'bound': True,
-            'camera': logical_name,
-            'device_id': device_id,
-            'restart_required': True,
-        }
+    def get_session_cameras(self) -> list[SessionCamera]:
+        """Return the fixed, deterministically ordered session camera inventory."""
+        with self._camera_management_lock:
+            cameras = self._get_session_cameras()
+            if cameras is None:
+                return []
+            return cameras
+
+    def rename_camera(self, slot_id: str, display_name: str) -> SessionCamera:
+        """Rename one session slot while retaining its live camera state."""
+        with self._camera_management_lock:
+            camera = self.camera_runtime.rename_camera(slot_id, display_name)
+            if not isinstance(camera, SessionCamera):
+                raise SessionCameraError(
+                    'Camera runtime returned an invalid renamed session camera',
+                )
+            self.point_service.rename_overlay_camera(
+                camera.slot_id,
+                camera.display_name,
+            )
+            return camera
+
+    def close_camera(self, slot_id: str) -> SessionCamera:
+        """Close one session slot and remove only its spatial ownership."""
+        with self._camera_management_lock:
+            try:
+                camera = self.camera_runtime.close_camera(slot_id)
+                if not isinstance(camera, SessionCamera):
+                    raise SessionCameraError(
+                        'Camera runtime returned an invalid closed session camera',
+                    )
+                return camera
+            finally:
+                self.point_service.clear_overlay_for_camera(slot_id)
+
+    def open_camera(self, slot_id: str) -> SessionCamera:
+        """Reopen one closed session slot with fresh spatial state."""
+        with self._camera_management_lock:
+            try:
+                camera = self.camera_runtime.open_camera(slot_id)
+                if not isinstance(camera, SessionCamera):
+                    raise SessionCameraError(
+                        'Camera runtime returned an invalid opened session camera',
+                    )
+                return camera
+            finally:
+                self.point_service.clear_overlay_for_camera(slot_id)
 
     def calibrate(
         self,
@@ -295,30 +331,42 @@ class MultiVisionService:
         preview_point: Point2D,
         preview_transform: PreviewTransform,
     ) -> RedCircleOverlay:
-        return self.point_service.point_from_preview(
-            logical_name,
-            preview_point,
-            preview_transform,
-        )
+        with self._camera_management_lock:
+            return self.point_service.point_from_preview(
+                logical_name,
+                preview_point,
+                preview_transform,
+            )
 
     def point_from_camera(
         self,
         logical_name: str,
         camera_point: Sequence[float],
     ) -> RedCircleOverlay:
-        return self.point_service.point_from_camera(logical_name, camera_point)
+        with self._camera_management_lock:
+            return self.point_service.point_from_camera(logical_name, camera_point)
 
     def get_calibration_metrics(self, logical_name: str) -> CalibrationMetrics | None:
         status = self.get_camera_status(logical_name)
-        if status.device_id is None:
-            return None
-        calibration = self.calibration_registry.get_record(status.device_id)
-        if calibration is None:
+        session_camera = self._get_session_camera(status.logical_name)
+        if session_camera is None:
+            raise CameraUnavailableError('Camera runtime returned no session camera')
+        calibration = session_camera.calibration
+        if not isinstance(calibration, PersistedCalibration):
             return None
         return calibration.metrics
 
     def get_calibration_records(self) -> dict[str, PersistedCalibration]:
-        return self.calibration_registry.get_records()
+        session_cameras = self._get_session_cameras()
+        if session_cameras is None:
+            raise CameraUnavailableError(
+                'Camera runtime returned no session camera inventory',
+            )
+        return {
+            camera.slot_id: camera.calibration
+            for camera in session_cameras
+            if isinstance(camera.calibration, PersistedCalibration)
+        }
 
     def clear_overlay(self) -> None:
         self.point_service.clear_overlay()
@@ -328,8 +376,17 @@ class MultiVisionService:
         logical_name: str,
         correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None = None,
     ) -> PersistedCalibration:
+        with self._camera_management_lock:
+            return self._calibrate_camera_locked(logical_name, correspondences)
+
+    def _calibrate_camera_locked(
+        self,
+        logical_name: str,
+        correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None,
+    ) -> PersistedCalibration:
         status = self._require_available_camera(logical_name)
-        if status.device_id is None or status.native_resolution is None:
+        session_camera = self._get_session_camera(status.logical_name)
+        if session_camera is None or status.native_resolution is None:
             raise CameraUnavailableError(f'Camera {logical_name!r} has incomplete metadata')
         checked_correspondences = self._get_correspondences_for_operation(
             status,
@@ -346,9 +403,13 @@ class MultiVisionService:
             status.native_resolution,
             self.configuration.projector_resolution,
             version=self.configuration.calibration_version,
-            camera_id=status.device_id,
+            camera_id=session_camera.slot_id,
         )
-        self.calibration_registry.save(self.calibration_store, record)
+        self._set_session_calibration(
+            session_camera.slot_id,
+            CalibrationStatus.UNVERIFIED,
+            record,
+        )
         return record
 
     def _verify_camera(
@@ -356,21 +417,44 @@ class MultiVisionService:
         logical_name: str,
         correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None = None,
     ) -> CalibrationStatus:
+        with self._camera_management_lock:
+            return self._verify_camera_locked(logical_name, correspondences)
+
+    def _verify_camera_locked(
+        self,
+        logical_name: str,
+        correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None,
+    ) -> CalibrationStatus:
         status = self._require_available_camera(logical_name)
-        if status.device_id is None or status.native_resolution is None:
+        session_camera = self._get_session_camera(status.logical_name)
+        if session_camera is None or status.native_resolution is None:
             raise CameraUnavailableError(f'Camera {logical_name!r} has incomplete metadata')
+        calibration = session_camera.calibration
+        if not isinstance(calibration, PersistedCalibration):
+            return CalibrationStatus.UNCALIBRATED
         checked_correspondences = self._get_correspondences_for_operation(
             status,
             correspondences,
         )
-        return self.calibration_registry.verify(
-            status.device_id,
+        session_registry = CalibrationRegistry(
+            {session_camera.slot_id: calibration},
+            calibration_version=self.configuration.calibration_version,
+            projector_resolution=self.configuration.projector_resolution,
+        )
+        calibration_status = session_registry.verify(
+            session_camera.slot_id,
             checked_correspondences,
             camera_resolution=status.native_resolution,
             projector_resolution=self.configuration.projector_resolution,
             thresholds=self.configuration.calibration_thresholds,
             pattern=self.calibration_pattern,
         )
+        self._set_session_calibration(
+            session_camera.slot_id,
+            calibration_status,
+            calibration,
+        )
+        return calibration_status
 
     def _get_available_statuses(self) -> list[CameraStatus]:
         return [
@@ -381,6 +465,12 @@ class MultiVisionService:
 
     def _require_available_camera(self, logical_name: str) -> CameraStatus:
         status = self.get_camera_status(logical_name)
+        session_camera = self._get_session_camera(status.logical_name)
+        if session_camera is not None and session_camera.state is not SessionCameraState.OPEN:
+            raise CameraUnavailableError(
+                session_camera.error_message
+                or f'Camera {logical_name!r} is not available',
+            )
         if status.runtime_status is not RuntimeStatus.AVAILABLE:
             raise CameraUnavailableError(
                 status.error_message or f'Camera {logical_name!r} is unavailable',
@@ -417,17 +507,22 @@ class MultiVisionService:
         status: CameraStatus,
         correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None,
     ) -> CameraCorrespondences:
-        assert status.device_id is not None
+        session_camera = self._get_session_camera(status.logical_name)
+        if session_camera is None:
+            raise CameraUnavailableError(
+                f'Camera {status.logical_name!r} has no session identity',
+            )
+        camera_id = session_camera.slot_id
         if correspondences is not None:
             if isinstance(correspondences, CameraCorrespondences):
-                if correspondences.camera_id not in {None, status.device_id}:
+                if correspondences.camera_id not in {None, camera_id}:
                     raise CalibrationError('Correspondences belong to another camera')
-                return correspondences._replace(camera_id=status.device_id)
+                return correspondences._replace(camera_id=camera_id)
             try:
                 values = tuple(correspondences)
             except (TypeError, ValueError) as ex:
                 raise CalibrationError('correspondences must be iterable') from ex
-            return CameraCorrespondences(values, status.device_id)
+            return CameraCorrespondences(values, camera_id)
 
         frame = self.snapshot(status.logical_name)
         detector = self.detector
@@ -437,22 +532,96 @@ class MultiVisionService:
         return assemble_correspondences(
             detected_markers,
             self.calibration_pattern,
-            camera_id=status.device_id,
+            camera_id=camera_id,
         )
 
     def _get_calibration_status(self, status: CameraStatus) -> CalibrationStatus:
-        if status.device_id is None:
-            return CalibrationStatus.UNCALIBRATED
-        calibration_status = self.calibration_registry.get_status(
-            status.device_id,
-            camera_resolution=status.native_resolution,
-            projector_resolution=self.configuration.projector_resolution,
-        )
-        if not isinstance(calibration_status, CalibrationStatus):
-            raise CalibrationError(
-                f'Camera {status.logical_name!r} returned an invalid calibration status',
+        session_camera = self._get_session_camera(status.logical_name)
+        if session_camera is None:
+            raise CameraUnavailableError(
+                f'Camera {status.logical_name!r} has no session state',
             )
-        return calibration_status
+        calibration = session_camera.calibration
+        if (
+            session_camera.calibration_status is CalibrationStatus.CALIBRATED
+            and isinstance(calibration, PersistedCalibration)
+            and (
+                calibration.camera_id != session_camera.slot_id
+                or calibration.version != self.configuration.calibration_version
+                or calibration.camera_resolution != status.native_resolution
+                or calibration.projector_resolution != self.configuration.projector_resolution
+            )
+        ):
+            return CalibrationStatus.STALE
+        return session_camera.calibration_status
+
+    def _get_session_cameras(self) -> list[SessionCamera] | None:
+        get_session_cameras = getattr(self.camera_runtime, 'get_session_cameras', None)
+        if not callable(get_session_cameras):
+            return None
+        cameras = get_session_cameras()
+        if not isinstance(cameras, list) or any(
+            not isinstance(camera, SessionCamera)
+            for camera in cameras
+        ):
+            raise SessionCameraError(
+                'Camera runtime returned an invalid session camera list',
+            )
+        return sorted(cameras, key=_session_camera_sort_key)
+
+    def _resolve_camera_reference(self, camera_reference: str) -> str:
+        cameras = self._get_session_cameras()
+        if cameras is None:
+            return camera_reference
+        for camera in cameras:
+            if camera.slot_id == camera_reference:
+                return camera.slot_id
+        matching_cameras = [
+            camera
+            for camera in cameras
+            if camera.display_name == camera_reference
+        ]
+        if len(matching_cameras) > 1:
+            raise CameraUnavailableError(
+                f'Camera name {camera_reference!r} is ambiguous',
+            )
+        if len(matching_cameras) == 1:
+            return matching_cameras[0].slot_id
+        return camera_reference
+
+    def _get_session_camera(self, slot_id: str) -> SessionCamera | None:
+        cameras = self._get_session_cameras()
+        if cameras is None:
+            return None
+        for camera in cameras:
+            if camera.slot_id == slot_id:
+                return camera
+        return None
+
+    def _set_session_calibration(
+        self,
+        slot_id: str,
+        calibration_status: CalibrationStatus,
+        calibration: PersistedCalibration,
+    ) -> None:
+        set_calibration = getattr(self.camera_runtime, 'set_calibration', None)
+        if not callable(set_calibration):
+            raise SessionCameraError(
+                'Camera runtime does not support session calibration',
+            )
+        updated_camera = set_calibration(
+            slot_id,
+            calibration_status,
+            calibration,
+        )
+        if not isinstance(updated_camera, SessionCamera):
+            raise SessionCameraError(
+                'Camera runtime returned an invalid calibrated session camera',
+            )
+
+
+def _session_camera_sort_key(camera: SessionCamera) -> int:
+    return int(camera.slot_id.rsplit('-', 1)[1])
 
 
 def _validate_camera_status(

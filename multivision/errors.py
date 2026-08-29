@@ -62,5 +62,33 @@ class CameraUnavailableError(HardwareError):
     code = 'CAMERA_UNAVAILABLE'
 
 
+class SessionCameraError(MultiVisionError, ValueError):
+    """Base class for invalid in-memory session camera operations."""
+
+
+class CameraSlotNotFoundError(SessionCameraError):
+    """Raised when a session camera slot does not exist."""
+
+    code = 'CAMERA_SLOT_NOT_FOUND'
+
+
+class DuplicateCameraNameError(SessionCameraError):
+    """Raised when a display name is already assigned to another slot."""
+
+    code = 'DUPLICATE_CAMERA_NAME'
+
+
+class CameraStateError(SessionCameraError):
+    """Raised when a session camera lifecycle transition is invalid."""
+
+    code = 'CAMERA_STATE_ERROR'
+
+
+class ActiveCameraLimitError(CameraStateError):
+    """Raised when opening a camera would exceed the active-camera limit."""
+
+    code = 'ACTIVE_CAMERA_LIMIT'
+
+
 class FrameCaptureError(HardwareError):
     """Raised when an open camera cannot provide a usable frame."""
