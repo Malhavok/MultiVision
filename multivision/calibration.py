@@ -29,6 +29,7 @@ from multivision.pattern import (
     APRILTAG_FAMILIES,
     CalibrationMarker,
     CalibrationPattern,
+    SUPPORTED_MARKER_COUNTS,
 )
 from multivision.types import (
     Resolution,
@@ -260,8 +261,13 @@ def _validate_pattern(pattern: CalibrationPattern) -> None:
         or pattern.marker_size <= 0
     ):
         raise CalibrationError('pattern has an invalid marker size')
-    if not isinstance(pattern.markers, tuple) or not 9 <= len(pattern.markers) <= 12:
-        raise CalibrationError('pattern must contain between 9 and 12 markers')
+    if (
+        not isinstance(pattern.markers, tuple)
+        or len(pattern.markers) not in SUPPORTED_MARKER_COUNTS
+    ):
+        raise CalibrationError(
+            'pattern must contain 9, 10, 11, 12 or 20 markers',
+        )
 
     marker_ids: set[int] = set()
     for marker in pattern.markers:

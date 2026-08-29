@@ -32,6 +32,7 @@ from multivision.errors import (
 from multivision.fiducials import CameraCorrespondences, FiducialCorrespondence
 from multivision.pattern import CalibrationPattern
 from multivision.geometry import (
+    CoordinateBounds,
     MatrixLike,
     Point2D,
     RegionLike,
@@ -519,10 +520,16 @@ class CalibrationRegistry:
                 if self._projector_resolution is not None
                 else record.projector_resolution
             )
+            camera_bounds = CoordinateBounds(
+                0.0,
+                0.0,
+                float(record.camera_resolution.width),
+                float(record.camera_resolution.height),
+            )
             return project_camera_to_projector(
                 point,
                 record.camera_to_projector,
-                calibrated_region=record.valid_region,
+                calibrated_region=camera_bounds,
                 projector_resolution=effective_projector_resolution,
             )
 

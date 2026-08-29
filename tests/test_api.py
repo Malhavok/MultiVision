@@ -232,6 +232,14 @@ class ApiTest(unittest.TestCase):
                 json={'enabled': True},
             )
 
+        def without_volatile_frame_fields(response: object) -> dict[str, object]:
+            data = response.json()  # type: ignore[union-attr]
+            return {
+                key: value
+                for key, value in data.items()
+                if key not in {'frame_counter', 'frame_metadata'}
+            }
+
         assert initial_response.status_code == 200
         initial_camera = initial_response.json()[0]
         assert initial_camera['area_enabled'] is False, f'{initial_camera=}'
@@ -256,11 +264,17 @@ class ApiTest(unittest.TestCase):
             [1000.0, 700.0],
             [0.0, 700.0],
         ], f'{enabled_camera=}'
-        assert retry_response.json() == enabled_camera, f'{retry_response.json()=}'
-        assert status_response.json() == enabled_camera, f'{status_response.json()=}'
+        assert without_volatile_frame_fields(retry_response) == without_volatile_frame_fields(
+            enabled_response,
+        ), f'{retry_response.json()=}'
+        assert without_volatile_frame_fields(status_response) == without_volatile_frame_fields(
+            enabled_response,
+        ), f'{status_response.json()=}'
         assert disabled_response.json()['area_enabled'] is False
         assert disabled_response.json()['available_area'] is None
-        assert disabled_retry_response.json() == disabled_response.json()
+        assert without_volatile_frame_fields(disabled_retry_response) == (
+            without_volatile_frame_fields(disabled_response)
+        )
 
         assert invalid_polygon_response.status_code == 422
         assert invalid_polygon_response.json()['error']['code'] == 'AVAILABLE_AREA_INVALID'

@@ -75,14 +75,17 @@ class FakePygame:
     def __init__(self) -> None:
         self.window_surface = FakeSurface((1280, 720))
         self.rendered_text: list[str] = []
+        self.font_sizes: list[int] = []
         self.display = SimpleNamespace(
             set_mode=lambda _size: self.window_surface,
             set_caption=lambda _caption: None,
             flip=lambda: None,
         )
-        self.font = SimpleNamespace(
-            Font=lambda _name, _size: FakeFont(self.rendered_text),
-        )
+        def make_font(_name: object, size: int) -> FakeFont:
+            self.font_sizes.append(size)
+            return FakeFont(self.rendered_text)
+
+        self.font = SimpleNamespace(Font=make_font)
         self.time = SimpleNamespace(Clock=lambda: SimpleNamespace(tick=lambda _rate: None))
         self.event = SimpleNamespace(get=lambda: [])
         self.draw_calls: list[tuple[str, tuple[object, ...]]] = []
@@ -562,14 +565,35 @@ class DisplayTest(unittest.TestCase):
         from pygame._sdl2 import video
 
         class FakeWindow:
+            def __init__(self) -> None:
+                self.fullscreen_calls: list[bool] = []
+                self.show_count = 0
+                self.restore_count = 0
+                self.focus_count = 0
+
             def destroy(self) -> None:
                 return None
 
+            def show(self) -> None:
+                self.show_count += 1
+
+            def restore(self) -> None:
+                self.restore_count += 1
+
+            def set_fullscreen(self, *, desktop: bool) -> None:
+                self.fullscreen_calls.append(desktop)
+
+            def focus(self) -> None:
+                self.focus_count += 1
+
         window_arguments: list[dict[str, object]] = []
+        created_windows: list[FakeWindow] = []
 
         def make_window(*_args: object, **kwargs: object) -> FakeWindow:
             window_arguments.append(kwargs)
-            return FakeWindow()
+            window = FakeWindow()
+            created_windows.append(window)
+            return window
 
         class FakeRenderer:
             def __init__(self, _window: FakeWindow) -> None:
@@ -579,12 +603,25 @@ class DisplayTest(unittest.TestCase):
             patch.object(video, 'Window', side_effect=make_window),
             patch.object(video, 'Renderer', FakeRenderer),
         ):
-            Sdl2ProjectorOutput(Resolution(1200, 800))
+            Sdl2ProjectorOutput(
+                Resolution(1200, 800),
+                window_resolution=Resolution(800, 600),
+                fullscreen=True,
+            )
 
+        assert window_arguments[0]['size'] == (800, 600), f'{window_arguments=}'
         assert window_arguments[0]['position'] == (
             video.WINDOWPOS_CENTERED + 1,
             video.WINDOWPOS_CENTERED + 1,
         ), f'{window_arguments=}'
+        assert created_windows[0].fullscreen_calls == [True], (
+            f'{created_windows[0].fullscreen_calls=}'
+        )
+        assert created_windows[0].show_count == 2, f'{created_windows[0].show_count=}'
+        assert created_windows[0].restore_count == 1, (
+            f'{created_windows[0].restore_count=}'
+        )
+        assert created_windows[0].focus_count == 1, f'{created_windows[0].focus_count=}'
 
     def test_early_initialisation_failure_shuts_down_injected_projector(self) -> None:
         pygame_module = FakePygame()
@@ -693,6 +730,50 @@ class DisplayTest(unittest.TestCase):
             (10, 20),
             (20, 30),
         ], f'{surface.blits=}'
+
+    def test_projector_area_default_font_is_three_times_the_ui_size(self) -> None:
+        pygame_module = FakePygame()
+        surface = FakeSurface((1200, 800))
+        area = CameraArea(
+            'camera-0',
+            'overhead',
+            True,
+            (Point2D(10, 20), Point2D(200, 20), Point2D(200, 150)),
+            (70, 190, 255),
+        )
+
+        ProjectorRenderer(pygame_module).render_areas(surface, [area])
+
+        assert pygame_module.font_sizes == [48], f'{pygame_module.font_sizes=}'
+
+    def test_camera_preview_border_uses_projector_area_colour(self) -> None:
+        pygame_module = FakePygame()
+        service = AreaDisplayService(
+            [
+                CameraArea(
+                    'overhead',
+                    'overhead',
+                    True,
+                    (Point2D(10, 20), Point2D(200, 20), Point2D(200, 150)),
+                    (70, 190, 255),
+                ),
+            ],
+        )
+        display_runtime = PygameDisplayRuntime(
+            service,
+            DisplayConfiguration(window_resolution=Resolution(1000, 700)),
+            pygame_module=pygame_module,
+            frame_surface_converter=lambda _frame, _pygame: FakeSurface((1, 1)),
+        )
+
+        display_runtime.render_once()
+
+        assert any(
+            call[0] == 'rect'
+            and call[1][1] == (70, 190, 255)
+            and call[1][3] == 3
+            for call in pygame_module.draw_calls
+        ), f'{pygame_module.draw_calls=}'
 
     def test_projector_areas_are_separate_from_point_overlay_and_stale_areas_disappear(self) -> None:
         area = CameraArea(

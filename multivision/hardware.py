@@ -1,6 +1,7 @@
 """Small seams between MultiVision and physical camera hardware."""
 
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -48,9 +49,59 @@ class CaptureDeviceFactory(Protocol):
         ...
 
 
+class SleepInhibitor(Protocol):
+    """Keep the host awake for the lifetime of the running service."""
+
+    def start(self) -> None:
+        ...
+
+    def stop(self) -> None:
+        ...
+
+
+class SystemSleepInhibitor:
+    """Use the native macOS assertion command while the service is running."""
+
+    def __init__(self) -> None:
+        self._process: Any | None = None
+
+    def start(self) -> None:
+        if sys.platform != 'darwin' or self._process is not None:
+            return
+        caffeinate_path = shutil.which('caffeinate')
+        if caffeinate_path is None:
+            raise HardwareError('macOS caffeinate command is unavailable')
+        try:
+            self._process = subprocess.Popen(
+                [caffeinate_path, '-dimsu', '-w', str(os.getpid())],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as ex:
+            raise HardwareError('Could not prevent macOS sleep') from ex
+
+    def stop(self) -> None:
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2.0)
+        except OSError:
+            pass
+
+
 # Some macOS AVFoundation cameras return a near-black conversion while a native
 # AVFoundation client can still provide the usable frame.
 OPENCV_BLACK_FRAME_MAX_VALUE = 8
+BLACK_FRAME_FALLBACK_THRESHOLD = 3
 
 
 class OpenCVCaptureDevice:
@@ -62,6 +113,7 @@ class OpenCVCaptureDevice:
         self._capture = capture
         self._fallback_capture: CaptureDevice | None = None
         self._fallback_opener = fallback_opener
+        self._black_frame_count = 0
 
     def is_opened(self) -> bool:
         if self._fallback_capture is not None:
@@ -83,10 +135,13 @@ class OpenCVCaptureDevice:
         success, frame = result
         if not isinstance(success, bool):
             raise FrameCaptureError('The camera returned a malformed frame result')
+        if not success or not _is_opencv_black_frame(frame):
+            self._black_frame_count = 0
+            return success, frame
+        self._black_frame_count += 1
         if (
-            not success
-            or not _is_opencv_black_frame(frame)
-            or self._fallback_opener is None
+            self._fallback_opener is None
+            or self._black_frame_count < BLACK_FRAME_FALLBACK_THRESHOLD
         ):
             return success, frame
         self._activate_fallback()
@@ -208,7 +263,7 @@ class OpenCVCaptureDeviceFactory:
         device: DeviceInfo | None = None,
     ) -> CaptureDevice:
         """Adopt a discovery probe so startup does not open the device twice."""
-        return OpenCVCaptureDevice(capture, _make_ffmpeg_fallback(device))
+        return OpenCVCaptureDevice(capture)
 
     def open_capture(self, device: DeviceInfo) -> CaptureDevice:
         if not isinstance(device, DeviceInfo):
@@ -250,7 +305,7 @@ class OpenCVCaptureDeviceFactory:
                 raise CameraOpenError('Capture handle returned a malformed open state')
             if not opened:
                 raise CameraOpenError(f'Could not open device {device.device_id!r}')
-            return OpenCVCaptureDevice(capture, _make_ffmpeg_fallback(device))
+            return OpenCVCaptureDevice(capture)
         except CameraOpenError:
             if capture is not None:
                 _release_capture(capture)

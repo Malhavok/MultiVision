@@ -385,15 +385,20 @@ class PointOverlayService:
 
         calibration = session_camera.calibration
         camera_to_projector = getattr(calibration, 'camera_to_projector', None)
-        valid_region = getattr(calibration, 'valid_region', None)
-        if camera_to_projector is None or valid_region is None:
+        if camera_to_projector is None:
             raise InvalidHomographyError(
                 'Session camera calibration has no camera-to-projector transform',
             )
+        camera_bounds = CoordinateBounds(
+            0.0,
+            0.0,
+            float(camera.status.native_resolution.width),
+            float(camera.status.native_resolution.height),
+        )
         return project_camera_to_projector(
             camera_point,
             camera_to_projector,
-            calibrated_region=valid_region,
+            calibrated_region=camera_bounds,
             projector_resolution=self.projector_resolution,
         )
 

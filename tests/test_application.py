@@ -123,19 +123,30 @@ class MultiVisionServiceAreaTest(unittest.TestCase):
         service = MultiVisionService(
             Configuration(projector_resolution=Resolution(1000, 700)),
             camera_runtime=runtime,  # type: ignore[arg-type]
-            point_service=FakePointService(),  # type: ignore[arg-type]
+            point_service=PointOverlayService(
+                runtime,  # type: ignore[arg-type]
+                object(),  # type: ignore[arg-type]
+                Resolution(1000, 700),
+            ),
         )
 
         initial_area = service.get_camera_area('camera-0')
         assert initial_area.area_enabled is False, f'{initial_area=}'
         assert initial_area.available_area is None, f'{initial_area=}'
         calculated_area = service.calculate_available_area('camera-0')
-        assert calculated_area[0] == Point2D(0.0, 10.0), f'{calculated_area=}'
+        assert calculated_area == (
+            Point2D(0.0, 0.0),
+            Point2D(640.0, 0.0),
+            Point2D(640.0, 480.0),
+            Point2D(0.0, 480.0),
+        ), f'{calculated_area=}'
 
         enabled_area = service.set_area_enabled('camera-0', True)
         assert enabled_area.area_enabled is True, f'{enabled_area=}'
         assert enabled_area.available_area == calculated_area, f'{enabled_area=}'
         assert runtime.registry.get('camera-0').calibration == calibration
+        overlay = service.point_from_camera('camera-0', (600, 450))
+        assert overlay.camera_point == Point2D(600, 450), f'{overlay=}'
 
         disabled_area = service.set_area_enabled('camera-0', False)
         assert disabled_area.area_enabled is False, f'{disabled_area=}'

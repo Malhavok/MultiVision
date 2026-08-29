@@ -38,6 +38,7 @@ from multivision.types import (
 
 BLACK = (0, 0, 0)
 WHITE = (235, 235, 235)
+PROJECTOR_AREA_LABEL_FONT_SIZE = 48
 GREY = (145, 145, 145)
 DARK_GREY = (35, 35, 35)
 GREEN = (85, 205, 115)
@@ -153,9 +154,16 @@ class DisplayConfiguration:
 
 
 class Sdl2ProjectorOutput:
-    """Present the projector surface in a separate Pygame window."""
+    """Present the projector surface in a borderless window on its display."""
 
-    def __init__(self, projector_resolution: Resolution, display_index: int = 1) -> None:
+    def __init__(
+        self,
+        projector_resolution: Resolution,
+        display_index: int = 1,
+        window_resolution: Resolution | None = None,
+        top_inset_pixels: int = 0,
+        fullscreen: bool = False,
+    ) -> None:
         from pygame._sdl2 import video
 
         if (
@@ -164,26 +172,51 @@ class Sdl2ProjectorOutput:
             or display_index < 0
         ):
             raise ValueError('display_index must be a non-negative integer')
+        if not is_valid_resolution(projector_resolution):
+            raise ValueError('projector_resolution must be a positive Resolution')
+        if window_resolution is None:
+            window_resolution = projector_resolution
+        if not is_valid_resolution(window_resolution):
+            raise ValueError('window_resolution must be a positive Resolution')
+        if (
+            not isinstance(top_inset_pixels, int)
+            or isinstance(top_inset_pixels, bool)
+            or not 0 <= top_inset_pixels < window_resolution.height
+        ):
+            raise ValueError(
+                'top_inset_pixels must be a non-negative value smaller than window height',
+            )
+        if not isinstance(fullscreen, bool):
+            raise ValueError('fullscreen must be a bool')
         centred_position = video.WINDOWPOS_CENTERED + display_index
         window = video.Window(
             'MultiVision Projector',
-            size=tuple(projector_resolution),
+            size=tuple(window_resolution),
             position=(centred_position, centred_position),
             borderless=True,
         )
         try:
             renderer = video.Renderer(window)
-        except BaseException:  # noqa: BLE001 (Release a window if renderer setup fails).
+            window.show()
+            if fullscreen:
+                window.restore()
+                window.set_fullscreen(desktop=True)
+                window.show()
+                window.focus()
+        except BaseException:  # noqa: BLE001 (Release a window if projector setup fails).
             try:
                 window.destroy()
-            except Exception:  # noqa: BLE001 (Preserve the renderer setup failure).
+            except Exception:  # noqa: BLE001 (Preserve the projector setup failure).
                 pass
             raise
         self._window = window
+        self._window_resolution = window_resolution
+        self._top_inset_pixels = top_inset_pixels
         self._renderer = renderer
         self._texture: Any | None = None
 
     def present(self, surface: Any) -> None:
+        from pygame import Rect
         from pygame._sdl2 import video
 
         if self._texture is None:
@@ -191,7 +224,15 @@ class Sdl2ProjectorOutput:
         else:
             self._texture.update(surface)
         self._renderer.clear()
-        self._renderer.blit(self._texture)
+        self._renderer.blit(
+            self._texture,
+            Rect(
+                0,
+                self._top_inset_pixels,
+                self._window_resolution.width,
+                self._window_resolution.height - self._top_inset_pixels,
+            ),
+        )
         self._renderer.present()
 
     def shutdown(self) -> None:
@@ -241,9 +282,15 @@ class ProjectorRenderer:
                 marker_width,
                 self._pygame,
             )
+            marker_surface_size = _get_surface_size(marker_surface, marker_width)
             surface.blit(
                 marker_surface,
-                (round(marker.bounds.left), round(marker.bounds.top)),
+                (
+                    round(marker.bounds.left)
+                    - (marker_surface_size[0] - marker_width) // 2,
+                    round(marker.bounds.top)
+                    - (marker_surface_size[1] - marker_width) // 2,
+                ),
             )
 
     def render_areas(
@@ -256,7 +303,7 @@ class ProjectorRenderer:
         if not isinstance(areas, Sequence) or isinstance(areas, (str, bytes)):
             raise TypeError('areas must be a sequence of projector areas')
         if font is None:
-            font = self._pygame.font.Font(None, 16)
+            font = self._pygame.font.Font(None, PROJECTOR_AREA_LABEL_FONT_SIZE)
         for area in sorted(areas, key=lambda value: _slot_sort_key(value.slot_id)):
             if not area.area_enabled or area.available_area is None:
                 continue
@@ -273,8 +320,22 @@ class ProjectorRenderer:
                 2,
             )
             label_surface = font.render(area.display_name, True, area.area_colour)
+            surface_size = _get_surface_size(surface, 0)
+            label_size = _get_surface_size(label_surface, 0)
             first_point = area_points[0]
-            surface.blit(label_surface, first_point)
+            surface.blit(
+                label_surface,
+                (
+                    min(
+                        max(first_point[0], 0),
+                        max(0, surface_size[0] - label_size[0]),
+                    ),
+                    min(
+                        max(first_point[1], 0),
+                        max(0, surface_size[1] - label_size[1]),
+                    ),
+                ),
+            )
 
     def render_overlay(
         self,
@@ -346,6 +407,8 @@ class PygameDisplayRuntime:
             else _make_projector_output
         )
         self._font: Any | None = None
+        self._projector_area_font: Any | None = None
+        self._area_colours: dict[str, tuple[int, int, int]] = {}
         self._is_running = False
         self._is_initialised = False
         self._preview_layouts: dict[str, CameraPreviewLayout] = {}
@@ -398,6 +461,10 @@ class PygameDisplayRuntime:
                     self.configuration,
                 )
             font = pygame_module.font.Font(None, 16)
+            projector_area_font = pygame_module.font.Font(
+                None,
+                PROJECTOR_AREA_LABEL_FONT_SIZE,
+            )
         except BaseException:  # noqa: BLE001 (Clean up Pygame before propagating interruption).
             try:
                 if 'projector_output' in locals() and projector_output is not None:
@@ -412,6 +479,7 @@ class PygameDisplayRuntime:
         self._projector_renderer = projector_renderer
         self._projector_output = projector_output
         self._font = font
+        self._projector_area_font = projector_area_font
         self._is_initialised = True
 
     def run(self, max_frames: int | None = None) -> None:
@@ -483,17 +551,25 @@ class PygameDisplayRuntime:
         self._window_surface.fill(DARK_GREY)
         display_cameras = self._get_display_cameras()
         self._preview_layouts = self._build_preview_layouts(display_cameras)
+        pattern_visible = self.service.calibration_pattern_visible
+        if not isinstance(pattern_visible, bool):
+            raise TypeError('service returned an invalid calibration pattern state')
+        projector_areas = [] if pattern_visible else self._get_projector_areas()
+        if not pattern_visible:
+            self._area_colours = {
+                area.slot_id: area.area_colour
+                for area in projector_areas
+            }
+        area_colours = self._area_colours
         for camera in display_cameras:
             self._render_camera_card(
                 camera.status,
                 self._preview_layouts[camera.slot_id],
                 camera.session_camera,
+                area_colours.get(camera.slot_id),
             )
 
         projector_is_ready = True
-        pattern_visible = self.service.calibration_pattern_visible
-        if not isinstance(pattern_visible, bool):
-            raise TypeError('service returned an invalid calibration pattern state')
         if self.calibration_pattern is None or not pattern_visible:
             self._projector_renderer.clear(self._projector_surface)
         else:
@@ -522,8 +598,8 @@ class PygameDisplayRuntime:
         if projector_is_ready and not pattern_visible:
             self._projector_renderer.render_areas(
                 self._projector_surface,
-                self._get_projector_areas(),
-                self._font,
+                projector_areas,
+                self._projector_area_font,
             )
         if projector_is_ready:
             self._projector_renderer.render_overlay(
@@ -564,6 +640,8 @@ class PygameDisplayRuntime:
                 self._projector_surface = None
                 self._projector_renderer = None
                 self._font = None
+                self._projector_area_font = None
+                self._area_colours = {}
                 self._is_initialised = False
         if output_error is not None:
             raise output_error
@@ -578,6 +656,7 @@ class PygameDisplayRuntime:
         status: CameraStatus,
         layout: CameraPreviewLayout,
         session_camera: SessionCamera | None = None,
+        area_colour: tuple[int, int, int] | None = None,
     ) -> None:
         assert self._window_surface is not None
         self._draw_rectangle(self._window_surface, layout.panel_bounds, DARK_GREY)
@@ -655,7 +734,28 @@ class PygameDisplayRuntime:
                 layout.preview_bounds.top + 8,
                 RED,
             )
+        self._draw_preview_border(layout.preview_bounds, area_colour)
         self._draw_uncalibrated_click_frame(slot_id, layout)
+
+    def _draw_preview_border(
+        self,
+        bounds: CoordinateBounds,
+        colour: tuple[int, int, int] | None,
+    ) -> None:
+        if colour is None:
+            return
+        assert self._window_surface is not None
+        self._get_pygame().draw.rect(
+            self._window_surface,
+            colour,
+            (
+                round(bounds.left),
+                round(bounds.top),
+                max(1, round(bounds.right - bounds.left)),
+                max(1, round(bounds.bottom - bounds.top)),
+            ),
+            3,
+        )
 
     def _handle_preview_click(self, window_position: object) -> None:
         if not isinstance(window_position, (tuple, list)) or len(window_position) != 2:
@@ -969,7 +1069,14 @@ def _make_projector_output(
         return None
     display_count = pygame_module.display.get_num_displays()
     display_index = min(1, max(0, display_count - 1))
-    return Sdl2ProjectorOutput(configuration.projector_resolution, display_index)
+    desktop_sizes = pygame_module.display.get_desktop_sizes()
+    desktop_width, desktop_height = desktop_sizes[display_index]
+    return Sdl2ProjectorOutput(
+        configuration.projector_resolution,
+        display_index,
+        Resolution(desktop_width, desktop_height),
+        fullscreen=True,
+    )
 
 
 def _frame_to_surface(frame: Frame, pygame_module: Any) -> Any:
@@ -1019,11 +1126,38 @@ def _render_apriltag_image(
         borderBits=1,
     )
     rgb_marker_image = cv2.cvtColor(marker_image, cv2.COLOR_GRAY2RGB)
-    return pygame_module.image.frombuffer(
+    marker_surface = pygame_module.image.frombuffer(
         rgb_marker_image.tobytes(),
         (pixel_size, pixel_size),
         'RGB',
     )
+    quiet_zone = max(4, round(pixel_size * 0.1))
+    quiet_surface = pygame_module.Surface(
+        (pixel_size + 2 * quiet_zone, pixel_size + 2 * quiet_zone),
+    )
+    quiet_surface.fill(WHITE)
+    quiet_surface.blit(marker_surface, (quiet_zone, quiet_zone))
+    return quiet_surface
+
+
+def _get_surface_size(surface: Any, fallback_size: int) -> tuple[int, int]:
+    get_size = getattr(surface, 'get_size', None)
+    if callable(get_size):
+        size = get_size()
+        if (
+            isinstance(size, tuple)
+            and len(size) == 2
+            and all(isinstance(value, int) and value > 0 for value in size)
+        ):
+            return size
+    size = getattr(surface, 'size', None)
+    if (
+        isinstance(size, tuple)
+        and len(size) == 2
+        and all(isinstance(value, int) and value > 0 for value in size)
+    ):
+        return size
+    return fallback_size, fallback_size
 
 
 def _build_display_cameras(

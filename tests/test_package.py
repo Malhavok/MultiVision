@@ -169,6 +169,12 @@ class PackageTest(unittest.TestCase):
             fallback_opener=lambda: fallback_capture,
         )
 
+        for _ in range(2):
+            success, frame = capture.read()
+            assert success is True, f'{success=}'
+            assert frame is not None and frame.max() == 0, f'{frame=}'
+            assert fallback_capture.read_count == 0, f'{fallback_capture.read_count=}'
+
         success, frame = capture.read()
 
         assert success is True, f'{success=}'

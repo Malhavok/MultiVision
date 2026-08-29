@@ -27,8 +27,9 @@ APRILTAG_FAMILIES = frozenset(
         APRILTAG_36H11,
     },
 )
-DEFAULT_MARKER_COUNT = 12
-_DEFAULT_MARKER_SIZE_FRACTION = 0.1
+DEFAULT_MARKER_COUNT = 20
+SUPPORTED_MARKER_COUNTS = frozenset({9, 10, 11, 12, 20})
+_DEFAULT_MARKER_SIZE_FRACTION = 0.225
 
 
 class MarkerCorner(NamedTuple):
@@ -115,10 +116,10 @@ def build_calibration_pattern(
 
     checked_marker_size = marker_size
     if checked_marker_size is None:
-        checked_marker_size = min(
-            checked_area.right - checked_area.left,
-            checked_area.bottom - checked_area.top,
-        ) * _DEFAULT_MARKER_SIZE_FRACTION
+        checked_marker_size = _default_marker_size(
+            checked_area,
+            marker_count,
+        )
     checked_marker_size = _coerce_marker_size(
         checked_marker_size,
         checked_area,
@@ -222,9 +223,24 @@ def _validate_marker_count(marker_count: int) -> None:
     if (
         not isinstance(marker_count, int)
         or isinstance(marker_count, bool)
-        or not 9 <= marker_count <= 12
+        or marker_count not in SUPPORTED_MARKER_COUNTS
     ):
-        raise ValueError('marker_count must be between 9 and 12')
+        raise ValueError(
+            'marker_count must be one of 9, 10, 11, 12 or 20',
+        )
+
+
+def _default_marker_size(
+    usable_area: CoordinateBounds,
+    marker_count: int,
+) -> int:
+    columns, rows, _ = _layout_for_marker_count(marker_count)
+    area_width = usable_area.right - usable_area.left
+    area_height = usable_area.bottom - usable_area.top
+    desired_size = round(min(area_width, area_height) * _DEFAULT_MARKER_SIZE_FRACTION)
+    cell_size = min(area_width / columns, area_height / rows)
+    maximum_size = math.floor(math.nextafter(cell_size, -math.inf))
+    return min(desired_size, maximum_size)
 
 
 def _coerce_marker_size(
@@ -252,6 +268,7 @@ def _layout_for_marker_count(marker_count: int) -> tuple[int, int, frozenset[tup
         10: (5, 2, frozenset()),
         11: (4, 3, frozenset({(1, 1)})),
         12: (4, 3, frozenset()),
+        20: (5, 4, frozenset()),
     }
     return layouts[marker_count]
 
@@ -339,5 +356,6 @@ __all__ = [
     'CalibrationPattern',
     'DEFAULT_MARKER_COUNT',
     'MarkerCorner',
+    'SUPPORTED_MARKER_COUNTS',
     'build_calibration_pattern',
 ]

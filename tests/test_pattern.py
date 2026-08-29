@@ -5,6 +5,7 @@ from multivision.geometry import CoordinateBounds, Point2D
 from multivision.pattern import (
     APRILTAG_36H11,
     CalibrationPattern,
+    SUPPORTED_MARKER_COUNTS,
     build_calibration_pattern,
 )
 from multivision.types import Resolution
@@ -16,7 +17,8 @@ class CalibrationPatternTest(unittest.TestCase):
 
         assert isinstance(pattern, CalibrationPattern)
         assert pattern.marker_family == APRILTAG_36H11
-        assert 9 <= len(pattern.markers) <= 12
+        assert len(pattern.markers) == 20
+        assert pattern.marker_size == 243
         assert len({marker.marker_id for marker in pattern.markers}) == len(pattern.markers)
         assert all(
             pattern.usable_area.contains(corner)
@@ -62,15 +64,21 @@ class CalibrationPatternTest(unittest.TestCase):
         assert not hasattr(first_pattern, 'camera_resolution')
         assert not hasattr(first_pattern, 'preview_size')
 
+    def test_default_marker_size_is_capped_for_narrow_layouts(self) -> None:
+        pattern = build_calibration_pattern(Resolution(700, 1000))
+
+        assert pattern.marker_size == 139, f'{pattern=}'
+        assert pattern.marker_size < 700 / 5, f'{pattern=}'
+
     def test_marker_count_is_tunable_only_within_contract(self) -> None:
-        for marker_count in range(9, 13):
+        for marker_count in sorted(SUPPORTED_MARKER_COUNTS):
             pattern = build_calibration_pattern(
                 Resolution(1200, 800),
                 marker_count=marker_count,
             )
             assert len(pattern.markers) == marker_count, f'{marker_count=}'
 
-        for marker_count in [8, 13]:
+        for marker_count in [8, 13, 19, 21]:
             with self.subTest(marker_count=marker_count):
                 with self.assertRaises(ValueError):
                     build_calibration_pattern(
@@ -81,7 +89,7 @@ class CalibrationPatternTest(unittest.TestCase):
     def test_all_layouts_use_raster_safe_usable_area_edges(self) -> None:
         usable_area = CoordinateBounds(37, 23, 973, 677)
         marker_size = 80
-        for marker_count in range(9, 13):
+        for marker_count in sorted(SUPPORTED_MARKER_COUNTS):
             with self.subTest(marker_count=marker_count):
                 pattern = build_calibration_pattern(
                     Resolution(1000, 700),
@@ -159,7 +167,7 @@ class CalibrationPatternTest(unittest.TestCase):
     def test_rendered_marker_rectangles_stay_inside_surface_and_usable_area(self) -> None:
         projector_resolution = Resolution(1000, 700)
         usable_area = CoordinateBounds(37.4, 23.4, 973.4, 677.4)
-        for marker_count in range(9, 13):
+        for marker_count in sorted(SUPPORTED_MARKER_COUNTS):
             with self.subTest(marker_count=marker_count):
                 pattern = build_calibration_pattern(
                     projector_resolution,
@@ -195,7 +203,7 @@ class CalibrationPatternTest(unittest.TestCase):
 
     def test_marker_size_must_fit_every_supported_layout_cell(self) -> None:
         usable_area = CoordinateBounds(0, 0, 1000, 600)
-        for marker_count in range(9, 13):
+        for marker_count in (9, 10, 11, 12):
             with self.subTest(marker_count=marker_count):
                 pattern = build_calibration_pattern(
                     Resolution(1000, 600),
@@ -211,6 +219,25 @@ class CalibrationPatternTest(unittest.TestCase):
                         marker_count=marker_count,
                         marker_size=200,
                     )
+
+    def test_five_by_four_layout_accepts_its_safe_marker_size_limit(self) -> None:
+        usable_area = CoordinateBounds(0, 0, 1000, 600)
+
+        pattern = build_calibration_pattern(
+            Resolution(1000, 600),
+            usable_area=usable_area,
+            marker_count=20,
+            marker_size=149,
+        )
+
+        assert len(pattern.markers) == 20, f'{pattern=}'
+        with self.assertRaises(ValueError):
+            build_calibration_pattern(
+                Resolution(1000, 600),
+                usable_area=usable_area,
+                marker_count=20,
+                marker_size=150,
+            )
 
     def test_malformed_dimensions_and_marker_sizes_fail_as_value_errors(self) -> None:
         invalid_resolutions = [

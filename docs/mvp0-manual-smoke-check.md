@@ -154,7 +154,7 @@ JSON responses alone.
 
 During the calibration-pattern presentation in the preceding step, inspect the
 projector/display rather than relying on the calibration JSON. Confirm that all
-9–12 tags are visible, that the outer tags reach as close as safely possible to
+20 tags in the 5×4 layout are visible, that the outer tags reach as close as safely possible to
 each configured usable-area edge, and that neither the tags nor their rendered
 integer pixels are clipped. Do not record exact boundary contact when raster
 rounding leaves a safety gap. Record the projector resolution, usable-area
@@ -172,8 +172,11 @@ actually overlap. Enable their areas through the still-running service:
 
 Confirm on the projector/display and in `cameras list` that each slot reports
 `area_enabled: true` with an ordered finite `available_area`, its current
-`name`, and an `area_colour`. The two outlines must be visibly distinct and
-retain their colours where they overlap; both current names must be legible.
+`name`, and an `area_colour`. The polygon is an estimated projection of the
+full native camera frame, and the same native-frame footprint is pointable when
+its projected point remains inside the projector bounds. The two outlines must
+be visibly distinct and retain their colours where they overlap; both current
+names must be legible.
 The outlines are diagnostic only, are drawn before the existing red point
 overlay, and do not change which camera can point. Repeat one of the known
 point operations from section 4 and confirm that the red circle remains a

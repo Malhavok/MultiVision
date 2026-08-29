@@ -25,6 +25,7 @@ from multivision.errors import (
     SessionCameraError,
 )
 from multivision.geometry import (
+    CoordinateBounds,
     Point2D,
     Polygon,
     PreviewTransform,
@@ -42,6 +43,8 @@ from multivision.hardware import (
     CaptureDeviceFactory,
     DeviceDiscovery,
     OpenCVCaptureDeviceFactory,
+    SleepInhibitor,
+    SystemSleepInhibitor,
 )
 from multivision.pattern import CalibrationPattern, build_calibration_pattern
 from multivision.persistence import (
@@ -99,6 +102,7 @@ class MultiVisionService:
         detector: FiducialDetector | None = None,
         calibration_pattern: CalibrationPattern | None = None,
         point_service: PointOverlayService | None = None,
+        sleep_inhibitor: SleepInhibitor | None = None,
     ) -> None:
         if calibration_store is not None and not isinstance(
             calibration_store,
@@ -165,6 +169,11 @@ class MultiVisionService:
             )
         )
         self.detector = detector
+        self.sleep_inhibitor = (
+            sleep_inhibitor
+            if sleep_inhibitor is not None
+            else SystemSleepInhibitor()
+        )
         self._lifecycle_lock = threading.RLock()
         self._camera_management_lock = threading.RLock()
         self._calibration_capture_count = 0
@@ -207,6 +216,11 @@ class MultiVisionService:
             if self._is_running:
                 return
             self.camera_runtime.start()
+            try:
+                self.sleep_inhibitor.start()
+            except Exception:
+                self.camera_runtime.shutdown()
+                raise
             self._is_running = True
 
     def shutdown(self) -> None:
@@ -219,6 +233,11 @@ class MultiVisionService:
                 self.camera_runtime.shutdown()
             except Exception as ex:  # noqa: BLE001 (Cleanup must complete before surfacing errors).
                 shutdown_error = ex
+            try:
+                self.sleep_inhibitor.stop()
+            except Exception as ex:  # noqa: BLE001 (Cleanup must complete before surfacing errors).
+                if shutdown_error is None:
+                    shutdown_error = ex
             self._is_running = False
             self._has_stopped = True
             if shutdown_error is not None:
@@ -532,25 +551,28 @@ class MultiVisionService:
     ) -> Polygon:
         native_resolution = status.native_resolution
         calibration = camera.calibration
-        valid_region = getattr(calibration, 'valid_region', None)
         camera_to_projector = getattr(calibration, 'camera_to_projector', None)
-        if (
-            native_resolution is None
-            or valid_region is None
-            or camera_to_projector is None
-        ):
+        if native_resolution is None or camera_to_projector is None:
             raise InvalidAvailableAreaError(
                 f'Camera {camera.slot_id!r} has no usable calibrated area',
             )
+        # Keep this footprint identical to the native-frame region accepted by
+        # pointing; the calibration's tag-supported hull remains quality metadata.
+        camera_frame = CoordinateBounds(
+            0.0,
+            0.0,
+            float(native_resolution.width),
+            float(native_resolution.height),
+        )
         available_area = calculate_available_projector_area(
-            valid_region,
+            camera_frame,
             native_resolution,
             camera_to_projector,
             self.configuration.projector_resolution,
         )
         if available_area is None:
             raise InvalidAvailableAreaError(
-                f'Camera {camera.slot_id!r} has no usable calibrated area',
+                f'Camera {camera.slot_id!r} has no usable diagnostic area',
             )
         return available_area
 

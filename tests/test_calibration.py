@@ -37,7 +37,9 @@ class CalibrationTest(unittest.TestCase):
             recovered_point = project_point(camera_point, result.camera_to_projector)
             assert abs(recovered_point.x - source_point.x) < 0.01, f'{recovered_point=}'
             assert abs(recovered_point.y - source_point.y) < 0.01, f'{recovered_point=}'
-        assert result.metrics.ransac_inlier_count == 48, f'{result.metrics=}'
+        assert result.metrics.ransac_inlier_count == len(pattern.markers) * 4, (
+            f'{result.metrics=}'
+        )
         assert result.metrics.spatial_coverage > 0.5, f'{result.metrics=}'
         assert result.projector_to_camera != result.camera_to_projector, f'{result=}'
         assert is_point_in_region(Point2D(500, 400), result.valid_region), f'{result=}'

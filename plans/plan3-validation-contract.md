@@ -9,24 +9,24 @@ Plan3 has two related goals:
 - make the projector calibration pattern edge-complete and raster-safe, so its tags reach as close as safely possible to the edges of the configured usable area;
 - let the operator enable or disable a per-camera diagnostic area on the projector, showing the calibrated surface area associated with that camera.
 
-The area visualisation is diagnostic only. It must not alter pointing, calibrated-region rejection, camera selection, overlay ownership or calibration mathematics. It is session-local and must not add camera-area persistence.
+The area visualisation is diagnostic only. It must not alter camera selection, overlay ownership or calibration mathematics. Pointing uses the same full native camera-frame footprint as the diagnostic polygon, subject to native-camera and projector bounds. It is session-local and must not add camera-area persistence.
 
 ADR-0001 is not edited. Where Plan2 already supersedes its persisted camera identity/calibration behaviour, Plan3 continues the Plan2 boundary.
 
 ## Calibration-pattern edge coverage
 
-- Keep the existing supported marker counts and deterministic layouts (9–12 AprilTags) unless implementation evidence requires a focused change.
-- Place markers using the full configured `usable_area`, not an additional large implicit inset. Outer marker rectangles must be at the maximum raster-safe proximity to each usable-area edge, with intermediate centres evenly distributed across the remaining span.
+- Use a default 5×4 layout of 20 AprilTags for calibration. Retain the existing explicit 9–12 marker layouts for focused callers and compatibility unless implementation evidence requires otherwise.
+- Place the 20 default markers using the full configured `usable_area`, not an additional large implicit inset. Retained layouts follow the same rule. Outer marker rectangles must be at the maximum raster-safe proximity to each usable-area edge, with intermediate centres evenly distributed across the remaining span.
 - Respect the existing half-open coordinate convention and marker-size fit rules. No marker corner may equal or exceed the usable area's right or bottom boundary, and rendered integer pixels must remain inside the usable area and projector surface.
 - The renderer and metadata must use the same raster-safe rectangle interpretation. Do not claim exact boundary contact if rounding would clip a marker.
 - Pattern generation remains independent of camera frames, camera identity and Pygame window layout.
 
 ## Available-area meaning
 
-- A camera's available area is derived from its current calibration, not from a manually authored polygon and not from an extrapolated native-camera rectangle.
-- Start with the calibration's camera-space `valid_region`, intersect it with the camera's native image bounds, transform the resulting polygon with that camera's current `camera_to_projector` homography, and clip it to projector bounds.
+- A camera's available area is derived from its current calibration, not from a manually authored polygon.
+- For this diagnostic-only footprint, start with the camera's full native image rectangle, transform it with that camera's current `camera_to_projector` homography, and clip it to projector bounds. This deliberately may extrapolate beyond the tag-supported region.
 - The result must contain at least three finite, non-collinear vertices. Projection must fail closed for invalid matrices, non-finite points, a projective horizon crossing or an empty/degenerate clipped result.
-- The polygon is a visual diagnostic of the region that can actually be used by the calibrated camera. It does not grant pointing permission outside the existing service checks.
+- The polygon estimates the camera-frame footprint on the projector. Camera clicks use that same native-frame footprint, with points still rejected when their projection falls outside the projector bounds. The calibration's tag-supported `valid_region` remains metadata for calibration quality and is not a separate click gate.
 - Polygon vertices remain in projector-native coordinates. API responses serialise them as ordered `[x, y]` pairs.
 
 ## Area lifecycle and ownership
@@ -76,7 +76,7 @@ Tests must cover:
 - default disabled state, enable/disable idempotence, calibrated-only enablement, response serialisation and no mutation on failure;
 - rename preservation of area state and current-name labels;
 - close, reopen, disconnect and recalibration clearing area state, including clearing before a recalibration attempt;
-- independent per-camera polygons and transforms, overlap, deterministic unique colours and unchanged pointing behaviour;
+- independent per-camera polygons and transforms, overlap, deterministic unique colours and full native-frame pointing behaviour;
 - API and CLI requests against the running service without camera reopening or Pygame ownership leaks;
 - area suppression during calibration-pattern presentation, normal projector layer ordering, labels and stale-area removal.
 
