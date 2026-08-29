@@ -455,7 +455,7 @@ class DisplayTest(unittest.TestCase):
             for text in pygame_module.rendered_text
         ), f'{pygame_module.rendered_text=}'
 
-    def test_calibration_pattern_remains_visible_without_calibration_request(self) -> None:
+    def test_calibration_pattern_is_hidden_without_calibration_request(self) -> None:
         pygame_module = FakePygame()
         pattern = build_calibration_pattern(Resolution(1200, 800))
         marker_count = 0
@@ -480,7 +480,7 @@ class DisplayTest(unittest.TestCase):
 
         display_runtime.render_once()
 
-        assert marker_count == len(pattern.markers), f'{marker_count=}'
+        assert marker_count == 0, f'{marker_count=}'
 
     def test_projector_rendering_failure_is_visible_and_retryable(self) -> None:
         pygame_module = FakePygame()

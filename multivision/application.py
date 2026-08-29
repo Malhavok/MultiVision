@@ -54,7 +54,8 @@ from multivision.types import (
 
 
 CALIBRATION_PATTERN_WAIT_TIMEOUT_SECONDS = 5.0
-CALIBRATION_PATTERN_SETTLE_SECONDS = 0.1
+CALIBRATION_PATTERN_SETTLE_SECONDS = 3.0
+CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS = 5.0
 
 
 class MultiVisionService:
@@ -153,15 +154,14 @@ class MultiVisionService:
 
     @property
     def overlay(self) -> RedCircleOverlay | None:
-        with self._camera_management_lock:
-            overlay = self.point_service.overlay
-            if overlay is None:
-                return None
-            camera = self._get_session_camera(overlay.camera_id)
-            if camera is not None and camera.state is not SessionCameraState.OPEN:
-                self.point_service.clear_overlay_for_camera(overlay.camera_id)
-                return None
-            return overlay
+        overlay = self.point_service.overlay
+        if overlay is None:
+            return None
+        camera = self._get_session_camera(overlay.camera_id)
+        if camera is not None and camera.state is not SessionCameraState.OPEN:
+            self.point_service.clear_overlay_for_camera(overlay.camera_id)
+            return None
+        return overlay
 
     @property
     def calibration_pattern_visible(self) -> bool:
@@ -245,11 +245,11 @@ class MultiVisionService:
 
     def get_session_cameras(self) -> list[SessionCamera]:
         """Return the fixed, deterministically ordered session camera inventory."""
-        with self._camera_management_lock:
-            cameras = self._get_session_cameras()
-            if cameras is None:
-                return []
-            return cameras
+        # The display must read snapshots while calibration holds lifecycle writes locked.
+        cameras = self._get_session_cameras()
+        if cameras is None:
+            return []
+        return cameras
 
     def rename_camera(self, slot_id: str, display_name: str) -> SessionCamera:
         """Rename one session slot while retaining its live camera state."""
@@ -485,11 +485,42 @@ class MultiVisionService:
         if correspondences is not None:
             return self._get_correspondences(status, correspondences)
         with self._calibration_capture_lock:
+            self._calibration_pattern_presented.clear()
             self._calibration_capture_count += 1
         try:
-            # The pattern is continuously presented, so only the camera settle delay remains.
+            if not self._calibration_pattern_presented.wait(
+                CALIBRATION_PATTERN_WAIT_TIMEOUT_SECONDS,
+            ):
+                raise CalibrationError(
+                    'The calibration pattern was not presented by the main-thread display',
+                )
+            # Allow the projector and camera exposure pipeline to settle after presentation.
             time.sleep(CALIBRATION_PATTERN_SETTLE_SECONDS)
-            return self._get_correspondences(status, None)
+            deadline = time.monotonic() + CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS
+            best_correspondences: CameraCorrespondences | None = None
+            last_error: CalibrationError | None = None
+            while True:
+                try:
+                    candidate = self._get_correspondences(status, None)
+                except CalibrationError as ex:
+                    last_error = ex
+                else:
+                    if best_correspondences is None or (
+                        len(candidate.unique_marker_ids),
+                        len(candidate.correspondences),
+                    ) > (
+                        len(best_correspondences.unique_marker_ids),
+                        len(best_correspondences.correspondences),
+                    ):
+                        best_correspondences = candidate
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.25)
+            if best_correspondences is not None:
+                return best_correspondences
+            if last_error is not None:
+                raise last_error
+            raise CalibrationError('No calibration correspondences were detected')
         finally:
             with self._calibration_capture_lock:
                 self._calibration_capture_count -= 1

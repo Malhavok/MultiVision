@@ -450,7 +450,10 @@ class PygameDisplayRuntime:
             )
 
         projector_is_ready = True
-        if self.calibration_pattern is None:
+        pattern_visible = self.service.calibration_pattern_visible
+        if not isinstance(pattern_visible, bool):
+            raise TypeError('service returned an invalid calibration pattern state')
+        if self.calibration_pattern is None or not pattern_visible:
             self._projector_renderer.clear(self._projector_surface)
         else:
             try:
