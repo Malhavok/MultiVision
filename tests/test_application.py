@@ -1,11 +1,22 @@
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from multivision.application import MultiVisionService
+from multivision.application import (
+    AREA_COLOURS,
+    MultiVisionService,
+)
 from multivision.calibration import CalibrationMetrics, CalibrationResult
+from multivision.errors import (
+    CalibrationError,
+    CameraUnavailableError,
+    InvalidAvailableAreaError,
+    InvalidCalibrationStateError,
+)
 from multivision.config import Configuration
 from multivision.geometry import HomographyPair, Point2D
+from multivision.service import PointOverlayService
 from multivision.session import FrameMetadata, SessionCameraRegistry
 from multivision.types import (
     CalibrationStatus,
@@ -13,15 +24,20 @@ from multivision.types import (
     DeviceInfo,
     Resolution,
     RuntimeStatus,
+    SessionCameraState,
 )
 
 
 class FakeSessionRuntime:
-    def __init__(self) -> None:
+    def __init__(self, capture_indexes: tuple[int, ...] = (0, 1)) -> None:
         self.registry = SessionCameraRegistry.from_devices(
             [
-                DeviceInfo('device-1', 'Camera 1', capture_index=1),
-                DeviceInfo('device-0', 'Camera 0', capture_index=0),
+                DeviceInfo(
+                    f'device-{capture_index}',
+                    f'Camera {capture_index}',
+                    capture_index=capture_index,
+                )
+                for capture_index in capture_indexes
             ],
         )
 
@@ -72,6 +88,9 @@ class CalibrationSessionRuntime(FakeSessionRuntime):
             calibration,
         )
 
+    def set_area_enabled(self, slot_id: str, area_enabled: bool) -> object:
+        return self.registry.set_area_enabled(slot_id, area_enabled)
+
 
 class FakePointService:
     def __init__(self) -> None:
@@ -83,6 +102,308 @@ class FakePointService:
 
     def clear_overlay_for_camera(self, camera_id: str) -> None:
         self.cleared.append(camera_id)
+
+
+class MultiVisionServiceAreaTest(unittest.TestCase):
+    def test_area_is_derived_on_enable_and_disabled_without_calibration_mutation(self) -> None:
+        runtime = CalibrationSessionRuntime()
+        calibration = SimpleNamespace(
+            camera_to_projector=(
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+            valid_region=((-10, 10), (500, 10), (500, 400), (-10, 400)),
+        )
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            calibration,
+        )
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+            point_service=FakePointService(),  # type: ignore[arg-type]
+        )
+
+        initial_area = service.get_camera_area('camera-0')
+        assert initial_area.area_enabled is False, f'{initial_area=}'
+        assert initial_area.available_area is None, f'{initial_area=}'
+        calculated_area = service.calculate_available_area('camera-0')
+        assert calculated_area[0] == Point2D(0.0, 10.0), f'{calculated_area=}'
+
+        enabled_area = service.set_area_enabled('camera-0', True)
+        assert enabled_area.area_enabled is True, f'{enabled_area=}'
+        assert enabled_area.available_area == calculated_area, f'{enabled_area=}'
+        assert runtime.registry.get('camera-0').calibration == calibration
+
+        disabled_area = service.set_area_enabled('camera-0', False)
+        assert disabled_area.area_enabled is False, f'{disabled_area=}'
+        assert disabled_area.available_area is None, f'{disabled_area=}'
+        assert runtime.registry.get('camera-0').calibration == calibration
+
+    def test_independent_areas_preserve_pointing_and_rename_overlay_semantics(self) -> None:
+        runtime = CalibrationSessionRuntime()
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            SimpleNamespace(
+                camera_to_projector=((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+                valid_region=((0, 0), (640, 0), (640, 480), (0, 480)),
+            ),
+        )
+        runtime.registry.set_calibration(
+            'camera-1',
+            CalibrationStatus.CALIBRATED,
+            SimpleNamespace(
+                camera_to_projector=((1, 0, 100), (0, 1, 0), (0, 0, 1)),
+                valid_region=((0, 0), (640, 0), (640, 480), (0, 480)),
+            ),
+        )
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+            point_service=PointOverlayService(
+                runtime,  # type: ignore[arg-type]
+                object(),  # type: ignore[arg-type]
+                Resolution(1000, 700),
+            ),
+        )
+
+        first_overlay = service.point_from_camera('camera-0', (100, 100))
+        first_area = service.set_area_enabled('camera-0', True)
+        second_area = service.set_area_enabled('camera-1', True)
+
+        assert first_area.available_area is not None
+        assert second_area.available_area is not None
+        assert first_area.available_area != second_area.available_area, (
+            f'{first_area=}, {second_area=}'
+        )
+        assert first_area.area_colour != second_area.area_colour
+        assert service.overlay is first_overlay, f'{service.overlay=}'
+
+        renamed_camera = service.rename_camera('camera-0', 'overhead')
+        renamed_area = service.get_camera_area('camera-0')
+        assert renamed_camera.display_name == 'overhead', f'{renamed_camera=}'
+        assert renamed_area.display_name == 'overhead', f'{renamed_area=}'
+        assert renamed_area.area_enabled is True, f'{renamed_area=}'
+        assert renamed_area.available_area == first_area.available_area
+        assert service.overlay is not None
+        assert service.overlay.logical_name == 'overhead'
+
+        service.set_area_enabled('camera-0', False)
+        assert service.overlay is not None
+        assert service.overlay.projector_point == Point2D(100, 100)
+        assert service.get_camera_area('camera-1').area_enabled is True
+
+        second_overlay = service.point_from_camera('camera-1', (100, 100))
+        assert second_overlay.camera_id == 'camera-1', f'{second_overlay=}'
+        assert second_overlay.projector_point == Point2D(200, 100), f'{second_overlay=}'
+
+    def test_renderable_areas_receive_distinct_slot_ordered_colours(self) -> None:
+        runtime = CalibrationSessionRuntime((0, 1, 2, 3, 4))
+        runtime.registry.close('camera-1')
+        runtime.registry.open('camera-4')
+        calibration = SimpleNamespace(
+            camera_to_projector=(
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+            valid_region=((0, 0), (640, 0), (640, 480), (0, 480)),
+        )
+        for slot_id in ('camera-0', 'camera-2', 'camera-3', 'camera-4'):
+            runtime.registry.set_calibration(
+                slot_id,
+                CalibrationStatus.CALIBRATED,
+                calibration,
+            )
+            runtime.registry.set_area_enabled(slot_id, True)
+
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+        )
+
+        enabled_areas = [
+            area
+            for area in service.get_camera_areas()
+            if area.area_enabled and area.available_area is not None
+        ]
+        assert [area.slot_id for area in enabled_areas] == [
+            'camera-0',
+            'camera-2',
+            'camera-3',
+            'camera-4',
+        ], f'{enabled_areas=}'
+        assert [area.area_colour for area in enabled_areas] == list(AREA_COLOURS)
+
+    def test_invalidating_runtime_status_clears_area_without_silent_restoration(self) -> None:
+        runtime = CalibrationSessionRuntime()
+        calibration = SimpleNamespace(
+            camera_to_projector=(
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+            valid_region=((0, 0), (500, 0), (500, 400), (0, 400)),
+        )
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            calibration,
+        )
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+        )
+        service.set_area_enabled('camera-0', True)
+        unavailable_status = CameraStatus(
+            'camera-0',
+            None,
+            RuntimeStatus.ERROR,
+            CalibrationStatus.CALIBRATED,
+            Resolution(640, 480),
+            error_message='capture failed',
+        )
+
+        original_get_status = runtime.get_status
+
+        def get_status(slot_id: str) -> CameraStatus:
+            if slot_id == 'camera-0':
+                return unavailable_status
+            return original_get_status(slot_id)
+
+        with patch.object(runtime, 'get_status', side_effect=get_status):
+            invalidated_area = service.get_camera_area('camera-0')
+
+        assert invalidated_area.area_enabled is False, f'{invalidated_area=}'
+        assert invalidated_area.available_area is None, f'{invalidated_area=}'
+        assert runtime.registry.get('camera-0').area_enabled is False
+        assert service.get_camera_area('camera-0').area_enabled is False
+
+    def test_recalibration_clears_area_before_attempt_and_after_failure(self) -> None:
+        runtime = CalibrationSessionRuntime()
+        calibration = SimpleNamespace(
+            camera_to_projector=(
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+            valid_region=((0, 0), (500, 0), (500, 400), (0, 400)),
+        )
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            calibration,
+        )
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+            point_service=FakePointService(),  # type: ignore[arg-type]
+        )
+        service.set_area_enabled('camera-0', True)
+        assert service.get_camera_area('camera-0').available_area is not None
+
+        observed_areas: list[object] = []
+
+        def fail_calibration(*_args: object, **_kwargs: object) -> CalibrationResult:
+            observed_areas.append(service.get_camera_area('camera-0').available_area)
+            raise CalibrationError('calibration failed')
+
+        with patch('multivision.application.calibrate_homography', fail_calibration):
+            with self.assertRaises(CalibrationError):
+                service.calibrate('camera-0', ())
+
+        assert observed_areas == [None], f'{observed_areas=}'
+        failed_area = service.get_camera_area('camera-0')
+        assert failed_area.area_enabled is False, f'{failed_area=}'
+        assert failed_area.available_area is None, f'{failed_area=}'
+
+    def test_failed_enable_does_not_change_calibration_overlay_or_lifecycle(self) -> None:
+        runtime = CalibrationSessionRuntime()
+        point_service = FakePointService()
+        service = MultiVisionService(
+            Configuration(),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+            point_service=point_service,  # type: ignore[arg-type]
+        )
+        initial_camera = runtime.registry.get('camera-0')
+
+        with self.assertRaises(InvalidCalibrationStateError):
+            service.set_area_enabled('camera-0', True)
+
+        failed_camera = runtime.registry.get('camera-0')
+        assert failed_camera == initial_camera, f'{failed_camera=}, {initial_camera=}'
+        assert point_service.renamed == [], f'{point_service.renamed=}'
+        assert point_service.cleared == [], f'{point_service.cleared=}'
+
+        invalid_calibration = SimpleNamespace(
+            camera_to_projector=((1, 0, 0), (0, 1, 0), (0, 0, 0)),
+            valid_region=((0, 0), (100, 0), (100, 100)),
+        )
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            invalid_calibration,
+        )
+        before_invalid_request = runtime.registry.get('camera-0')
+        with self.assertRaises(InvalidAvailableAreaError):
+            service.set_area_enabled('camera-0', True)
+        after_invalid_request = runtime.registry.get('camera-0')
+        assert after_invalid_request == before_invalid_request, (
+            f'{after_invalid_request=}, {before_invalid_request=}'
+        )
+        assert after_invalid_request.state is SessionCameraState.OPEN
+        assert after_invalid_request.area_enabled is False
+
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            invalid_calibration,
+        )
+        runtime.registry.close('camera-0')
+        closed_camera = runtime.registry.get('camera-0')
+        with self.assertRaises(CameraUnavailableError):
+            service.set_area_enabled('camera-0', True)
+        assert runtime.registry.get('camera-0') == closed_camera, f'{closed_camera=}'
+
+    def test_recalibration_clears_area_before_availability_failure(self) -> None:
+        runtime = CalibrationSessionRuntime()
+        calibration = SimpleNamespace(
+            camera_to_projector=(
+                (1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+            valid_region=((0, 0), (500, 0), (500, 400), (0, 400)),
+        )
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            calibration,
+        )
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+            point_service=FakePointService(),  # type: ignore[arg-type]
+        )
+        service.set_area_enabled('camera-0', True)
+        unavailable_status = CameraStatus(
+            'camera-0',
+            None,
+            RuntimeStatus.ERROR,
+            CalibrationStatus.CALIBRATED,
+            Resolution(640, 480),
+            error_message='capture failed',
+        )
+
+        with patch.object(runtime, 'get_status', return_value=unavailable_status):
+            with self.assertRaises(CameraUnavailableError):
+                service.calibrate('camera-0', ())
+
+        camera = runtime.registry.get('camera-0')
+        assert camera.area_enabled is False, f'{camera=}'
 
 
 class MultiVisionServiceCameraManagementTest(unittest.TestCase):
@@ -115,6 +436,45 @@ class MultiVisionServiceCameraManagementTest(unittest.TestCase):
         assert renamed_camera.calibration_status is CalibrationStatus.CALIBRATED
         assert renamed_camera.calibration == 'transform'
         assert point_service.renamed == [('camera-0', 'overhead')]
+
+    def test_close_reopen_and_disconnect_remove_enabled_area_state(self) -> None:
+        runtime = CalibrationSessionRuntime()
+        calibration = SimpleNamespace(
+            camera_to_projector=((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+            valid_region=((0, 0), (640, 0), (640, 480), (0, 480)),
+        )
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            calibration,
+        )
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+            point_service=FakePointService(),  # type: ignore[arg-type]
+        )
+
+        service.set_area_enabled('camera-0', True)
+        service.close_camera('camera-0')
+        closed_area = service.get_camera_area('camera-0')
+        assert closed_area.area_enabled is False, f'{closed_area=}'
+        assert closed_area.available_area is None, f'{closed_area=}'
+
+        service.open_camera('camera-0')
+        reopened_area = service.get_camera_area('camera-0')
+        assert reopened_area.area_enabled is False, f'{reopened_area=}'
+        assert reopened_area.available_area is None, f'{reopened_area=}'
+
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            calibration,
+        )
+        service.set_area_enabled('camera-0', True)
+        runtime.registry.mark_unavailable('camera-0', 'disconnected')
+        disconnected_area = service.get_camera_area('camera-0')
+        assert disconnected_area.area_enabled is False, f'{disconnected_area=}'
+        assert disconnected_area.available_area is None, f'{disconnected_area=}'
 
     def test_close_and_reopen_clear_only_the_changed_camera_spatial_state(self) -> None:
         runtime = FakeSessionRuntime()

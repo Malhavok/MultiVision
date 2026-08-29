@@ -60,6 +60,8 @@ class HomographyPair(NamedTuple):
 PointLike: TypeAlias = Point2D | Sequence[Real]
 MatrixLike: TypeAlias = Sequence[Sequence[Real]]
 RegionLike: TypeAlias = CoordinateBounds | Sequence[PointLike]
+BoundsLike: TypeAlias = CoordinateBounds | Resolution | Sequence[int]
+Polygon: TypeAlias = tuple[Point2D, ...]
 
 
 class PreviewTransform(NamedTuple):
@@ -171,13 +173,8 @@ def is_point_in_region(point: PointLike, region: RegionLike) -> bool:
     except ValueError:
         return False
 
-    try:
-        polygon = [coerce_point(polygon_point) for polygon_point in region]
-    except (TypeError, ValueError):
-        return False
-    if len(polygon) < 3 or any(not is_finite_point(polygon_point) for polygon_point in polygon):
-        return False
-    if not _has_nonzero_polygon_area(polygon):
+    polygon = _normalise_polygon(region)
+    if polygon is None:
         return False
 
     is_inside = False
@@ -288,6 +285,105 @@ def project_point(point: PointLike, matrix: MatrixLike) -> Point2D:
     return result
 
 
+def intersect_polygon_with_bounds(
+    polygon: RegionLike,
+    bounds: BoundsLike,
+) -> Polygon | None:
+    """Intersect a finite polygon with a finite rectangular bounds area.
+
+    ``None`` is returned when the inputs are invalid or the intersection has
+    no usable area.  Polygon boundaries use the closed geometric edges of the
+    half-open coordinate rectangle, so a clipped edge may end at ``right`` or
+    ``bottom`` while pixel-coordinate point checks remain half-open.
+    """
+    checked_polygon = _normalise_polygon(polygon)
+    checked_bounds = _coerce_bounds(bounds)
+    if checked_polygon is None or checked_bounds is None:
+        return None
+
+    clipped_polygon = checked_polygon
+    for axis, boundary, keeps_greater in (
+        ('x', checked_bounds.left, True),
+        ('x', checked_bounds.right, False),
+        ('y', checked_bounds.top, True),
+        ('y', checked_bounds.bottom, False),
+    ):
+        clipped_polygon = _clip_polygon_against_boundary(
+            clipped_polygon,
+            axis,
+            boundary,
+            keeps_greater,
+        )
+        if clipped_polygon is None:
+            return None
+
+    return clipped_polygon
+
+
+def project_polygon(
+    polygon: RegionLike,
+    homography: MatrixLike | HomographyPair,
+) -> Polygon | None:
+    """Project a polygon, rejecting invalid transforms and horizon crossings."""
+    checked_polygon = _normalise_polygon(polygon)
+    if checked_polygon is None:
+        return None
+    matrix = (
+        homography.camera_to_projector
+        if isinstance(homography, HomographyPair)
+        else homography
+    )
+    try:
+        normalised_matrix = _normalise_homography(matrix)
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+    denominators = tuple(
+        normalised_matrix[2][0] * point.x
+        + normalised_matrix[2][1] * point.y
+        + normalised_matrix[2][2]
+        for point in checked_polygon
+    )
+    if any(
+        not math.isfinite(denominator)
+        or abs(denominator) <= 1e-12
+        for denominator in denominators
+    ):
+        return None
+    denominator_signs = {denominator > 0 for denominator in denominators}
+    if len(denominator_signs) != 1:
+        return None
+
+    try:
+        projected_polygon = tuple(
+            project_point(point, normalised_matrix)
+            for point in checked_polygon
+        )
+    except InvalidHomographyError:
+        return None
+    return _normalise_polygon(projected_polygon)
+
+
+def calculate_available_projector_area(
+    camera_polygon: RegionLike,
+    camera_resolution: Resolution | Sequence[int],
+    homography: MatrixLike | HomographyPair,
+    projector_resolution: Resolution | Sequence[int],
+) -> Polygon | None:
+    """Derive a usable projector polygon using a camera-to-projector transform."""
+    camera_bounds = _coerce_bounds(camera_resolution)
+    projector_bounds = _coerce_bounds(projector_resolution)
+    if camera_bounds is None or projector_bounds is None:
+        return None
+    native_polygon = intersect_polygon_with_bounds(camera_polygon, camera_bounds)
+    if native_polygon is None:
+        return None
+    projected_polygon = project_polygon(native_polygon, homography)
+    if projected_polygon is None:
+        return None
+    return intersect_polygon_with_bounds(projected_polygon, projector_bounds)
+
+
 def projector_to_camera(
     point: PointLike,
     homography: MatrixLike | HomographyPair,
@@ -368,6 +464,8 @@ def _coerce_resolution(
     if isinstance(resolution, Resolution):
         checked_resolution = resolution
     else:
+        if isinstance(resolution, (Mapping, Set, str, bytes, bytearray)):
+            raise ValueError(f'{field_name} must contain width and height')
         try:
             width, height = resolution
         except (TypeError, ValueError):
@@ -383,6 +481,91 @@ def _coerce_resolution(
     ):
         raise ValueError(f'{field_name} must contain positive integer dimensions')
     return checked_resolution
+
+
+def _coerce_bounds(bounds: BoundsLike) -> CoordinateBounds | None:
+    if isinstance(bounds, CoordinateBounds):
+        return bounds if _is_valid_bounds(bounds) else None
+    try:
+        resolution = _coerce_resolution(bounds, 'bounds')
+    except (TypeError, ValueError):
+        return None
+    return CoordinateBounds(0, 0, resolution.width, resolution.height)
+
+
+def _normalise_polygon(polygon: RegionLike) -> Polygon | None:
+    if isinstance(polygon, CoordinateBounds):
+        if not _is_valid_bounds(polygon):
+            return None
+        points = (
+            Point2D(polygon.left, polygon.top),
+            Point2D(polygon.right, polygon.top),
+            Point2D(polygon.right, polygon.bottom),
+            Point2D(polygon.left, polygon.bottom),
+        )
+    else:
+        if isinstance(polygon, (Mapping, Set, str, bytes, bytearray)):
+            return None
+        try:
+            points = tuple(coerce_point(point) for point in polygon)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    distinct_points: list[Point2D] = []
+    for point in points:
+        if len(distinct_points) == 0 or point != distinct_points[-1]:
+            distinct_points.append(point)
+    if len(distinct_points) > 1 and distinct_points[0] == distinct_points[-1]:
+        distinct_points.pop()
+    if len(distinct_points) < 3 or not _has_nonzero_polygon_area(distinct_points):
+        return None
+    return tuple(distinct_points)
+
+
+def _clip_polygon_against_boundary(
+    polygon: Polygon,
+    axis: str,
+    boundary: float,
+    keeps_greater: bool,
+) -> Polygon | None:
+    clipped_points: list[Point2D] = []
+    previous_point = polygon[-1]
+    previous_value = previous_point.x if axis == 'x' else previous_point.y
+    previous_inside = (
+        previous_value >= boundary
+        if keeps_greater
+        else previous_value <= boundary
+    )
+    for current_point in polygon:
+        current_value = current_point.x if axis == 'x' else current_point.y
+        current_inside = (
+            current_value >= boundary
+            if keeps_greater
+            else current_value <= boundary
+        )
+        if current_inside != previous_inside:
+            value_delta = current_value - previous_value
+            fraction = (boundary - previous_value) / value_delta
+            intersection_x = previous_point.x + fraction * (
+                current_point.x - previous_point.x
+            )
+            intersection_y = previous_point.y + fraction * (
+                current_point.y - previous_point.y
+            )
+            if axis == 'x':
+                intersection_x = boundary
+            else:
+                intersection_y = boundary
+            clipped_points.append(Point2D(intersection_x, intersection_y))
+        if current_inside:
+            clipped_points.append(current_point)
+        previous_point = current_point
+        previous_value = current_value
+        previous_inside = current_inside
+
+    if len(clipped_points) == 0:
+        return None
+    return _normalise_polygon(clipped_points)
 
 
 def _is_valid_bounds(bounds: CoordinateBounds) -> bool:
@@ -474,16 +657,20 @@ def _determinant(matrix: tuple[tuple[float, float, float], ...]) -> float:
 
 
 __all__ = [
+    'BoundsLike',
     'CoordinateBounds',
     'HomographyPair',
     'MatrixLike',
+    'Polygon',
     'Point2D',
     'PointLike',
     'PreviewTransform',
     'RegionLike',
     'build_preview_transform',
+    'calculate_available_projector_area',
     'camera_to_projector',
     'coerce_point',
+    'intersect_polygon_with_bounds',
     'invert_homography',
     'is_finite_point',
     'is_point_in_bounds',
@@ -493,6 +680,7 @@ __all__ = [
     'preview_local_to_camera_native',
     'project_camera_to_projector',
     'project_point',
+    'project_polygon',
     'projector_to_camera',
     'validate_homography',
     'validate_point_in_region',

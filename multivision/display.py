@@ -72,12 +72,23 @@ class ProjectorOutput(Protocol):
 ProjectorOutputFactory = Callable[[Any, 'DisplayConfiguration'], ProjectorOutput | None]
 
 
+class ProjectorAreaLike(Protocol):
+    slot_id: str
+    display_name: str
+    area_enabled: bool
+    available_area: Sequence[Point2D] | None
+    area_colour: tuple[int, int, int]
+
+
 class DisplayServiceLike(Protocol):
     @property
     def overlay(self) -> RedCircleOverlay | None:
         ...
 
     def get_camera_statuses(self) -> list[CameraStatus]:
+        ...
+
+    def get_camera_areas(self) -> list[ProjectorAreaLike]:
         ...
 
     def snapshot(self, logical_name: str) -> Frame:
@@ -234,6 +245,36 @@ class ProjectorRenderer:
                 marker_surface,
                 (round(marker.bounds.left), round(marker.bounds.top)),
             )
+
+    def render_areas(
+        self,
+        surface: Any,
+        areas: Sequence[ProjectorAreaLike],
+        font: Any | None = None,
+    ) -> None:
+        """Draw the current enabled diagnostic areas in slot order."""
+        if not isinstance(areas, Sequence) or isinstance(areas, (str, bytes)):
+            raise TypeError('areas must be a sequence of projector areas')
+        if font is None:
+            font = self._pygame.font.Font(None, 16)
+        for area in sorted(areas, key=lambda value: _slot_sort_key(value.slot_id)):
+            if not area.area_enabled or area.available_area is None:
+                continue
+            area_points = tuple(
+                (round(point.x), round(point.y))
+                for point in area.available_area
+            )
+            if len(area_points) < 3:
+                continue
+            self._pygame.draw.polygon(
+                surface,
+                area.area_colour,
+                area_points,
+                2,
+            )
+            label_surface = font.render(area.display_name, True, area.area_colour)
+            first_point = area_points[0]
+            surface.blit(label_surface, first_point)
 
     def render_overlay(
         self,
@@ -478,6 +519,12 @@ class PygameDisplayRuntime:
                 )
                 if callable(mark_pattern_presented):
                     mark_pattern_presented()
+        if projector_is_ready and not pattern_visible:
+            self._projector_renderer.render_areas(
+                self._projector_surface,
+                self._get_projector_areas(),
+                self._font,
+            )
         if projector_is_ready:
             self._projector_renderer.render_overlay(
                 self._projector_surface,
@@ -715,6 +762,15 @@ class PygameDisplayRuntime:
             self.configuration.window_resolution,
             session_cameras=session_cameras if len(session_cameras) > 0 else None,
         )
+
+    def _get_projector_areas(self) -> list[ProjectorAreaLike]:
+        get_camera_areas = getattr(self.service, 'get_camera_areas', None)
+        if not callable(get_camera_areas):
+            return []
+        areas = get_camera_areas()
+        if not isinstance(areas, list):
+            raise TypeError('service returned an invalid projector area list')
+        return areas
 
     def _get_display_cameras(self) -> list[_DisplayCamera]:
         statuses = self.service.get_camera_statuses()
@@ -1090,6 +1146,7 @@ __all__ = [
     'FrameSurfaceConverter',
     'MarkerImageRenderer',
     'DisplayServiceLike',
+    'ProjectorAreaLike',
     'ProjectorOutput',
     'ProjectorOutputFactory',
     'PygameDisplayRuntime',

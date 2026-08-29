@@ -18,11 +18,16 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     field_validator,
 )
 
-from multivision.application import MultiVisionService
+from multivision.application import (
+    CameraArea,
+    MultiVisionService,
+    get_camera_area_colour,
+)
 from multivision.errors import (
     CalibrationError,
     CameraSlotNotFoundError,
@@ -36,7 +41,10 @@ from multivision.errors import (
     SessionCameraError,
 )
 from multivision.fiducials import FiducialCorrespondence
-from multivision.geometry import Point2D
+from multivision.geometry import (
+    Point2D,
+    Polygon,
+)
 from multivision.persistence import PersistedCalibration
 from multivision.service import RedCircleOverlay
 from multivision.session import (
@@ -98,6 +106,14 @@ class CameraRenameRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     name: str = Field(min_length=1)
+
+
+class CameraAreaRequest(BaseModel):
+    """The desired session-local diagnostic-area state."""
+
+    model_config = ConfigDict(extra='forbid')
+
+    enabled: StrictBool
 
 
 class PointRequest(BaseModel):
@@ -202,8 +218,16 @@ def create_app(
     def get_cameras() -> list[dict[str, Any]]:
         session_cameras = owned_service.get_session_cameras()
         if len(session_cameras) > 0:
+            areas = {
+                area.slot_id: area
+                for area in owned_service.get_camera_areas()
+            }
             return [
-                _session_camera_to_data(owned_service, camera)
+                _session_camera_to_data(
+                    owned_service,
+                    camera,
+                    areas[camera.slot_id],
+                )
                 for camera in session_cameras
             ]
         return [_camera_to_data(status) for status in owned_service.get_camera_statuses()]
@@ -215,6 +239,14 @@ def create_app(
     ) -> dict[str, Any]:
         camera = owned_service.rename_camera(slot_id, request.name)
         return _session_camera_to_data(owned_service, camera)
+
+    @app.post('/cameras/{slot_id}/area')
+    def set_camera_area(
+        slot_id: Annotated[str, Path(min_length=1)],
+        request: CameraAreaRequest,
+    ) -> dict[str, Any]:
+        area = owned_service.set_area_enabled(slot_id, request.enabled)
+        return _camera_area_to_data(owned_service, area)
 
     @app.post('/cameras/{slot_id}/close')
     def close_camera(
@@ -241,6 +273,9 @@ def create_app(
     def get_camera_status(
         logical_name: Annotated[str, Path(min_length=1)],
     ) -> dict[str, Any]:
+        camera = _find_session_camera(owned_service, logical_name)
+        if camera is not None:
+            return _session_camera_to_data(owned_service, camera)
         return _camera_to_data(owned_service.get_camera_status(logical_name))
 
     @app.get('/cameras/{logical_name}/snapshot')
@@ -384,13 +419,23 @@ def _device_to_data(device: DeviceInfo) -> dict[str, Any]:
 
 
 def _camera_to_data(status: CameraStatus) -> dict[str, Any]:
+    lifecycle = _lifecycle_for_status(status)
     return {
         'camera': status.logical_name,
+        'slot': status.logical_name,
+        'name': status.logical_name,
         'device_id': status.device_id,
+        'state': lifecycle,
+        'lifecycle': lifecycle,
         'runtime_status': status.runtime_status.value,
         'calibration_status': status.calibration_status.value,
+        'calibration': status.calibration_status.value,
         'native_resolution': _resolution_to_data(status.native_resolution),
         'frame_counter': status.frame_counter,
+        'frame_metadata': None,
+        'area_enabled': False,
+        'area_colour': list(get_camera_area_colour(status.logical_name)),
+        'available_area': None,
         'error_message': status.error_message,
     }
 
@@ -398,8 +443,10 @@ def _camera_to_data(status: CameraStatus) -> dict[str, Any]:
 def _session_camera_to_data(
     service: MultiVisionService,
     camera: SessionCamera,
+    area: CameraArea | None = None,
 ) -> dict[str, Any]:
     status = service.get_camera_status(camera.slot_id)
+    area = service.get_camera_area(camera.slot_id) if area is None else area
     device_info = camera.device_info
     frame_metadata = camera.frame_metadata
     return {
@@ -409,13 +456,54 @@ def _session_camera_to_data(
         'device_id': device_info.device_id if device_info is not None else None,
         'capture_index': camera.capture_index,
         'state': camera.state.value,
+        'lifecycle': camera.state.value,
         'runtime_status': status.runtime_status.value,
         'calibration_status': status.calibration_status.value,
+        'calibration': status.calibration_status.value,
         'native_resolution': _resolution_to_data(status.native_resolution),
         'frame_counter': status.frame_counter,
         'frame_metadata': _frame_metadata_to_data(frame_metadata),
+        'area_enabled': area.area_enabled,
+        'area_colour': list(area.area_colour),
+        'available_area': _polygon_to_data(area.available_area),
         'error_message': status.error_message or camera.error_message,
     }
+
+
+def _camera_area_to_data(
+    service: MultiVisionService,
+    area: CameraArea,
+) -> dict[str, Any]:
+    camera = _find_session_camera(service, area.slot_id)
+    if camera is None:
+        raise SessionCameraError(
+            f'Camera slot {area.slot_id!r} is not in the session inventory',
+        )
+    return _session_camera_to_data(service, camera, area)
+
+
+def _find_session_camera(
+    service: MultiVisionService,
+    camera_reference: str,
+) -> SessionCamera | None:
+    for camera in service.get_session_cameras():
+        if camera.slot_id == camera_reference or camera.display_name == camera_reference:
+            return camera
+    return None
+
+
+def _polygon_to_data(polygon: Polygon | None) -> list[list[float]] | None:
+    if polygon is None:
+        return None
+    return [[point.x, point.y] for point in polygon]
+
+
+def _lifecycle_for_status(status: CameraStatus) -> str:
+    if status.runtime_status is RuntimeStatus.STOPPED:
+        return 'CLOSED'
+    if status.runtime_status in {RuntimeStatus.ERROR, RuntimeStatus.UNAVAILABLE}:
+        return 'UNAVAILABLE'
+    return 'OPEN'
 
 
 def _frame_metadata_to_data(
@@ -562,6 +650,7 @@ app = create_app()
 
 __all__ = [
     'CalibrationRequest',
+    'CameraAreaRequest',
     'CameraRenameRequest',
     'CorrespondenceRequest',
     'PointPairRequest',

@@ -40,6 +40,12 @@ class InvalidHomographyError(GeometryError):
     code = 'INVALID_HOMOGRAPHY'
 
 
+class InvalidAvailableAreaError(GeometryError):
+    """Raised when a camera calibration cannot produce a usable area."""
+
+    code = 'AVAILABLE_AREA_INVALID'
+
+
 class FiducialDetectionError(MultiVisionError):
     """Raised when the fiducial detector cannot be initialised or run."""
 

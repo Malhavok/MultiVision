@@ -35,6 +35,8 @@ class CliTest(unittest.TestCase):
             ['cameras', 'rename', 'camera-0', 'overhead'],
             ['cameras', 'close', 'camera-1'],
             ['cameras', 'open', 'camera-1'],
+            ['cameras', 'area', 'enable', 'camera-0'],
+            ['cameras', 'area', 'disable', 'camera-0'],
             ['calibrate', '--camera', 'overhead'],
             ['calibration', 'verify', '--camera', 'overhead'],
             ['calibration', 'status'],
@@ -56,6 +58,16 @@ class CliTest(unittest.TestCase):
             ),
             ('POST', 'http://service.test/cameras/camera-1/close', None),
             ('POST', 'http://service.test/cameras/camera-1/open', None),
+            (
+                'POST',
+                'http://service.test/cameras/camera-0/area',
+                {'enabled': True},
+            ),
+            (
+                'POST',
+                'http://service.test/cameras/camera-0/area',
+                {'enabled': False},
+            ),
             ('POST', 'http://service.test/calibration', {'camera': 'overhead'}),
             ('POST', 'http://service.test/calibration/verify', {'camera': 'overhead'}),
             ('GET', 'http://service.test/calibration/status', None),
@@ -66,6 +78,67 @@ class CliTest(unittest.TestCase):
             }),
             ('DELETE', 'http://service.test/overlay', None),
         ]
+
+    def test_area_command_prints_service_schema_and_preserves_structured_failures(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            if payload == {'enabled': True}:
+                return ServiceResponse(
+                    200,
+                    'application/json',
+                    json.dumps({
+                        'slot': 'camera-0',
+                        'name': 'overhead',
+                        'area_enabled': True,
+                        'available_area': [[1.0, 2.0], [3.0, 4.0]],
+                    }).encode('utf-8'),
+                )
+            return ServiceResponse(
+                422,
+                'application/json',
+                json.dumps({
+                    'error': {
+                        'code': 'AVAILABLE_AREA_INVALID',
+                        'message': 'area is degenerate',
+                    },
+                }).encode('utf-8'),
+            )
+
+        client = MultiVisionClient(
+            'http://service.test',
+            request_sender=request_sender,
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(['cameras', 'area', 'enable', 'camera-0'], client)
+        assert result == 0
+        assert json.loads(output.getvalue())['area_enabled'] is True
+
+        error_output = io.StringIO()
+        with redirect_stderr(error_output):
+            result = main(['cameras', 'area', 'disable', 'camera-0'], client)
+        assert result == 1
+        assert 'AVAILABLE_AREA_INVALID' in error_output.getvalue()
+        assert [
+            (url, payload)
+            for _method, url, payload, _timeout_seconds in requests
+        ] == [
+            (
+                'http://service.test/cameras/camera-0/area',
+                {'enabled': True},
+            ),
+            (
+                'http://service.test/cameras/camera-0/area',
+                {'enabled': False},
+            ),
+        ], f'{requests=}'
 
     def test_snapshot_can_write_the_service_response_without_opening_a_camera(self) -> None:
         output = io.StringIO()
@@ -221,7 +294,10 @@ class CliTest(unittest.TestCase):
                 '-c',
                 (
                     'import sys; import multivision.cli; '
-                    "print('cv2' in sys.modules, 'pygame' in sys.modules)"
+                    "print('cv2' in sys.modules, 'pygame' in sys.modules, "
+                    "'multivision.camera' in sys.modules, "
+                    "'multivision.display' in sys.modules, "
+                    "'multivision.geometry' in sys.modules)"
                 ),
             ],
             capture_output=True,
@@ -230,7 +306,7 @@ class CliTest(unittest.TestCase):
         )
 
         assert result.returncode == 0, f'{result.stdout=}, {result.stderr=}'
-        assert result.stdout.strip() == 'False False', f'{result.stdout=}'
+        assert result.stdout.strip() == 'False False False False False', f'{result.stdout=}'
 
 
 if __name__ == '__main__':

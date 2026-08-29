@@ -2,16 +2,19 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from multivision.application import CameraArea
 from multivision.calibration import CalibrationMetrics
 from multivision.display import (
+    BLACK,
     DisplayConfiguration,
     PygameDisplayRuntime,
     ProjectorRenderer,
     Sdl2ProjectorOutput,
     build_camera_preview_layouts,
 )
-from multivision.geometry import CoordinateBounds
+from multivision.geometry import CoordinateBounds, Point2D
 from multivision.pattern import build_calibration_pattern
+from multivision.service import RedCircleOverlay
 from multivision.session import SessionCameraRegistry
 from multivision.types import (
     CalibrationStatus,
@@ -82,7 +85,12 @@ class FakePygame:
         )
         self.time = SimpleNamespace(Clock=lambda: SimpleNamespace(tick=lambda _rate: None))
         self.event = SimpleNamespace(get=lambda: [])
-        self.draw = SimpleNamespace(rect=lambda *_arguments: None)
+        self.draw_calls: list[tuple[str, tuple[object, ...]]] = []
+        self.draw = SimpleNamespace(
+            rect=lambda *arguments: self.draw_calls.append(('rect', arguments)),
+            polygon=lambda *arguments: self.draw_calls.append(('polygon', arguments)),
+            circle=lambda *arguments: self.draw_calls.append(('circle', arguments)),
+        )
         self.transform = SimpleNamespace(
             smoothscale=lambda _surface, size: FakeSurface(size),
         )
@@ -132,6 +140,15 @@ class FakeCameraRuntime:
         assert logical_name == 'overhead'
         self.snapshot_count += 1
         return Frame(f'frame-{self.snapshot_count}', self.snapshot_count, 0.0)
+
+
+class AreaDisplayService(FakeCameraRuntime):
+    def __init__(self, areas: list[CameraArea]) -> None:
+        super().__init__()
+        self.areas = areas
+
+    def get_camera_areas(self) -> list[CameraArea]:
+        return self.areas
 
 
 class SessionDisplayService:
@@ -637,6 +654,127 @@ class DisplayTest(unittest.TestCase):
         assert display_runtime.projector_surface is None
         assert pygame_module.quit_count == 1, f'{pygame_module.quit_count=}'
 
+    def test_projector_area_rendering_uses_slot_order_names_and_colours(self) -> None:
+        pygame_module = FakePygame()
+        font = FakeFont(pygame_module.rendered_text)
+        surface = FakeSurface((1200, 800))
+        areas = [
+            CameraArea(
+                'camera-1',
+                'side-left',
+                True,
+                (Point2D(20, 30), Point2D(200, 30), Point2D(200, 150)),
+                (255, 180, 70),
+            ),
+            CameraArea(
+                'camera-0',
+                'overhead',
+                True,
+                (Point2D(10, 20), Point2D(100, 20), Point2D(100, 120)),
+                (70, 190, 255),
+            ),
+            CameraArea('camera-2', 'disabled', False, None, (180, 100, 255)),
+        ]
+
+        ProjectorRenderer(pygame_module).render_areas(surface, areas, font)
+
+        assert [call[0] for call in pygame_module.draw_calls] == [
+            'polygon',
+            'polygon',
+        ], f'{pygame_module.draw_calls=}'
+        assert [call[1][1] for call in pygame_module.draw_calls] == [
+            (70, 190, 255),
+            (255, 180, 70),
+        ], f'{pygame_module.draw_calls=}'
+        assert pygame_module.rendered_text == ['overhead', 'side-left'], (
+            f'{pygame_module.rendered_text=}'
+        )
+        assert [position for _surface, position in surface.blits] == [
+            (10, 20),
+            (20, 30),
+        ], f'{surface.blits=}'
+
+    def test_projector_areas_are_separate_from_point_overlay_and_stale_areas_disappear(self) -> None:
+        area = CameraArea(
+            'camera-0',
+            'overhead',
+            True,
+            (Point2D(10, 20), Point2D(200, 20), Point2D(200, 150)),
+            (70, 190, 255),
+        )
+        service = AreaDisplayService([area])
+        service.overlay = RedCircleOverlay(
+            'overhead',
+            'overhead-device',
+            Point2D(1, 2),
+            Point2D(300, 400),
+        )
+        pygame_module = FakePygame()
+        display_runtime = PygameDisplayRuntime(
+            service,
+            pygame_module=pygame_module,
+            frame_surface_converter=lambda _frame, _pygame: FakeSurface((1, 1)),
+        )
+
+        display_runtime.render_once()
+        projector_draw_calls = [
+            call
+            for call in pygame_module.draw_calls
+            if call[1][0] is display_runtime.projector_surface
+        ]
+        assert [call[0] for call in projector_draw_calls] == [
+            'polygon',
+            'circle',
+        ], f'{projector_draw_calls=}'
+
+        service.areas = []
+        display_runtime.render_once()
+        projector_draw_calls = [
+            call
+            for call in pygame_module.draw_calls
+            if call[1][0] is display_runtime.projector_surface
+        ]
+        assert [call[0] for call in projector_draw_calls] == [
+            'polygon',
+            'circle',
+            'circle',
+        ], f'{projector_draw_calls=}'
+        assert display_runtime.projector_surface.fills == [BLACK, BLACK]
+
+    def test_projector_areas_are_suppressed_while_calibration_pattern_is_visible(self) -> None:
+        area = CameraArea(
+            'camera-0',
+            'overhead',
+            True,
+            (Point2D(10, 20), Point2D(200, 20), Point2D(200, 150)),
+            (70, 190, 255),
+        )
+        service = AreaDisplayService([area])
+        service.calibration_pattern_visible = True
+        pygame_module = FakePygame()
+        pattern = build_calibration_pattern(Resolution(1200, 800))
+        display_runtime = PygameDisplayRuntime(
+            service,
+            DisplayConfiguration(projector_resolution=Resolution(1200, 800)),
+            calibration_pattern=pattern,
+            pygame_module=pygame_module,
+            marker_image_renderer=lambda _family, _id, size, _pygame: FakeSurface(
+                (size, size),
+            ),
+        )
+
+        display_runtime.render_once()
+
+        assert not any(
+            call[0] == 'polygon'
+            for call in pygame_module.draw_calls
+        ), f'{pygame_module.draw_calls=}'
+        assert 'overhead' not in pygame_module.rendered_text
+        assert 'side-left' not in pygame_module.rendered_text
+        assert display_runtime.projector_surface.fills == [
+            (235, 235, 235),
+        ]
+
     def test_projector_pattern_rendering_is_independent_of_camera_runtime(self) -> None:
         pygame_module = FakePygame()
         marker_calls: list[tuple[str, int, int]] = []
@@ -650,9 +788,10 @@ class DisplayTest(unittest.TestCase):
             marker_calls.append((family, marker_id, pixel_size))
             return FakeSurface((pixel_size, pixel_size))
 
+        usable_area = CoordinateBounds(50, 50, 1150, 750)
         pattern = build_calibration_pattern(
             Resolution(1200, 800),
-            usable_area=CoordinateBounds(50, 50, 1150, 750),
+            usable_area=usable_area,
         )
         projector_surface = FakeSurface((1200, 800))
         ProjectorRenderer(pygame_module, render_marker).render_calibration_pattern(
@@ -663,6 +802,14 @@ class DisplayTest(unittest.TestCase):
         assert len(marker_calls) == len(pattern.markers), f'{marker_calls=}'
         assert projector_surface.fills == [(235, 235, 235)], f'{projector_surface.fills=}'
         assert len(projector_surface.blits) == len(pattern.markers), f'{projector_surface.blits=}'
+        assert all(
+            isinstance(marker_surface, FakeSurface)
+            and position[0] >= usable_area.left
+            and position[1] >= usable_area.top
+            and position[0] + marker_surface.size[0] <= usable_area.right
+            and position[1] + marker_surface.size[1] <= usable_area.bottom
+            for marker_surface, position in projector_surface.blits
+        ), f'{projector_surface.blits=}'
         assert pattern == build_calibration_pattern(
             Resolution(1200, 800),
             usable_area=CoordinateBounds(50, 50, 1150, 750),

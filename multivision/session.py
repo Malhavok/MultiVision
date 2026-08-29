@@ -72,6 +72,8 @@ class SessionCamera:
     calibration: object | None = None
     error_message: str | None = None
     lifecycle_generation: int = 0
+    # Geometry remains derived from the current calibration; this flag is session-local.
+    area_enabled: bool = False
 
     def __post_init__(self) -> None:
         _validate_slot_id(self.slot_id)
@@ -81,12 +83,20 @@ class SessionCamera:
         _validate_camera_state(self.state)
         _validate_frame_metadata(self.frame_metadata)
         _validate_calibration_status(self.calibration_status)
+        _validate_area_enabled(self.area_enabled)
         _validate_camera_runtime_state(
             self.state,
             self.frame_metadata,
             self.calibration_status,
             self.calibration,
         )
+        if self.area_enabled and (
+            self.state is not SessionCameraState.OPEN
+            or self.calibration_status is not CalibrationStatus.CALIBRATED
+        ):
+            raise SessionCameraError(
+                'an enabled area requires an open, calibrated camera',
+            )
         if self.error_message is not None and not isinstance(self.error_message, str):
             raise SessionCameraError('error_message must be a string or None')
         if (
@@ -222,6 +232,25 @@ class SessionCameraRegistry:
         camera.frame_metadata = frame_metadata
         return self._snapshot_camera(camera)
 
+    def set_area_enabled(self, slot_id: str, area_enabled: bool) -> SessionCamera:
+        """Set session-local area visibility without storing derived geometry."""
+        camera = self._get(slot_id)
+        _validate_area_enabled(area_enabled)
+        if area_enabled and camera.state is not SessionCameraState.OPEN:
+            raise CameraStateError(
+                f'Camera {slot_id!r} cannot enable an area while {camera.state}',
+            )
+        if (
+            area_enabled
+            and camera.calibration_status is not CalibrationStatus.CALIBRATED
+        ):
+            raise CameraStateError(
+                f'Camera {slot_id!r} cannot enable an area while '
+                f'{camera.calibration_status}',
+            )
+        camera.area_enabled = area_enabled
+        return self._snapshot_camera(camera)
+
     def set_calibration(
         self,
         slot_id: str,
@@ -240,6 +269,7 @@ class SessionCameraRegistry:
             calibration_status,
             calibration,
         )
+        camera.area_enabled = False
         camera.calibration_status = calibration_status
         camera.calibration = copy.deepcopy(calibration)
         return self._snapshot_camera(camera)
@@ -322,6 +352,7 @@ class SessionCameraRegistry:
     @staticmethod
     def _clear_runtime_state(camera: SessionCamera) -> None:
         camera.frame_metadata = None
+        camera.area_enabled = False
         SessionCameraRegistry._clear_calibration(camera)
 
 
@@ -388,6 +419,11 @@ def _validate_frame_metadata(frame_metadata: object) -> None:
 def _validate_calibration_status(status: object) -> None:
     if not isinstance(status, CalibrationStatus):
         raise SessionCameraError('calibration_status must be CalibrationStatus')
+
+
+def _validate_area_enabled(area_enabled: object) -> None:
+    if not isinstance(area_enabled, bool):
+        raise SessionCameraError('area_enabled must be a bool')
 
 
 def _validate_camera_runtime_state(

@@ -126,8 +126,18 @@ def build_calibration_pattern(
     )
 
     columns, rows, omitted_slots = _layout_for_marker_count(marker_count)
-    cell_width = (checked_area.right - checked_area.left) / columns
-    cell_height = (checked_area.bottom - checked_area.top) / rows
+    x_starts = _build_raster_safe_axis_starts(
+        checked_area.left,
+        checked_area.right,
+        columns,
+        checked_marker_size,
+    )
+    y_starts = _build_raster_safe_axis_starts(
+        checked_area.top,
+        checked_area.bottom,
+        rows,
+        checked_marker_size,
+    )
     marker_positions = [
         (x_idx, y_idx)
         for y_idx in range(rows)
@@ -140,10 +150,8 @@ def build_calibration_pattern(
             marker_id,
             _build_marker_corners(
                 checked_area,
-                x_idx,
-                y_idx,
-                cell_width,
-                cell_height,
+                x_starts[x_idx],
+                y_starts[y_idx],
                 checked_marker_size,
             ),
         )
@@ -248,22 +256,67 @@ def _layout_for_marker_count(marker_count: int) -> tuple[int, int, frozenset[tup
     return layouts[marker_count]
 
 
+def _build_raster_safe_axis_starts(
+    area_start: float,
+    area_end: float,
+    axis_count: int,
+    marker_size: float,
+) -> tuple[float, ...]:
+    rendered_marker_size = max(1, round(marker_size))
+    first_render_start = math.ceil(area_start)
+    first_start = max(
+        area_start,
+        _minimum_raster_safe_start(first_render_start),
+    )
+    last_render_start = math.floor(area_end) - rendered_marker_size
+    last_raster_start = _maximum_raster_safe_start(last_render_start)
+    last_geometry_start = math.nextafter(
+        area_end - marker_size,
+        -math.inf,
+    )
+    last_start = min(last_raster_start, last_geometry_start)
+    if last_start < first_start:
+        raise ValueError('marker_size must fit inside the raster-safe usable area')
+    step = (last_start - first_start) / (axis_count - 1)
+    return tuple(
+        min(first_start + marker_idx * step, last_start)
+        for marker_idx in range(axis_count)
+    )
+
+
+def _minimum_raster_safe_start(rendered_start: int) -> float:
+    candidate = rendered_start - 0.5
+    if round(candidate) >= rendered_start:
+        return candidate
+    return math.nextafter(candidate, math.inf)
+
+
+def _maximum_raster_safe_start(rendered_start: int) -> float:
+    candidate = rendered_start + 0.5
+    if round(candidate) <= rendered_start:
+        return candidate
+    return math.nextafter(candidate, -math.inf)
+
+
 def _build_marker_corners(
     usable_area: CoordinateBounds,
-    x_idx: int,
-    y_idx: int,
-    cell_width: float,
-    cell_height: float,
+    x_start: float,
+    y_start: float,
     marker_size: float,
 ) -> tuple[Point2D, ...]:
-    centre_x = usable_area.left + (x_idx + 0.5) * cell_width
-    centre_y = usable_area.top + (y_idx + 0.5) * cell_height
-    half_size = marker_size / 2
+    x_end = min(
+        x_start + marker_size,
+        math.nextafter(usable_area.right, -math.inf),
+    )
+    y_end = min(
+        y_start + marker_size,
+        math.nextafter(usable_area.bottom, -math.inf),
+    )
     return (
-        Point2D(centre_x - half_size, centre_y - half_size),
-        Point2D(centre_x + half_size, centre_y - half_size),
-        Point2D(centre_x + half_size, centre_y + half_size),
-        Point2D(centre_x - half_size, centre_y + half_size),
+        Point2D(x_start, y_start),
+        Point2D(x_end, y_start),
+        Point2D(x_end, y_end),
+        Point2D(x_start, y_end),
     )
 
 

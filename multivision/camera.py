@@ -203,6 +203,14 @@ class CameraRuntime:
                 )
                 return camera
 
+    def set_area_enabled(self, slot_id: str, area_enabled: bool) -> SessionCamera:
+        """Update session-local area visibility without storing its polygon."""
+        with self._lifecycle_lock:
+            self._require_session_runtime()
+            assert self._session_registry is not None
+            with self._lock:
+                return self._session_registry.set_area_enabled(slot_id, area_enabled)
+
     def rename_camera(self, slot_id: str, display_name: str) -> SessionCamera:
         """Rename a session slot without changing its owned runtime state."""
         with self._lifecycle_lock:

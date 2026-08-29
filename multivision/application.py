@@ -6,6 +6,7 @@ import pathlib
 import threading
 import time
 from collections.abc import Sequence
+from typing import NamedTuple
 
 from multivision.calibration import CalibrationMetrics, calibrate_homography
 from multivision.camera import CameraRuntime
@@ -16,11 +17,19 @@ from multivision.config import (
 from multivision.discovery import PlatformDeviceDiscovery
 from multivision.errors import (
     CalibrationError,
+    CameraSlotNotFoundError,
     CameraUnavailableError,
     FrameCaptureError,
+    InvalidAvailableAreaError,
+    InvalidCalibrationStateError,
     SessionCameraError,
 )
-from multivision.geometry import Point2D, PreviewTransform
+from multivision.geometry import (
+    Point2D,
+    Polygon,
+    PreviewTransform,
+    calculate_available_projector_area,
+)
 from multivision.fiducials import (
     CameraCorrespondences,
     FiducialCorrespondence,
@@ -56,6 +65,22 @@ from multivision.types import (
 CALIBRATION_PATTERN_WAIT_TIMEOUT_SECONDS = 5.0
 CALIBRATION_PATTERN_SETTLE_SECONDS = 3.0
 CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS = 5.0
+AREA_COLOURS = (
+    (70, 190, 255),
+    (255, 180, 70),
+    (180, 100, 255),
+    (80, 220, 150),
+)
+
+
+class CameraArea(NamedTuple):
+    """Current session-local visibility and derived projector area."""
+
+    slot_id: str
+    display_name: str
+    area_enabled: bool
+    available_area: Polygon | None
+    area_colour: tuple[int, int, int]
 
 
 class MultiVisionService:
@@ -251,6 +276,50 @@ class MultiVisionService:
             return []
         return cameras
 
+    def calculate_available_area(self, camera_reference: str) -> Polygon:
+        """Calculate the current calibrated projector area without enabling it."""
+        with self._camera_management_lock:
+            camera, status = self._get_area_camera(camera_reference)
+            self._require_area_enablement(camera, status)
+            return self._calculate_available_area(camera, status)
+
+    def get_camera_area(self, camera_reference: str) -> CameraArea:
+        """Return the enabled area derived from the camera's current calibration."""
+        with self._camera_management_lock:
+            camera = self._get_session_camera(camera_reference)
+            if camera is None:
+                raise CameraSlotNotFoundError(
+                    f'Unknown session camera slot {camera_reference!r}',
+                )
+            areas = self._get_camera_areas_locked()
+            return next(area for area in areas if area.slot_id == camera.slot_id)
+
+    def get_camera_areas(self) -> list[CameraArea]:
+        """Return current area data in deterministic session-slot order."""
+        with self._camera_management_lock:
+            return self._get_camera_areas_locked()
+
+    def set_area_enabled(
+        self,
+        camera_reference: str,
+        area_enabled: bool,
+    ) -> CameraArea:
+        """Atomically enable or disable one camera's derived projector area."""
+        if not isinstance(area_enabled, bool):
+            raise ValueError('area_enabled must be a bool')
+        with self._camera_management_lock:
+            camera, status = self._get_area_camera(camera_reference)
+            if area_enabled:
+                self._require_area_enablement(camera, status)
+                # Calculate first – an invalid polygon must not change session state.
+                self._calculate_available_area(camera, status)
+            updated_camera = self._set_session_area_enabled(
+                camera.slot_id,
+                area_enabled,
+            )
+            areas = self._get_camera_areas_locked()
+            return next(area for area in areas if area.slot_id == updated_camera.slot_id)
+
     def rename_camera(self, slot_id: str, display_name: str) -> SessionCamera:
         """Rename one session slot while retaining its live camera state."""
         with self._camera_management_lock:
@@ -371,6 +440,151 @@ class MultiVisionService:
     def clear_overlay(self) -> None:
         self.point_service.clear_overlay()
 
+    def _clear_area_before_calibration(self, logical_name: str) -> None:
+        resolved_slot = self._resolve_camera_reference(logical_name)
+        session_camera = self._get_session_camera(resolved_slot)
+        if session_camera is None or not session_camera.area_enabled:
+            return
+        self._set_session_area_enabled(session_camera.slot_id, False)
+
+    def _set_session_area_enabled(
+        self,
+        slot_id: str,
+        area_enabled: bool,
+    ) -> SessionCamera:
+        set_area_enabled = getattr(self.camera_runtime, 'set_area_enabled', None)
+        if not callable(set_area_enabled):
+            raise SessionCameraError(
+                'Camera runtime does not support session area state',
+            )
+        updated_camera = set_area_enabled(slot_id, area_enabled)
+        if not isinstance(updated_camera, SessionCamera):
+            raise SessionCameraError(
+                'Camera runtime returned an invalid area session camera',
+            )
+        return updated_camera
+
+    def _get_area_camera(
+        self,
+        slot_id: str,
+    ) -> tuple[SessionCamera, CameraStatus]:
+        camera = self._get_session_camera(slot_id)
+        if camera is None:
+            raise CameraSlotNotFoundError(
+                f'Unknown session camera slot {slot_id!r}',
+            )
+        return camera, self.get_camera_status(camera.slot_id)
+
+    def _get_camera_areas_locked(self) -> list[CameraArea]:
+        cameras = self._get_session_cameras()
+        if cameras is None:
+            return []
+        areas: list[CameraArea] = []
+        for camera in cameras:
+            area = self._build_camera_area(
+                camera,
+                self.get_camera_status(camera.slot_id),
+            )
+            if area.area_enabled and area.available_area is None:
+                # An invalidating status must not leave an enabled flag that can
+                # silently make an old area reappear after recovery.
+                self._set_session_area_enabled(camera.slot_id, False)
+                area = area._replace(area_enabled=False)
+            areas.append(area)
+        colour_index = 0
+        for area_index, area in enumerate(areas):
+            if not area.area_enabled or area.available_area is None:
+                continue
+            areas[area_index] = area._replace(
+                area_colour=AREA_COLOURS[colour_index],
+            )
+            colour_index += 1
+        return areas
+
+    def _require_area_enablement(
+        self,
+        camera: SessionCamera,
+        status: CameraStatus,
+    ) -> None:
+        if camera.state is not SessionCameraState.OPEN:
+            raise CameraUnavailableError(
+                camera.error_message
+                or f'Camera {camera.slot_id!r} is not available',
+            )
+        if status.runtime_status is not RuntimeStatus.AVAILABLE:
+            raise CameraUnavailableError(
+                status.error_message
+                or f'Camera {camera.slot_id!r} is not available',
+            )
+        calibration_status = self._get_calibration_status(status)
+        if calibration_status is not CalibrationStatus.CALIBRATED:
+            error = InvalidCalibrationStateError(
+                f'Camera {camera.slot_id!r} calibration is '
+                f'{calibration_status.value}',
+            )
+            error.code = f'CALIBRATION_{calibration_status.value}'
+            raise error
+
+    def _calculate_available_area(
+        self,
+        camera: SessionCamera,
+        status: CameraStatus,
+    ) -> Polygon:
+        native_resolution = status.native_resolution
+        calibration = camera.calibration
+        valid_region = getattr(calibration, 'valid_region', None)
+        camera_to_projector = getattr(calibration, 'camera_to_projector', None)
+        if (
+            native_resolution is None
+            or valid_region is None
+            or camera_to_projector is None
+        ):
+            raise InvalidAvailableAreaError(
+                f'Camera {camera.slot_id!r} has no usable calibrated area',
+            )
+        available_area = calculate_available_projector_area(
+            valid_region,
+            native_resolution,
+            camera_to_projector,
+            self.configuration.projector_resolution,
+        )
+        if available_area is None:
+            raise InvalidAvailableAreaError(
+                f'Camera {camera.slot_id!r} has no usable calibrated area',
+            )
+        return available_area
+
+    def _build_camera_area(
+        self,
+        camera: SessionCamera,
+        status: CameraStatus,
+    ) -> CameraArea:
+        area_colour = get_camera_area_colour(camera.slot_id)
+        if not camera.area_enabled:
+            return CameraArea(
+                camera.slot_id,
+                camera.display_name,
+                False,
+                None,
+                area_colour,
+            )
+        try:
+            self._require_area_enablement(camera, status)
+            available_area = self._calculate_available_area(camera, status)
+        except (
+            CameraUnavailableError,
+            InvalidCalibrationStateError,
+            InvalidAvailableAreaError,
+        ):
+            available_area = None
+        return CameraArea(
+            camera.slot_id,
+            camera.display_name,
+            True,
+            available_area,
+            area_colour,
+        )
+
     def _calibrate_camera(
         self,
         logical_name: str,
@@ -384,6 +598,7 @@ class MultiVisionService:
         logical_name: str,
         correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None,
     ) -> PersistedCalibration:
+        self._clear_area_before_calibration(logical_name)
         status = self._require_available_camera(logical_name)
         session_camera = self._get_session_camera(status.logical_name)
         if session_camera is None or status.native_resolution is None:
@@ -425,6 +640,7 @@ class MultiVisionService:
         logical_name: str,
         correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None,
     ) -> CalibrationStatus:
+        self._clear_area_before_calibration(logical_name)
         status = self._require_available_camera(logical_name)
         session_camera = self._get_session_camera(status.logical_name)
         if session_camera is None or status.native_resolution is None:
@@ -645,6 +861,14 @@ class MultiVisionService:
             )
 
 
+def get_camera_area_colour(slot_id: str) -> tuple[int, int, int]:
+    """Return the stable diagnostic colour assigned to a session slot."""
+    prefix, separator, index = slot_id.rpartition('-')
+    if prefix != 'camera' or separator == '' or not index.isdigit():
+        return AREA_COLOURS[0]
+    return AREA_COLOURS[int(index) % len(AREA_COLOURS)]
+
+
 def _session_camera_sort_key(camera: SessionCamera) -> int:
     return int(camera.slot_id.rsplit('-', 1)[1])
 
@@ -688,4 +912,4 @@ def _validate_camera_status(
         )
 
 
-__all__ = ['MultiVisionService']
+__all__ = ['AREA_COLOURS', 'CameraArea', 'MultiVisionService', 'get_camera_area_colour']

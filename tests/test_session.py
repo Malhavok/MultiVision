@@ -106,26 +106,98 @@ class SessionCameraRegistryTest(unittest.TestCase):
             registry.rename('camera-1', 'overhead')
         assert registry.get('camera-1').display_name == 'camera-1'
 
-    def test_close_and_reopen_clear_frame_and_calibration(self) -> None:
+    def test_area_enablement_defaults_disabled_and_requires_calibration(self) -> None:
+        registry = SessionCameraRegistry.from_capture_indexes([0])
+        camera = registry.get('camera-0')
+
+        assert camera.area_enabled is False, f'{camera=}'
+        with self.assertRaises(CameraStateError):
+            registry.set_area_enabled('camera-0', True)
+        assert registry.get('camera-0').area_enabled is False
+
+        registry.set_calibration('camera-0', CalibrationStatus.CALIBRATED, 'transform')
+        enabled_camera = registry.set_area_enabled('camera-0', True)
+        assert enabled_camera.area_enabled is True, f'{enabled_camera=}'
+        assert registry.set_area_enabled('camera-0', True).area_enabled is True
+        assert registry.set_area_enabled('camera-0', False).area_enabled is False
+        with self.assertRaises(SessionCameraError):
+            registry.set_area_enabled('camera-0', 1)  # type: ignore[arg-type]
+
+    def test_area_enablement_preserves_slot_identity_and_rename_state(self) -> None:
+        registry = SessionCameraRegistry.from_capture_indexes([0, 1])
+        registry.set_calibration('camera-0', CalibrationStatus.CALIBRATED, 'transform')
+        registry.set_area_enabled('camera-0', True)
+        renamed_camera = registry.rename('camera-0', 'overhead')
+
+        assert renamed_camera.slot_id == 'camera-0', f'{renamed_camera=}'
+        with self.assertRaises(AttributeError):
+            renamed_camera.slot_id = 'camera-1'
+        assert renamed_camera.display_name == 'overhead', f'{renamed_camera=}'
+        assert renamed_camera.area_enabled is True, f'{renamed_camera=}'
+        assert renamed_camera.calibration == 'transform', f'{renamed_camera=}'
+        assert registry.get('camera-1').area_enabled is False
+
+    def test_area_enablement_is_independent_and_recalibration_invalidates_one_slot(self) -> None:
+        registry = SessionCameraRegistry.from_capture_indexes([0, 1])
+        registry.set_calibration('camera-0', CalibrationStatus.CALIBRATED, 'transform-0')
+        registry.set_calibration('camera-1', CalibrationStatus.CALIBRATED, 'transform-1')
+        registry.set_area_enabled('camera-0', True)
+        registry.set_area_enabled('camera-1', True)
+
+        registry.set_area_enabled('camera-0', False)
+        assert registry.get('camera-0').area_enabled is False
+        assert registry.get('camera-1').area_enabled is True
+        assert registry.get('camera-1').calibration == 'transform-1'
+
+        registry.set_calibration('camera-0', CalibrationStatus.CALIBRATED, 'transform-0-new')
+        assert registry.get('camera-0').area_enabled is False
+        assert registry.get('camera-0').calibration == 'transform-0-new'
+        assert registry.get('camera-1').area_enabled is True
+        assert registry.get('camera-1').calibration == 'transform-1'
+
+    def test_area_enablement_is_session_local_and_calibration_owns_geometry(self) -> None:
+        calibration = {'valid_region': [(0, 0), (10, 0), (10, 10)]}
+        registry = SessionCameraRegistry.from_capture_indexes([2, 0, 1])
+        registry.set_calibration('camera-0', CalibrationStatus.CALIBRATED, calibration)
+        registry.set_area_enabled('camera-0', True)
+
+        enabled_camera = registry.get('camera-0')
+        assert enabled_camera.area_enabled is True, f'{enabled_camera=}'
+        assert enabled_camera.calibration == calibration, f'{enabled_camera=}'
+        assert not hasattr(enabled_camera, 'available_area'), f'{enabled_camera=}'
+        assert [camera.slot_id for camera in registry.get_cameras()] == [
+            'camera-0',
+            'camera-1',
+            'camera-2',
+        ], f'{registry.get_cameras()=}'
+
+        new_session_registry = SessionCameraRegistry.from_capture_indexes([2, 0, 1])
+        assert new_session_registry.get('camera-0').area_enabled is False
+
+    def test_close_and_reopen_clear_frame_calibration_and_area(self) -> None:
         registry = SessionCameraRegistry.from_capture_indexes([0])
         registry.set_frame_metadata('camera-0', FrameMetadata(3, 4.0))
         registry.set_calibration('camera-0', CalibrationStatus.CALIBRATED, 'transform')
+        registry.set_area_enabled('camera-0', True)
         closed_camera = registry.close('camera-0')
 
         assert closed_camera.state is SessionCameraState.CLOSED
         assert closed_camera.frame_metadata is None
         assert closed_camera.calibration_status is CalibrationStatus.UNCALIBRATED
         assert closed_camera.calibration is None
+        assert closed_camera.area_enabled is False
 
         reopened_camera = registry.open('camera-0')
         assert reopened_camera.state is SessionCameraState.OPEN
         assert reopened_camera.calibration_status is CalibrationStatus.UNCALIBRATED
         assert reopened_camera.calibration is None
+        assert reopened_camera.area_enabled is False
 
     def test_disconnect_invalidates_camera_state_and_spatial_ownership(self) -> None:
         registry = SessionCameraRegistry.from_capture_indexes([0])
         registry.set_frame_metadata('camera-0', FrameMetadata(3, 4.0))
         registry.set_calibration('camera-0', CalibrationStatus.CALIBRATED, 'transform')
+        registry.set_area_enabled('camera-0', True)
         unavailable_camera = registry.mark_unavailable(
             'camera-0',
             'Camera camera-0 became unavailable',
@@ -135,6 +207,7 @@ class SessionCameraRegistryTest(unittest.TestCase):
         assert unavailable_camera.frame_metadata is None
         assert unavailable_camera.calibration_status is CalibrationStatus.UNCALIBRATED
         assert unavailable_camera.calibration is None
+        assert unavailable_camera.area_enabled is False
         with self.assertRaises(CameraStateError):
             registry.open('camera-0')
 

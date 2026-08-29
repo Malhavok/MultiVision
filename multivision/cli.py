@@ -189,6 +189,32 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     open_parser.add_argument('slot_id')
     open_parser.set_defaults(command_handler='cameras_open')
+    area_parser = camera_subparsers.add_parser(
+        'area',
+        help='enable or disable a camera diagnostic area',
+    )
+    area_subparsers = area_parser.add_subparsers(
+        dest='area_command',
+        required=True,
+    )
+    area_enable_parser = area_subparsers.add_parser(
+        'enable',
+        help='enable a camera diagnostic area',
+    )
+    area_enable_parser.add_argument('slot_id')
+    area_enable_parser.set_defaults(
+        command_handler='cameras_area',
+        desired_area_enabled=True,
+    )
+    area_disable_parser = area_subparsers.add_parser(
+        'disable',
+        help='disable a camera diagnostic area',
+    )
+    area_disable_parser.add_argument('slot_id')
+    area_disable_parser.set_defaults(
+        command_handler='cameras_area',
+        desired_area_enabled=False,
+    )
     calibrate_parser = subparsers.add_parser('calibrate', help='calibrate one or all cameras')
     calibrate_parser.add_argument('--camera', dest='camera', default=None)
     calibrate_parser.set_defaults(command_handler='calibrate')
@@ -243,6 +269,7 @@ def _run_command(
         'cameras_rename': _cameras_rename,
         'cameras_close': _cameras_close,
         'cameras_open': _cameras_open,
+        'cameras_area': _cameras_area,
         'calibrate': _calibrate,
         'calibration_verify': _calibration_verify,
         'calibration_status': _calibration_status,
@@ -293,6 +320,17 @@ def _cameras_open(
 ) -> ServiceResponse:
     slot_id = _quote_path_component(arguments.slot_id)
     return client.post(f'/cameras/{slot_id}/open')
+
+
+def _cameras_area(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    slot_id = _quote_path_component(arguments.slot_id)
+    return client.post(
+        f'/cameras/{slot_id}/area',
+        {'enabled': arguments.desired_area_enabled},
+    )
 
 
 def _calibrate(client: MultiVisionClient, arguments: argparse.Namespace) -> ServiceResponse:

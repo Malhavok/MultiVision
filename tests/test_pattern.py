@@ -78,6 +78,140 @@ class CalibrationPatternTest(unittest.TestCase):
                         marker_count=marker_count,
                     )
 
+    def test_all_layouts_use_raster_safe_usable_area_edges(self) -> None:
+        usable_area = CoordinateBounds(37, 23, 973, 677)
+        marker_size = 80
+        for marker_count in range(9, 13):
+            with self.subTest(marker_count=marker_count):
+                pattern = build_calibration_pattern(
+                    Resolution(1000, 700),
+                    usable_area=usable_area,
+                    marker_count=marker_count,
+                    marker_size=marker_size,
+                )
+                first_marker = pattern.markers[0].bounds
+                last_marker = pattern.markers[-1].bounds
+                assert first_marker.left == usable_area.left, f'{pattern=}'
+                assert first_marker.top == usable_area.top, f'{pattern=}'
+                assert last_marker.right < usable_area.right, f'{pattern=}'
+                assert last_marker.bottom < usable_area.bottom, f'{pattern=}'
+                assert (
+                    last_marker.right > usable_area.right - marker_size - 1
+                ), f'{pattern=}'
+                assert (
+                    last_marker.bottom > usable_area.bottom - marker_size - 1
+                ), f'{pattern=}'
+                rendered_size = max(1, round(pattern.marker_size))
+                assert round(first_marker.left) + rendered_size <= math.floor(
+                    usable_area.right,
+                )
+                assert round(last_marker.left) + rendered_size <= math.floor(
+                    usable_area.right,
+                )
+                assert round(first_marker.top) + rendered_size <= math.floor(
+                    usable_area.bottom,
+                )
+                assert round(last_marker.top) + rendered_size <= math.floor(
+                    usable_area.bottom,
+                )
+                assert build_calibration_pattern(
+                    Resolution(1000, 700),
+                    usable_area=usable_area,
+                    marker_count=marker_count,
+                    marker_size=marker_size,
+                ) == pattern
+
+    def test_fractional_edges_use_maximum_raster_safe_proximity(self) -> None:
+        usable_area = CoordinateBounds(37.4, 23.4, 973.4, 677.4)
+        marker_size = 80.6
+        pattern = build_calibration_pattern(
+            Resolution(1000, 700),
+            usable_area=usable_area,
+            marker_size=marker_size,
+        )
+
+        first_marker = pattern.markers[0].bounds
+        last_marker = pattern.markers[-1].bounds
+        assert first_marker.left == 37.5, f'{first_marker=}'
+        assert first_marker.top == 23.5, f'{first_marker=}'
+        assert last_marker.left == 892.5, f'{last_marker=}'
+        assert last_marker.top == 596.5, f'{last_marker=}'
+        assert last_marker.right == 973.1, f'{last_marker=}'
+        assert last_marker.bottom == 677.1, f'{last_marker=}'
+        assert (
+            round(first_marker.left) + round(marker_size) <= usable_area.right
+        )
+        assert (
+            round(first_marker.top) + round(marker_size) <= usable_area.bottom
+        )
+        assert (
+            round(last_marker.left) + round(marker_size) <= usable_area.right
+        )
+        assert (
+            round(last_marker.top) + round(marker_size) <= usable_area.bottom
+        )
+        assert all(
+            usable_area.contains(corner)
+            for marker in pattern.markers
+            for corner in marker.corners
+        ), f'{pattern=}'
+
+    def test_rendered_marker_rectangles_stay_inside_surface_and_usable_area(self) -> None:
+        projector_resolution = Resolution(1000, 700)
+        usable_area = CoordinateBounds(37.4, 23.4, 973.4, 677.4)
+        for marker_count in range(9, 13):
+            with self.subTest(marker_count=marker_count):
+                pattern = build_calibration_pattern(
+                    projector_resolution,
+                    usable_area=usable_area,
+                    marker_count=marker_count,
+                    marker_size=80.6,
+                )
+                for marker in pattern.markers:
+                    rendered_left = round(marker.bounds.left)
+                    rendered_top = round(marker.bounds.top)
+                    rendered_width = max(
+                        1,
+                        round(marker.bounds.right - marker.bounds.left),
+                    )
+                    rendered_height = max(
+                        1,
+                        round(marker.bounds.bottom - marker.bounds.top),
+                    )
+                    rendered_bounds = CoordinateBounds(
+                        rendered_left,
+                        rendered_top,
+                        rendered_left + rendered_width,
+                        rendered_top + rendered_height,
+                    )
+                    assert rendered_bounds.left >= usable_area.left, f'{rendered_bounds=}'
+                    assert rendered_bounds.top >= usable_area.top, f'{rendered_bounds=}'
+                    assert rendered_bounds.right <= usable_area.right, f'{rendered_bounds=}'
+                    assert rendered_bounds.bottom <= usable_area.bottom, f'{rendered_bounds=}'
+                    assert rendered_bounds.left >= 0, f'{rendered_bounds=}'
+                    assert rendered_bounds.top >= 0, f'{rendered_bounds=}'
+                    assert rendered_bounds.right <= projector_resolution.width, f'{rendered_bounds=}'
+                    assert rendered_bounds.bottom <= projector_resolution.height, f'{rendered_bounds=}'
+
+    def test_marker_size_must_fit_every_supported_layout_cell(self) -> None:
+        usable_area = CoordinateBounds(0, 0, 1000, 600)
+        for marker_count in range(9, 13):
+            with self.subTest(marker_count=marker_count):
+                pattern = build_calibration_pattern(
+                    Resolution(1000, 600),
+                    usable_area=usable_area,
+                    marker_count=marker_count,
+                    marker_size=199,
+                )
+                assert len(pattern.markers) == marker_count, f'{pattern=}'
+                with self.assertRaises(ValueError):
+                    build_calibration_pattern(
+                        Resolution(1000, 600),
+                        usable_area=usable_area,
+                        marker_count=marker_count,
+                        marker_size=200,
+                    )
+
     def test_malformed_dimensions_and_marker_sizes_fail_as_value_errors(self) -> None:
         invalid_resolutions = [
             None,

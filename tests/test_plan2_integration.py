@@ -14,7 +14,7 @@ from multivision.camera import CameraRuntime
 from multivision.cli import MultiVisionClient, ServiceResponse, main as cli_main
 from multivision.config import Configuration
 from multivision.display import DisplayConfiguration, PygameDisplayRuntime
-from multivision.errors import CameraUnavailableError
+from multivision.errors import CalibrationError, CameraUnavailableError
 from multivision.geometry import CoordinateBounds, Point2D
 from multivision.types import (
     CalibrationStatus,
@@ -103,12 +103,14 @@ class IntegrationCaptureFactory:
 class IntegrationSurface:
     def __init__(self, size: tuple[int, int]) -> None:
         self.size = size
+        self.fills: list[tuple[int, int, int]] = []
+        self.blits: list[tuple[object, tuple[int, int]]] = []
 
-    def fill(self, _colour: tuple[int, int, int]) -> None:
-        return None
+    def fill(self, colour: tuple[int, int, int]) -> None:
+        self.fills.append(colour)
 
-    def blit(self, _surface: object, _position: tuple[int, int]) -> None:
-        return None
+    def blit(self, surface: object, position: tuple[int, int]) -> None:
+        self.blits.append((surface, position))
 
 
 class IntegrationPygame:
@@ -121,7 +123,10 @@ class IntegrationPygame:
     def __init__(self) -> None:
         self.events: list[object] = []
         self.rectangles: list[tuple[object, ...]] = []
+        self.polygons: list[tuple[object, ...]] = []
         self.circles: list[tuple[object, ...]] = []
+        self.draw_calls: list[tuple[str, tuple[object, ...]]] = []
+        self.rendered_text: list[str] = []
         self.window_surface = IntegrationSurface((800, 600))
         self.display = SimpleNamespace(
             set_mode=lambda _size: self.window_surface,
@@ -130,20 +135,37 @@ class IntegrationPygame:
         )
         self.event = SimpleNamespace(get=self._get_events)
         self.font = SimpleNamespace(
-            Font=lambda _name, _size: SimpleNamespace(
-                render=lambda *_arguments: IntegrationSurface((1, 1)),
-            ),
+            Font=lambda _name, _size: SimpleNamespace(render=self._render_text),
         )
         self.time = SimpleNamespace(
             Clock=lambda: SimpleNamespace(tick=lambda _rate: None),
         )
         self.draw = SimpleNamespace(
-            rect=lambda *arguments: self.rectangles.append(arguments),
-            circle=lambda *arguments: self.circles.append(arguments),
+            rect=lambda *arguments: self._record_draw('rect', arguments, self.rectangles),
+            polygon=lambda *arguments: self._record_draw('polygon', arguments, self.polygons),
+            circle=lambda *arguments: self._record_draw('circle', arguments, self.circles),
         )
         self.transform = SimpleNamespace(
             smoothscale=lambda _surface, size: IntegrationSurface(size),
         )
+
+    def _render_text(
+        self,
+        text: str,
+        _antialias: bool,
+        _colour: tuple[int, int, int],
+    ) -> IntegrationSurface:
+        self.rendered_text.append(text)
+        return IntegrationSurface((1, 1))
+
+    def _record_draw(
+        self,
+        draw_name: str,
+        arguments: tuple[object, ...],
+        draw_collection: list[tuple[object, ...]],
+    ) -> None:
+        self.draw_calls.append((draw_name, arguments))
+        draw_collection.append(arguments)
 
     def _get_events(self) -> list[object]:
         events = list(self.events)
@@ -297,6 +319,250 @@ class Plan2RuntimeIntegrationTest(unittest.TestCase):
         assert factory.opened_device_ids == ['device-0', 'device-1'], (
             f'{factory.opened_device_ids=}'
         )
+
+    def test_area_rendering_and_controls_share_session_calibration_across_interfaces(self) -> None:
+        discovery = IntegrationDiscovery(2)
+        factory = IntegrationCaptureFactory()
+        runtime = CameraRuntime(
+            discovery,
+            factory,
+            read_wait_seconds=0.001,
+        )
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,
+        )
+        pygame_module = IntegrationPygame()
+        display_runtime = PygameDisplayRuntime(
+            service,  # type: ignore[arg-type]
+            DisplayConfiguration(
+                window_resolution=Resolution(800, 600),
+                projector_resolution=Resolution(1000, 700),
+            ),
+            pygame_module=pygame_module,
+            frame_surface_converter=lambda _frame, _pygame: pygame_module.window_surface,
+        )
+
+        def make_calibration(translation_x: float) -> SimpleNamespace:
+            return SimpleNamespace(
+                camera_to_projector=(
+                    (1.0, 0.0, translation_x),
+                    (0.0, 1.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                ),
+                valid_region=CoordinateBounds(0, 0, 640, 480),
+            )
+
+        def get_projector_draw_calls() -> list[tuple[str, tuple[object, ...]]]:
+            return [
+                call
+                for call in pygame_module.draw_calls
+                if call[1][0] is display_runtime.projector_surface
+            ]
+
+        with TestClient(create_app(service)) as client:
+            try:
+                runtime.set_calibration(
+                    'camera-0',
+                    CalibrationStatus.CALIBRATED,
+                    make_calibration(0),
+                )
+                runtime.set_calibration(
+                    'camera-1',
+                    CalibrationStatus.CALIBRATED,
+                    make_calibration(100),
+                )
+
+                def request_sender(
+                    method: str,
+                    url: str,
+                    payload: dict[str, object] | None,
+                    timeout_seconds: float,
+                ) -> ServiceResponse:
+                    del timeout_seconds
+                    response = client.request(method, urlsplit(url).path, json=payload)
+                    return ServiceResponse(
+                        response.status_code,
+                        response.headers.get('content-type', ''),
+                        response.content,
+                    )
+
+                cli_client = MultiVisionClient(
+                    'http://service.test',
+                    request_sender=request_sender,
+                )
+                with redirect_stdout(io.StringIO()):
+                    assert cli_main(
+                        ['cameras', 'rename', 'camera-1', 'side'],
+                        cli_client,
+                    ) == 0
+                    assert cli_main(
+                        ['cameras', 'area', 'enable', 'camera-1'],
+                        cli_client,
+                    ) == 0
+
+                api_area_response = client.post(
+                    '/cameras/camera-0/area',
+                    json={'enabled': True},
+                )
+                assert api_area_response.status_code == 200, api_area_response.text
+                api_area = api_area_response.json()
+                cli_area_status = client.get('/cameras/side/status').json()
+                assert api_area['available_area'] == [
+                    [0.0, 0.0],
+                    [640.0, 0.0],
+                    [640.0, 480.0],
+                    [0.0, 480.0],
+                ], f'{api_area=}'
+                assert cli_area_status['available_area'] == [
+                    [100.0, 0.0],
+                    [740.0, 0.0],
+                    [740.0, 480.0],
+                    [100.0, 480.0],
+                ], f'{cli_area_status=}'
+                assert api_area['area_colour'] != cli_area_status['area_colour']
+
+                display_runtime.render_once()
+                projector_draw_calls = get_projector_draw_calls()
+                assert [call[0] for call in projector_draw_calls] == [
+                    'polygon',
+                    'polygon',
+                ], f'{projector_draw_calls=}'
+                assert [call[1][1] for call in projector_draw_calls] == [
+                    tuple(api_area['area_colour']),
+                    tuple(cli_area_status['area_colour']),
+                ], f'{projector_draw_calls=}'
+                assert [
+                    call[1][2]
+                    for call in projector_draw_calls
+                ] == [
+                    (
+                        (0, 0),
+                        (640, 0),
+                        (640, 480),
+                        (0, 480),
+                    ),
+                    (
+                        (100, 0),
+                        (740, 0),
+                        (740, 480),
+                        (100, 480),
+                    ),
+                ], f'{projector_draw_calls=}'
+                assert all(
+                    call[1][0] is display_runtime.projector_surface
+                    for call in pygame_module.draw_calls
+                    if call[0] == 'polygon'
+                ), f'{pygame_module.draw_calls=}'
+                assert (
+                    projector_draw_calls[0][1][2][1][0]
+                    > projector_draw_calls[1][1][2][0][0]
+                ), f'{projector_draw_calls=}'
+                assert pygame_module.rendered_text[-2:] == ['camera-0', 'side']
+
+                layout = display_runtime.preview_layouts['camera-0']
+                assert layout.preview_transform is not None
+                native_point = Point2D(100, 120)
+                content_bounds = layout.preview_transform.content_bounds
+                preview_point = Point2D(
+                    content_bounds.left + native_point.x * layout.preview_transform.scale,
+                    content_bounds.top + native_point.y * layout.preview_transform.scale,
+                )
+                pygame_module.events.append(
+                    SimpleNamespace(
+                        type=pygame_module.MOUSEBUTTONDOWN,
+                        button=1,
+                        pos=(
+                            round(layout.preview_bounds.left + preview_point.x),
+                            round(layout.preview_bounds.top + preview_point.y),
+                        ),
+                    ),
+                )
+                display_runtime.process_events()
+                gui_overlay = service.overlay
+                assert gui_overlay is not None
+                assert gui_overlay.camera_id == 'camera-0', f'{gui_overlay=}'
+                assert gui_overlay.camera_point == native_point, f'{gui_overlay=}'
+                assert gui_overlay.projector_point == native_point, f'{gui_overlay=}'
+
+                api_point_response = client.post(
+                    '/overlay/point',
+                    json={'camera': 'side', 'x': 100, 'y': 120},
+                )
+                assert api_point_response.status_code == 200, api_point_response.text
+                assert api_point_response.json()['camera_id'] == 'camera-1'
+                assert api_point_response.json()['projector_point'] == [200.0, 120.0]
+                with redirect_stdout(io.StringIO()):
+                    assert cli_main(
+                        ['point', '--camera', 'camera-0', '--x', '100', '--y', '120'],
+                        cli_client,
+                    ) == 0
+                assert service.overlay is not None
+                assert service.overlay.camera_id == 'camera-0'
+                assert service.overlay.projector_point == native_point
+
+                pygame_module.draw_calls.clear()
+                display_runtime.render_once()
+                projector_draw_calls = get_projector_draw_calls()
+                assert [call[0] for call in projector_draw_calls] == [
+                    'polygon',
+                    'polygon',
+                    'circle',
+                ], f'{projector_draw_calls=}'
+
+                client.post('/cameras/camera-0/close')
+                pygame_module.draw_calls.clear()
+                display_runtime.render_once()
+                projector_draw_calls = get_projector_draw_calls()
+                assert [call[0] for call in projector_draw_calls] == ['polygon']
+                assert projector_draw_calls[0][1][2] == (
+                    (100, 0),
+                    (740, 0),
+                    (740, 480),
+                    (100, 480),
+                ), f'{projector_draw_calls=}'
+                assert service.overlay is None
+
+                reopen_response = client.post('/cameras/camera-0/open')
+                assert reopen_response.status_code == 200
+                assert reopen_response.json()['calibration'] == 'UNCALIBRATED'
+                assert reopen_response.json()['area_enabled'] is False
+                pygame_module.draw_calls.clear()
+                display_runtime.render_once()
+                assert len(get_projector_draw_calls()) == 1
+
+                runtime.set_calibration(
+                    'camera-0',
+                    CalibrationStatus.CALIBRATED,
+                    make_calibration(0),
+                )
+                with redirect_stdout(io.StringIO()):
+                    assert cli_main(
+                        ['cameras', 'area', 'enable', 'camera-0'],
+                        cli_client,
+                    ) == 0
+                pygame_module.draw_calls.clear()
+                display_runtime.render_once()
+                assert len(get_projector_draw_calls()) == 2
+
+                with self.assertRaises(CalibrationError):
+                    service.calibrate('camera-0', [])
+                failed_calibration_status = client.get('/cameras/camera-0/status')
+                assert failed_calibration_status.status_code == 200
+                assert failed_calibration_status.json()['area_enabled'] is False
+                assert failed_calibration_status.json()['available_area'] is None
+                pygame_module.draw_calls.clear()
+                display_runtime.render_once()
+                assert len(get_projector_draw_calls()) == 1
+            finally:
+                display_runtime.shutdown()
+
+        assert discovery.call_count == 1, f'{discovery.call_count=}'
+        assert factory.opened_device_ids == [
+            'device-0',
+            'device-1',
+            'device-0',
+        ], f'{factory.opened_device_ids=}'
 
     def test_simultaneous_handles_retain_frames_and_manage_closed_slots(self) -> None:
         discovery = IntegrationDiscovery(5)
