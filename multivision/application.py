@@ -485,15 +485,9 @@ class MultiVisionService:
         if correspondences is not None:
             return self._get_correspondences(status, correspondences)
         with self._calibration_capture_lock:
-            self._calibration_pattern_presented.clear()
             self._calibration_capture_count += 1
         try:
-            if not self._calibration_pattern_presented.wait(
-                CALIBRATION_PATTERN_WAIT_TIMEOUT_SECONDS,
-            ):
-                raise CalibrationError(
-                    'The calibration pattern was not presented by the main-thread display',
-                )
+            # The pattern is continuously presented, so only the camera settle delay remains.
             time.sleep(CALIBRATION_PATTERN_SETTLE_SECONDS)
             return self._get_correspondences(status, None)
         finally:

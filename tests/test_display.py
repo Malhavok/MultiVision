@@ -455,6 +455,33 @@ class DisplayTest(unittest.TestCase):
             for text in pygame_module.rendered_text
         ), f'{pygame_module.rendered_text=}'
 
+    def test_calibration_pattern_remains_visible_without_calibration_request(self) -> None:
+        pygame_module = FakePygame()
+        pattern = build_calibration_pattern(Resolution(1200, 800))
+        marker_count = 0
+
+        def render_marker(
+            _family: str,
+            _marker_id: int,
+            _pixel_size: int,
+            _pygame_module: object,
+        ) -> FakeSurface:
+            nonlocal marker_count
+            marker_count += 1
+            return FakeSurface((_pixel_size, _pixel_size))
+
+        display_runtime = PygameDisplayRuntime(
+            FakeCameraRuntime(),
+            DisplayConfiguration(projector_resolution=Resolution(1200, 800)),
+            calibration_pattern=pattern,
+            pygame_module=pygame_module,
+            marker_image_renderer=render_marker,
+        )
+
+        display_runtime.render_once()
+
+        assert marker_count == len(pattern.markers), f'{marker_count=}'
+
     def test_projector_rendering_failure_is_visible_and_retryable(self) -> None:
         pygame_module = FakePygame()
         pattern = build_calibration_pattern(Resolution(1200, 800))

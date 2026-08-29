@@ -666,7 +666,7 @@ class CameraRuntime:
                         'Capture factory cannot adopt the startup discovery probe',
                     )
                 try:
-                    capture = adopt_capture(discovered_capture)
+                    capture = adopt_capture(discovered_capture, device)
                 except Exception:
                     self._release_unowned_capture(discovered_capture)
                     raise

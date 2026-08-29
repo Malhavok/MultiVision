@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 from multivision.config import (
     CalibrationThresholds,
     Configuration,
@@ -130,6 +132,51 @@ class PackageTest(unittest.TestCase):
 
         with self.assertRaises(HardwareError):
             OpenCVCaptureDevice(ReleasingCapture()).release()
+
+    def test_capture_boundary_switches_exact_black_frames_to_fallback(self) -> None:
+        class BlackCapture:
+            def __init__(self) -> None:
+                self.is_released = False
+
+            def isOpened(self) -> bool:
+                return not self.is_released
+
+            def read(self) -> tuple[bool, object]:
+                return True, np.zeros((2, 2, 3), dtype=np.uint8)
+
+            def release(self) -> None:
+                self.is_released = True
+
+        class FallbackCapture:
+            def __init__(self) -> None:
+                self.is_released = False
+                self.read_count = 0
+
+            def is_opened(self) -> bool:
+                return not self.is_released
+
+            def read(self) -> tuple[bool, object]:
+                self.read_count += 1
+                return True, np.full((2, 2, 3), 7, dtype=np.uint8)
+
+            def release(self) -> None:
+                self.is_released = True
+
+        original_capture = BlackCapture()
+        fallback_capture = FallbackCapture()
+        capture = OpenCVCaptureDevice(
+            original_capture,
+            fallback_opener=lambda: fallback_capture,
+        )
+
+        success, frame = capture.read()
+
+        assert success is True, f'{success=}'
+        assert frame is not None and frame.max() == 7, f'{frame=}'
+        assert original_capture.is_released, f'{original_capture.is_released=}'
+        assert fallback_capture.read_count == 1, f'{fallback_capture.read_count=}'
+        capture.release()
+        assert fallback_capture.is_released, f'{fallback_capture.is_released=}'
 
     def test_capture_factory_rejects_invalid_device_before_opencv(self) -> None:
         factory = OpenCVCaptureDeviceFactory()
