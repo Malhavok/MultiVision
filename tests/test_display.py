@@ -16,6 +16,13 @@ from multivision.display import (
 )
 from multivision.geometry import CoordinateBounds, Point2D
 from multivision.metric import MetricCalibrationStatus, build_metric_ruler
+from multivision.overlays import (
+    OverlayStyle,
+    ProjectorLabel,
+    ProjectorMaterialisation,
+    ProjectorPolygon,
+    ProjectorSegment,
+)
 from multivision.pattern import build_calibration_pattern
 from multivision.service import RedCircleOverlay
 from multivision.session import SessionCameraRegistry
@@ -239,6 +246,114 @@ class SessionDisplayService:
 
 
 class DisplayTest(unittest.TestCase):
+    def test_renderer_preserves_overlay_layers_and_visibility(self) -> None:
+        pygame_module = FakePygame()
+        renderer = ProjectorRenderer(pygame_module)
+        surface = FakeSurface((100, 80))
+        style = OverlayStyle(colour='#123456', line_width_px=2)
+        shape_overlay = SimpleNamespace(
+            kind='rect',
+            visible=True,
+            insertion_sequence=1,
+            materialised_primitives=ProjectorMaterialisation(
+                polygons=(
+                    ProjectorPolygon(
+                        (Point2D(10, 10), Point2D(20, 10), Point2D(20, 20)),
+                        style,
+                    ),
+                ),
+            ),
+        )
+        line_overlay = SimpleNamespace(
+            kind='line',
+            visible=True,
+            insertion_sequence=0,
+            materialised_primitives=ProjectorMaterialisation(
+                segments=(ProjectorSegment(Point2D(1, 1), Point2D(5, 5), style),),
+                labels=(ProjectorLabel(Point2D(3, 3), 'line', style),),
+            ),
+        )
+        hidden_overlay = SimpleNamespace(
+            kind='circle',
+            visible=False,
+            insertion_sequence=2,
+            materialised_primitives=ProjectorMaterialisation(
+                polygons=(
+                    ProjectorPolygon(
+                        (Point2D(30, 30), Point2D(40, 30), Point2D(40, 40)),
+                        style,
+                    ),
+                ),
+            ),
+        )
+
+        renderer.render_generic_overlays(
+            surface,
+            [line_overlay, hidden_overlay, shape_overlay],
+            FakeFont(pygame_module.rendered_text),
+        )
+
+        assert [call[0] for call in pygame_module.draw_calls] == ['polygon', 'line']
+        assert pygame_module.rendered_text == ['line'], (
+            f'{pygame_module.rendered_text=}'
+        )
+        assert len(surface.blits) == 1, f'{surface.blits=}'
+
+    def test_generic_overlays_are_suppressed_during_calibration_and_blank_capture(self) -> None:
+        class GenericOverlayService(FakeCameraRuntime):
+            def __init__(self) -> None:
+                super().__init__()
+                self.metric_capture_active = False
+                self.generic_overlays: list[object] = []
+
+            def list_overlays(self) -> list[object]:
+                return self.generic_overlays
+
+        pygame_module = FakePygame()
+        service = GenericOverlayService()
+        style = OverlayStyle(colour='#102030', line_width_px=2)
+        service.generic_overlays = [
+            SimpleNamespace(
+                kind='line',
+                visible=True,
+                insertion_sequence=0,
+                materialised_primitives=ProjectorMaterialisation(
+                    segments=(
+                        ProjectorSegment(Point2D(2, 3), Point2D(20, 30), style),
+                    ),
+                ),
+            ),
+        ]
+        display_runtime = PygameDisplayRuntime(
+            service,  # type: ignore[arg-type]
+            DisplayConfiguration(
+                window_resolution=Resolution(500, 400),
+                projector_resolution=Resolution(100, 80),
+            ),
+            pygame_module=pygame_module,
+            frame_surface_converter=lambda _frame, _pygame: FakeSurface((1, 1)),
+            projector_output=FakeProjectorOutput(),
+        )
+
+        display_runtime.render_once()
+        normal_line_count = len(
+            [
+                call
+                for call in pygame_module.draw_calls
+                if call[0] == 'line'
+            ],
+        )
+        service.calibration_pattern_visible = True
+        display_runtime.render_once()
+        service.calibration_pattern_visible = False
+        service.metric_capture_active = True
+        display_runtime.render_once()
+
+        assert normal_line_count == 1, f'{pygame_module.draw_calls=}'
+        assert len(
+            [call for call in pygame_module.draw_calls if call[0] == 'line'],
+        ) == normal_line_count, f'{pygame_module.draw_calls=}'
+
     def test_session_previews_follow_slot_order_and_rebuild_after_lifecycle_changes(self) -> None:
         pygame_module = FakePygame()
         service = SessionDisplayService(5)

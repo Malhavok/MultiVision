@@ -7,6 +7,7 @@ import pathlib
 import statistics
 import threading
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import NamedTuple
@@ -31,6 +32,7 @@ from multivision.errors import (
 )
 from multivision.geometry import (
     CoordinateBounds,
+    MatrixLike,
     Point2D,
     PointLike,
     Polygon,
@@ -69,6 +71,19 @@ from multivision.metric import (
     validate_positive_length,
 )
 from multivision.metric_target import METRIC_TARGET
+from multivision.overlays import (
+    AnyOverlayRequest,
+    CircleRequest,
+    GridRequest,
+    LineRequest,
+    OverlayEntry,
+    OverlayRegistry,
+    PointReference,
+    RectRequest,
+    RulerRequest,
+    get_overlay_dependencies,
+    materialise_overlay,
+)
 from multivision.pattern import CalibrationPattern, build_calibration_pattern
 from multivision.persistence import (
     CalibrationRegistry,
@@ -159,6 +174,7 @@ class MultiVisionService:
             raise ValueError('configuration must be Configuration')
         self.configuration = configuration
         self._projector_output_descriptor = configuration.projector_output_descriptor
+        self.overlay_registry = OverlayRegistry(self._projector_output_descriptor)
         self.metric_calibration_registry = MetricCalibrationRegistry(
             self._projector_output_descriptor,
         )
@@ -267,6 +283,7 @@ class MultiVisionService:
             if not self.metric_calibration_registry.is_usable(
                 self._projector_output_descriptor,
             ):
+                self.overlay_registry.invalidate_metric()
                 self._metric_ruler = None
             return self._metric_ruler
 
@@ -332,14 +349,75 @@ class MultiVisionService:
             status = self.metric_calibration_registry.get_status(
                 self._projector_output_descriptor,
             )
+            if status is MetricCalibrationStatus.STALE:
+                self.overlay_registry.invalidate_metric()
             return status, self.metric_calibration_registry.record
 
     def clear_metric_calibration(self) -> None:
         """Clear the shared metric transform and its independent ruler state."""
         with self._camera_management_lock:
             self._metric_capture_generation += 1
+            self.overlay_registry.invalidate_metric()
             self.metric_calibration_registry.clear()
             self._metric_ruler = None
+
+    def create_overlay(self, request: AnyOverlayRequest) -> OverlayEntry:
+        """Materialise and register one generic overlay atomically."""
+        if not isinstance(
+            request,
+            (GridRequest, CircleRequest, RectRequest, LineRequest, RulerRequest),
+        ):
+            raise ValueError('request must be an overlay request')
+
+        with self._camera_management_lock:
+            request = self._canonicalise_overlay_camera_references(request)
+            # A projector-only request still observes the current registry, so stale
+            # dependencies cannot survive until the next renderable snapshot.
+            self._invalidate_unusable_overlay_dependencies()
+            camera_dependencies, metric_dependency = get_overlay_dependencies(request)
+            camera_authorities = (
+                self._get_overlay_camera_authorities(camera_dependencies)
+                if len(camera_dependencies) > 0
+                else None
+            )
+            metric_calibration = (
+                self._require_overlay_metric_calibration()
+                if metric_dependency
+                else None
+            )
+
+            materialised_primitives = materialise_overlay(
+                request,
+                self._projector_output_descriptor.projector_resolution,
+                camera_authorities,
+                metric_calibration,
+                self.configuration.overlay_limits,
+            )
+            return self.overlay_registry.create(request, materialised_primitives)
+
+    def list_overlays(self) -> list[OverlayEntry]:
+        """Return usable generic overlays in their insertion order."""
+        with self._camera_management_lock:
+            self._invalidate_unusable_overlay_dependencies()
+            return self.overlay_registry.list()
+
+    def show_overlay(self, selector: str | uuid.UUID) -> OverlayEntry:
+        with self._camera_management_lock:
+            self._invalidate_unusable_overlay_dependencies()
+            return self.overlay_registry.show(selector)
+
+    def hide_overlay(self, selector: str | uuid.UUID) -> OverlayEntry:
+        with self._camera_management_lock:
+            self._invalidate_unusable_overlay_dependencies()
+            return self.overlay_registry.hide(selector)
+
+    def remove_overlay(self, selector: str | uuid.UUID) -> OverlayEntry:
+        with self._camera_management_lock:
+            return self.overlay_registry.remove(selector)
+
+    def clear_overlays(self) -> None:
+        with self._camera_management_lock:
+            self.overlay_registry.clear()
 
     def record_physical_validation(
         self,
@@ -449,6 +527,8 @@ class MultiVisionService:
                     f'Camera {logical_name!r} returned an invalid status',
                 )
             _validate_camera_status(runtime_status, resolved_slot)
+            if runtime_status.runtime_status is not RuntimeStatus.AVAILABLE:
+                self.overlay_registry.invalidate_camera(resolved_slot)
             calibration_status = self._get_calibration_status(runtime_status)
             return runtime_status._replace(calibration_status=calibration_status)
 
@@ -473,6 +553,10 @@ class MultiVisionService:
                         'Camera runtime returned an invalid camera status',
                     )
                 _validate_camera_status(status)
+                if status.runtime_status is not RuntimeStatus.AVAILABLE:
+                    self.overlay_registry.invalidate_camera(
+                        self._resolve_camera_reference(status.logical_name),
+                    )
                 calibration_status = self._get_calibration_status(status)
                 checked_statuses.append(status._replace(calibration_status=calibration_status))
             return checked_statuses
@@ -601,6 +685,7 @@ class MultiVisionService:
                     )
                 return camera
             finally:
+                self.overlay_registry.invalidate_camera(slot_id)
                 self.point_service.clear_overlay_for_camera(slot_id)
 
     def open_camera(self, slot_id: str) -> SessionCamera:
@@ -614,6 +699,7 @@ class MultiVisionService:
                     )
                 return camera
             finally:
+                self.overlay_registry.invalidate_camera(slot_id)
                 self.point_service.clear_overlay_for_camera(slot_id)
 
     def update_projector_descriptor(
@@ -641,15 +727,19 @@ class MultiVisionService:
         with self._camera_management_lock:
             if checked_descriptor == self._projector_output_descriptor:
                 return checked_descriptor
-            self._metric_capture_generation += 1
+            # Validate the replacement pattern before mutating any output state.
             updated_calibration_pattern = _build_projector_calibration_pattern(
                 checked_descriptor.projector_resolution,
             )
+            # Complete the authority updates first so a rejected transition does
+            # not leave the overlay registry describing a different output.
             self.camera_runtime.mark_calibrations_stale(checked_descriptor)
             self.calibration_registry.update_projector_descriptor(checked_descriptor)
             self.metric_calibration_registry.update_projector_descriptor(
                 checked_descriptor,
             )
+            self._metric_capture_generation += 1
+            self.overlay_registry.invalidate_projector_output(checked_descriptor)
             self._metric_ruler = None
             self.point_service.clear_overlay()
             self._projector_output_descriptor = checked_descriptor
@@ -680,6 +770,7 @@ class MultiVisionService:
                 # available to callers who assume the capture was authoritative.
                 self._metric_capture_generation += 1
                 capture_generation = self._metric_capture_generation
+                self.overlay_registry.invalidate_metric()
                 self.metric_calibration_registry.clear()
                 self._metric_ruler = None
                 camera, calibration = self._require_metric_camera(logical_name)
@@ -734,6 +825,64 @@ class MultiVisionService:
                     )
             finally:
                 self._finish_metric_capture()
+
+    def _invalidate_unusable_overlay_dependencies(self) -> None:
+        entries = self.overlay_registry.list()
+        camera_dependencies = {
+            camera_id
+            for entry in entries
+            for camera_id in entry.camera_dependencies
+        }
+        if len(camera_dependencies) > 0:
+            camera_authorities = self._get_overlay_camera_authorities(
+                tuple(sorted(camera_dependencies)),
+            )
+            for camera_id in sorted(camera_dependencies - camera_authorities.keys()):
+                self.overlay_registry.invalidate_camera(camera_id)
+        if any(entry.metric_dependency for entry in entries):
+            metric_is_usable = self.metric_calibration_registry.is_usable(
+                self._projector_output_descriptor,
+            )
+            if not metric_is_usable:
+                self.overlay_registry.invalidate_metric()
+
+    def _get_overlay_camera_authorities(
+        self,
+        requested_camera_references: Sequence[str] | None = None,
+    ) -> dict[str, MatrixLike]:
+        cameras = self._get_session_cameras()
+        if cameras is None:
+            return {}
+        requested_references = (
+            None
+            if requested_camera_references is None
+            else set(requested_camera_references)
+        )
+        authorities: dict[str, MatrixLike] = {}
+        for camera in cameras:
+            if requested_references is not None and not {
+                camera.slot_id,
+                camera.display_name,
+            }.intersection(requested_references):
+                continue
+            if camera.state is not SessionCameraState.OPEN:
+                continue
+            status = self.get_camera_status(camera.slot_id)
+            if status.runtime_status is not RuntimeStatus.AVAILABLE:
+                continue
+            if status.calibration_status is not CalibrationStatus.CALIBRATED:
+                continue
+            calibration = camera.calibration
+            if calibration is None:
+                continue
+            try:
+                camera_to_projector = validate_homography(
+                    getattr(calibration, 'camera_to_projector'),
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+            authorities[camera.slot_id] = camera_to_projector
+        return authorities
 
     def _require_metric_camera(
         self,
@@ -818,6 +967,36 @@ class MultiVisionService:
             error.code = 'METRIC_UNAVAILABLE'
             raise error
         return current_record
+
+    def _canonicalise_overlay_camera_references(
+        self,
+        request: AnyOverlayRequest,
+    ) -> AnyOverlayRequest:
+        updates: dict[str, PointReference] = {}
+        for field_name, field_value in request:
+            if (
+                not isinstance(field_value, PointReference)
+                or field_value.space != 'camera_px'
+            ):
+                continue
+            assert field_value.camera is not None
+            camera_slot_id = self._resolve_camera_reference(field_value.camera)
+            if camera_slot_id != field_value.camera:
+                updates[field_name] = field_value.model_copy(
+                    update={'camera': camera_slot_id},
+                )
+        if len(updates) == 0:
+            return request
+        return request.model_copy(update=updates)
+
+    def _require_overlay_metric_calibration(self) -> MetricCalibrationRecord:
+        try:
+            return self._require_usable_metric_calibration()
+        except InvalidCalibrationStateError:
+            # A failed metric transition must not leave old materialised
+            # projector geometry available to the display.
+            self.overlay_registry.invalidate_metric()
+            raise
 
     def _begin_metric_capture(self) -> None:
         with self._metric_capture_lock:
@@ -995,6 +1174,7 @@ class MultiVisionService:
 
     def _clear_area_before_calibration(self, logical_name: str) -> None:
         resolved_slot = self._resolve_camera_reference(logical_name)
+        self.overlay_registry.invalidate_camera(resolved_slot)
         session_camera = self._get_session_camera(resolved_slot)
         if session_camera is None or not session_camera.area_enabled:
             return
@@ -1442,9 +1622,11 @@ class MultiVisionService:
                 f'Camera {status.logical_name!r} has no session state',
             )
         calibration = session_camera.calibration
+        if session_camera.calibration_status is not CalibrationStatus.CALIBRATED:
+            self.overlay_registry.invalidate_camera(session_camera.slot_id)
+            return session_camera.calibration_status
         if (
-            session_camera.calibration_status is CalibrationStatus.CALIBRATED
-            and isinstance(calibration, PersistedCalibration)
+            isinstance(calibration, PersistedCalibration)
             and (
                 calibration.camera_id != session_camera.slot_id
                 or calibration.version != self.configuration.calibration_version
@@ -1453,6 +1635,7 @@ class MultiVisionService:
                 != self._projector_output_descriptor
             )
         ):
+            self.overlay_registry.invalidate_camera(session_camera.slot_id)
             return CalibrationStatus.STALE
         return session_camera.calibration_status
 
@@ -1505,6 +1688,7 @@ class MultiVisionService:
         calibration_status: CalibrationStatus,
         calibration: PersistedCalibration,
     ) -> None:
+        self.overlay_registry.invalidate_camera(slot_id)
         set_calibration = getattr(self.camera_runtime, 'set_calibration', None)
         if not callable(set_calibration):
             raise SessionCameraError(

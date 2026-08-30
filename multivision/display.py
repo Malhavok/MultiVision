@@ -24,6 +24,13 @@ from multivision.geometry import (
     build_preview_transform,
 )
 from multivision.metric import MetricCalibrationStatus
+from multivision.overlays import (
+    OverlayStyle,
+    ProjectorLabel,
+    ProjectorMaterialisation,
+    ProjectorPolygon,
+    ProjectorSegment,
+)
 from multivision.pattern import CalibrationPattern
 from multivision.service import RedCircleOverlay
 from multivision.session import SessionCamera
@@ -107,6 +114,13 @@ class MetricRulerLike(Protocol):
     label_bounds: CoordinateBounds
 
 
+class ProjectorOverlayLike(Protocol):
+    kind: str
+    visible: bool
+    materialised_primitives: ProjectorMaterialisation
+    insertion_sequence: int
+
+
 class DisplayServiceLike(Protocol):
     @property
     def overlay(self) -> RedCircleOverlay | None:
@@ -138,6 +152,9 @@ class DisplayServiceLike(Protocol):
         ...
 
     def get_camera_areas(self) -> list[ProjectorAreaLike]:
+        ...
+
+    def list_overlays(self) -> list[ProjectorOverlayLike]:
         ...
 
     def snapshot(self, logical_name: str) -> Frame:
@@ -511,6 +528,128 @@ class ProjectorRenderer:
             overlay.radius,
         )
 
+    def render_generic_overlays(
+        self,
+        surface: Any,
+        overlays: Sequence[ProjectorOverlayLike],
+        font: Any | None = None,
+        layer: str | None = None,
+    ) -> None:
+        """Draw immutable, already-materialised projector overlay primitives."""
+        self._require_main_thread()
+        if not isinstance(overlays, Sequence) or isinstance(overlays, (str, bytes)):
+            raise TypeError('overlays must be a sequence of projector overlays')
+        if layer not in {None, 'grid', 'shape', 'line', 'label'}:
+            raise ValueError(f'Unknown projector overlay layer: {layer!r}')
+        if len(overlays) == 0:
+            return
+        selected_layer = {
+            'grid': 0,
+            'shape': 1,
+            'line': 2,
+        }.get(layer)
+        surface_size = _get_surface_size(surface, 0)
+        if surface_size[0] <= 0 or surface_size[1] <= 0:
+            raise ValueError('projector surface must have a positive size')
+        ordered_overlays = sorted(
+            overlays,
+            key=lambda overlay: (
+                _projector_overlay_layer_key(overlay.kind),
+                overlay.insertion_sequence,
+            ),
+        )
+        draw_primitives: list[ProjectorPolygon | ProjectorSegment] = []
+        draw_labels: list[ProjectorLabel] = []
+        for overlay in ordered_overlays:
+            if not isinstance(overlay.visible, bool):
+                raise TypeError('projector overlay visibility must be a bool')
+            if not overlay.visible:
+                continue
+            overlay_layer = _projector_overlay_layer_key(overlay.kind)
+            if selected_layer is not None and overlay_layer != selected_layer:
+                continue
+            materialisation = overlay.materialised_primitives
+            if not isinstance(materialisation, ProjectorMaterialisation):
+                raise TypeError(
+                    'projector overlays must contain ProjectorMaterialisation values',
+                )
+            if not all(
+                isinstance(primitives, tuple)
+                for primitives in (
+                    materialisation.segments,
+                    materialisation.polygons,
+                    materialisation.labels,
+                )
+            ):
+                raise TypeError('projector materialisations must be immutable tuples')
+            for polygon in materialisation.polygons:
+                if not isinstance(polygon, ProjectorPolygon):
+                    raise TypeError('projector polygons must be ProjectorPolygon values')
+                if not isinstance(polygon.points, tuple):
+                    raise TypeError('projector polygon points must be immutable tuples')
+                if not all(
+                    _is_finite_display_point(point)
+                    for point in polygon.points
+                ):
+                    raise ValueError('projector polygon points must be finite')
+                _validate_overlay_style(polygon.style)
+            for segment in materialisation.segments:
+                if not isinstance(segment, ProjectorSegment):
+                    raise TypeError('projector segments must be ProjectorSegment values')
+                if (
+                    not _is_finite_display_point(segment.start)
+                    or not _is_finite_display_point(segment.end)
+                ):
+                    raise ValueError('projector segment points must be finite')
+                _validate_overlay_style(segment.style)
+            for label in materialisation.labels:
+                if not isinstance(label, ProjectorLabel):
+                    raise TypeError('projector labels must be ProjectorLabel values')
+                if not isinstance(label.text, str):
+                    raise TypeError('projector labels must contain string text')
+                if not _is_finite_display_point(label.position):
+                    raise ValueError('projector label positions must be finite')
+                _validate_overlay_style(label.style)
+            if layer == 'label':
+                draw_labels.extend(materialisation.labels)
+                continue
+            draw_primitives.extend(materialisation.polygons)
+            draw_primitives.extend(materialisation.segments)
+            if layer is None:
+                draw_labels.extend(materialisation.labels)
+
+        for primitive in draw_primitives:
+            if isinstance(primitive, ProjectorPolygon):
+                points = _round_generic_projector_points(primitive.points)
+                self._pygame.draw.polygon(surface, primitive.style.colour, points)
+                continue
+            start = _round_generic_projector_point(primitive.start)
+            end = _round_generic_projector_point(primitive.end)
+            self._pygame.draw.line(
+                surface,
+                primitive.style.colour,
+                start,
+                end,
+                primitive.style.line_width_px,
+            )
+        if len(draw_labels) == 0:
+            return
+        if font is None:
+            font = self._pygame.font.Font(None, 16)
+        for label in draw_labels:
+            position = _round_generic_projector_point(label.position)
+            label_surface = font.render(label.text, True, label.style.colour)
+            label_size = _get_surface_size(label_surface, 0)
+            label_left = min(
+                max(position[0] - label_size[0] // 2, 0),
+                max(0, surface_size[0] - label_size[0]),
+            )
+            label_top = min(
+                max(position[1] - label_size[1] // 2, 0),
+                max(0, surface_size[1] - label_size[1]),
+            )
+            surface.blit(label_surface, (label_left, label_top))
+
     @staticmethod
     def _require_main_thread() -> None:
         if threading.current_thread() is not threading.main_thread():
@@ -745,6 +884,11 @@ class PygameDisplayRuntime:
             if pattern_visible or metric_capture_active
             else self._get_projector_areas()
         )
+        generic_overlays = (
+            []
+            if pattern_visible or metric_capture_active
+            else self._get_generic_overlays()
+        )
         if not pattern_visible and not metric_capture_active:
             self._area_colours = {
                 area.slot_id: area.area_colour
@@ -785,10 +929,22 @@ class PygameDisplayRuntime:
                 if callable(mark_pattern_presented):
                     mark_pattern_presented()
             if not pattern_visible and not metric_capture_active:
+                self._projector_renderer.render_generic_overlays(
+                    self._projector_surface,
+                    generic_overlays,
+                    self._font,
+                    'grid',
+                )
                 self._projector_renderer.render_areas(
                     self._projector_surface,
                     projector_areas,
                     self._projector_area_font,
+                )
+                self._projector_renderer.render_generic_overlays(
+                    self._projector_surface,
+                    generic_overlays,
+                    self._font,
+                    'shape',
                 )
                 if metric_state is MetricCalibrationStatus.CALIBRATED:
                     try:
@@ -799,6 +955,18 @@ class PygameDisplayRuntime:
                         )
                     except Exception as ex:  # noqa: BLE001 (Bad metric snapshot).
                         self._last_metric_error = f'Metric ruler unavailable: {ex}'
+                self._projector_renderer.render_generic_overlays(
+                    self._projector_surface,
+                    generic_overlays,
+                    self._font,
+                    'line',
+                )
+                self._projector_renderer.render_generic_overlays(
+                    self._projector_surface,
+                    generic_overlays,
+                    self._font,
+                    'label',
+                )
                 self._projector_renderer.render_overlay(
                     self._projector_surface,
                     self.service.overlay,
@@ -1097,6 +1265,15 @@ class PygameDisplayRuntime:
         if not isinstance(areas, list):
             raise TypeError('service returned an invalid projector area list')
         return areas
+
+    def _get_generic_overlays(self) -> list[ProjectorOverlayLike]:
+        list_overlays = getattr(self.service, 'list_overlays', None)
+        if not callable(list_overlays):
+            return []
+        overlays = list_overlays()
+        if not isinstance(overlays, list):
+            raise TypeError('service returned an invalid projector overlay list')
+        return overlays
 
     def _get_metric_capture_active(self) -> bool:
         try:
@@ -1418,6 +1595,54 @@ def _is_metric_ruler_snapshot(value: object) -> bool:
         )
     except Exception:  # noqa: BLE001 (Malformed service snapshots are display input).
         return False
+
+
+def _projector_overlay_layer_key(kind: str) -> int:
+    if not isinstance(kind, str):
+        raise TypeError('projector overlay kinds must be strings')
+    try:
+        return {
+            'grid': 0,
+            'rect': 1,
+            'circle': 1,
+            'line': 2,
+            'ruler': 2,
+        }[kind]
+    except KeyError as ex:
+        raise ValueError(f'Unknown projector overlay kind: {kind!r}') from ex
+
+
+def _validate_overlay_style(style: object) -> None:
+    if not isinstance(style, OverlayStyle):
+        raise TypeError('projector primitives must contain OverlayStyle values')
+    if (
+        not isinstance(style.colour, tuple)
+        or len(style.colour) != 3
+        or any(
+            isinstance(channel, bool)
+            or not isinstance(channel, int)
+            or not 0 <= channel <= 255
+            for channel in style.colour
+        )
+        or not isinstance(style.line_width_px, int)
+        or isinstance(style.line_width_px, bool)
+        or style.line_width_px <= 0
+    ):
+        raise ValueError('projector primitive styles are not raster-safe')
+
+
+def _round_generic_projector_point(point: Point2D) -> tuple[int, int]:
+    if not _is_finite_display_point(point):
+        raise ValueError('projector primitive points must be finite Point2D values')
+    return round(point.x), round(point.y)
+
+
+def _round_generic_projector_points(
+    points: Sequence[Point2D],
+) -> tuple[tuple[int, int], ...]:
+    if not isinstance(points, Sequence) or len(points) < 3:
+        raise ValueError('projector polygons must contain at least three points')
+    return tuple(_round_generic_projector_point(point) for point in points)
 
 
 def _is_finite_display_number(value: object) -> bool:

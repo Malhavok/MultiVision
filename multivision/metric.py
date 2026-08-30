@@ -63,6 +63,7 @@ UNIT_TO_MM: dict[MetricUnit, float] = {
     'in': 25.4,
 }
 MAX_METRIC_RULER_TICKS = 200
+RULER_TICK_SPACING_SOURCE_UNITS = 5.0
 METRIC_RULER_RASTER_MARGIN_PIXELS = 1
 
 
@@ -898,6 +899,42 @@ def calculate_surface_distance_mm(
     return distance_mm
 
 
+def calculate_ruler_tick_layout(
+    measurement_length: object,
+    maximum_tick_count: object,
+) -> tuple[float, int]:
+    """Calculate bounded, source-space ruler ticks without changing their spacing."""
+    if not is_finite_real(measurement_length) or float(measurement_length) <= 0:
+        raise ValueError('Ruler measurement length must be positive and finite')
+    if (
+        not isinstance(maximum_tick_count, int)
+        or isinstance(maximum_tick_count, bool)
+        or maximum_tick_count <= 0
+    ):
+        raise ValueError('Ruler tick budget must be a positive integer')
+    length = float(measurement_length)
+    nominal_tick_count = max(
+        0,
+        math.ceil(length / RULER_TICK_SPACING_SOURCE_UNITS) - 1,
+    )
+    if nominal_tick_count == 0:
+        return RULER_TICK_SPACING_SOURCE_UNITS, 0
+    # Retaining multiples of the base spacing keeps a bounded ruler honest
+    # instead of resampling ticks to arbitrary fractions.
+    spacing_multiplier = max(
+        1,
+        math.ceil(nominal_tick_count / maximum_tick_count),
+    )
+    tick_spacing = RULER_TICK_SPACING_SOURCE_UNITS * spacing_multiplier
+    if not math.isfinite(tick_spacing):
+        raise ValueError('Ruler tick spacing must remain finite')
+    tick_count = min(
+        maximum_tick_count,
+        max(0, math.ceil(length / tick_spacing) - 1),
+    )
+    return tick_spacing, tick_count
+
+
 def surface_to_projector(
     surface_point: PointLike,
     surface_to_projector_matrix: MatrixLike | MetricHomographyPair,
@@ -1068,22 +1105,13 @@ def _build_metric_ruler_ticks(
     projector_bounds: CoordinateBounds,
 ) -> tuple[MetricRulerTick, ...]:
     ticks: list[MetricRulerTick] = []
-    nominal_tick_count = max(0, math.ceil(projected_line.length_mm / 5.0) - 1)
-    tick_spacing_mm = 5.0
-    if nominal_tick_count > MAX_METRIC_RULER_TICKS:
-        # Keep every retained tick on the physical 5-mm grid. Resampling ticks
-        # to arbitrary fractions would make the decoration imply a false scale.
-        spacing_multiplier = math.ceil(
-            nominal_tick_count / MAX_METRIC_RULER_TICKS,
-        )
-        tick_spacing_mm *= spacing_multiplier
-    tick_count = min(
+    tick_spacing_mm, tick_count = calculate_ruler_tick_layout(
+        projected_line.length_mm,
         MAX_METRIC_RULER_TICKS,
-        max(0, math.ceil(projected_line.length_mm / tick_spacing_mm) - 1),
     )
     for tick_index in range(1, tick_count + 1):
         distance_mm = tick_index * tick_spacing_mm
-        is_major = distance_mm % 10.0 == 0
+        is_major = distance_mm % (2.0 * RULER_TICK_SPACING_SOURCE_UNITS) == 0
         half_tick_length_mm = 5.0 if is_major else 3.0
         centre = Point2D(
             projected_line.surface_start.x + direction_x * distance_mm,
@@ -1540,7 +1568,9 @@ __all__ = [
     'MetricUnit',
     'ProjectedSurfaceRuler',
     'MAX_METRIC_RULER_TICKS',
+    'RULER_TICK_SPACING_SOURCE_UNITS',
     'METRIC_RULER_RASTER_MARGIN_PIXELS',
+    'calculate_ruler_tick_layout',
     'build_metric_ruler',
     'calibrate_metric_homography',
     'UNIT_TO_MM',

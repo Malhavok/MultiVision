@@ -494,3 +494,141 @@ projected ruler matches a physical ruler. Do not claim hardware accuracy from
 code, generated SVGs, screenshots, API responses, fake cameras/projectors or
 mocks. This procedure records no manual or external check as passed until the
 actual observations have been run and attached to the physical record.
+
+## Plan5 generic geometry overlay procedure
+
+This is a separate physical procedure for the coordinate-aware generic overlays.
+Run it with the same identified projector, tabletop and camera slots after the
+relevant camera and metric calibrations are current. The deterministic suite
+and API/CLI responses prove software behaviour only; they do not establish
+physical size, alignment or camera identity.
+
+Create named and unnamed overlays through the running service with the canonical
+thin CLI form. Use explicit extents and units in every request:
+
+For example, choose coordinates inside the current calibrated surface and
+adjust them to the tabletop before measuring:
+
+```sh
+GRID_SPEC='{"name":"grid-rotated","origin":{"space":"surface_mm","x":100,"y":100,"unit":"mm"},"geometry_space":"surface_mm","spacing":{"value":25.4,"unit":"mm"},"extent":{"width":{"value":200,"unit":"mm"},"height":{"value":150,"unit":"mm"}},"angle_deg":17}'
+CIRCLE_SPEC='{"centre":{"space":"surface_mm","x":250,"y":180,"unit":"mm"},"geometry_space":"surface_mm","radius":{"value":76.2,"unit":"mm"},"style":{"colour":"#00ff00"}}'
+RECT_SPEC='{"centre":{"space":"surface_mm","x":450,"y":180,"unit":"mm"},"geometry_space":"surface_mm","width":{"value":100,"unit":"mm"},"height":{"value":50,"unit":"mm"},"angle_deg":-12,"style":{"fill":true,"colour":"#0000ff"}}'
+LINE_SPEC='{"start":{"space":"surface_mm","x":100,"y":100,"unit":"mm"},"end":{"space":"surface_mm","x":400,"y":300,"unit":"mm"},"label":"physical line"}'
+RULER_SPEC='{"start":{"space":"surface_mm","x":100,"y":100,"unit":"mm"},"end":{"space":"surface_mm","x":200,"y":100,"unit":"mm"},"measurement_space":"surface_mm","unit":"cm"}'
+CAMERA_CIRCLE_SPEC='{"centre":{"space":"camera_px","camera":"camera-0","x":812,"y":443},"geometry_space":"surface_mm","radius":{"value":76.2,"unit":"mm"}}'
+PROJECTOR_CIRCLE_SPEC='{"centre":{"space":"projector_px","x":500,"y":400},"geometry_space":"projector_px","radius":{"value":100,"unit":"px"}}'
+"$PYTHON" -m multivision.cli overlay grid --spec-json "$GRID_SPEC"
+"$PYTHON" -m multivision.cli overlay circle --spec-json "$CIRCLE_SPEC"
+"$PYTHON" -m multivision.cli overlay rect --spec-json "$RECT_SPEC"
+"$PYTHON" -m multivision.cli overlay line --spec-json "$LINE_SPEC"
+"$PYTHON" -m multivision.cli overlay ruler --spec-json "$RULER_SPEC"
+"$PYTHON" -m multivision.cli overlay circle --spec-json "$CAMERA_CIRCLE_SPEC"
+"$PYTHON" -m multivision.cli overlay circle --spec-json "$PROJECTOR_CIRCLE_SPEC"
+"$PYTHON" -m multivision.cli overlays list
+```
+
+The camera example deliberately uses native camera pixels only as a point
+reference; its 76.2-mm radius remains a surface measurement. Use the actual
+session slot and live physical camera rather than assuming `camera-0`.
+
+Record the returned IDs, names, normalised requests, projector resolution and
+output identity. Confirm that the list response does not contain the internal
+materialised primitive collection. Use `overlay show`, `overlay hide` and
+`overlay remove` once by ID and once by name, then use `overlays clear`; record
+that only the selected overlay changes and that insertion order is preserved.
+
+For physical checks, place a verified flat target or other known-size reference
+on the tabletop and record the physical measurement, not just the requested
+JSON value. Check all of the following:
+
+1. A rotated `surface_mm` grid with an explicit width and height, measuring its
+   spacing at separated tabletop positions.
+2. Known-size physical circles and rectangles, including an outline and a fill
+   where useful, at separated positions and rotations.
+3. Physical lines and rulers at horizontal, vertical and diagonal orientations.
+4. A `camera_px` centre used for a physical circle or rectangle after both the
+   camera/projector and metric calibrations are current. Record the camera slot,
+   live physical camera and native point coordinates.
+5. A `projector_px` circle or rectangle beside a physical overlay, confirming
+   that its intentionally pixel-based size is different where expected.
+6. Geometry crossing each projector edge, confirming that clipping does not
+   change the requested physical size and does not add a screen-edge closing
+   stroke. Record any entirely off-screen valid geometry and its zero-draw
+   observation.
+7. Several named and unnamed overlays coexisting while each show/hide/remove
+   operation affects only its selected object.
+8. Camera invalidation by closing, disconnecting or invalidating one camera;
+   camera-dependent generic geometry must disappear while unrelated
+   projector-only geometry remains.
+9. Metric invalidation by clearing or recalibrating the metric surface;
+   physical generic geometry must disappear while projector-only geometry
+   remains.
+10. A same-process projector resolution or output-identity change; all generic
+    materialised geometry must be removed and no old geometry may reappear.
+
+Use `overlays list` and the projector display after every invalidation. Record
+one row for every physical measurement in a log like this; leave `result` as
+`not exercised` until the observation has actually been made:
+
+```text
+check | request/source size | expected | measured | absolute error
+      | position/orientation | camera slot and live identity | output identity | result
+rotated grid, position A | 25.4-mm spacing, 200 x 150 mm | 25.4 mm | ____ mm | ____ mm
+rotated grid, position B | 25.4-mm spacing, 200 x 150 mm | 25.4 mm | ____ mm | ____ mm
+circle outline | 152.4-mm diameter | 152.4 mm | ____ mm | ____ mm
+circle fill | 152.4-mm diameter | 152.4 mm | ____ mm | ____ mm
+rectangle outline/fill | 100 x 50 mm at ____ degrees | 100 x 50 mm | ____ | ____
+physical line, horizontal | ____ mm | ____ mm | ____ mm | ____ mm
+physical line, vertical | ____ mm | ____ mm | ____ mm | ____ mm
+physical ruler, diagonal | ____ mm / ____ | ____ mm | ____ mm | ____ mm
+camera anchor + physical shape | ____ mm at camera px (____, ____) | ____ | ____ | ____
+projector-pixel shape | ____ px | ____ px | ____ | ____
+edge-clipped physical shape | ____ mm, edge ____ | unchanged | ____ | ____
+```
+
+For the grid, measure separated cells rather than only adjacent lines. For
+circles and rectangles, record outline and fill separately when both are used.
+For every line and ruler, include horizontal, vertical and diagonal positions;
+measure the endpoints or markers with an independent physical ruler. Record
+whether an edge case is partially clipped or entirely off-screen, and for a
+valid off-screen-only request record the expected zero draw observation.
+
+Record lifecycle observations separately so a physical measurement cannot hide
+an invalidation failure:
+
+```text
+transition | dependent geometry | unrelated projector-only geometry | list/display result
+show/hide/remove by id and name | ____ | ____ | ____
+camera close/disconnect | removed | remains | ____
+metric clear/recalibration | removed | remains | ____
+projector resolution/output change | all removed | none remains | ____
+```
+
+Do not use mock draws, screenshots, synthetic homographies or deterministic
+test results as evidence for any physical observation. If a hardware check is
+unavailable, record it as `not exercised` rather than passing it by inference.
+
+### Plan5 deterministic and integration record
+
+Run the complete deterministic repository suite separately from the physical
+log and attach its output:
+
+```sh
+PYTHON="$PWD/.venv/bin/python"
+"$PYTHON" -m pytest
+```
+
+A passing suite verifies software contracts only — including source-space
+construction, projector clipping, API/CLI delegation, renderer ordering and
+invalidation. It does not fill any `measured` field above. During integration
+review, confirm that the service remains the only camera/metric/projector
+geometry authority, that the display consumes projector-native primitives only,
+and that no game, AI, scene-graph, DPI or local-scale behaviour has been added.
+
+The remaining physical uncertainty is the error between those mathematical
+contracts and the actual installation: printer scaling, target flatness and
+placement, projector/table movement, output identity, camera-to-live-device
+identification, lens/capture error, raster stroke width and ruler-reading
+error. Until the rows above contain observations from the target hardware,
+Plan5 physical accuracy remains **not established**; automated tests and API
+responses must not be reported as hardware acceptance.

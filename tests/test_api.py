@@ -75,6 +75,45 @@ class MalformedStatusRuntime:
 
 
 class ApiTest(unittest.TestCase):
+    def test_projector_overlay_routes_return_state_without_primitives(self) -> None:
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(100, 80)),
+        )
+
+        with TestClient(create_app(service, manage_lifecycle=False)) as client:
+            create_response = client.post(
+                '/overlays/line',
+                json={
+                    'name': 'diagonal',
+                    'start': {'space': 'projector_px', 'x': 1, 'y': 2},
+                    'end': {'space': 'projector_px', 'x': 90, 'y': 70},
+                },
+            )
+            entry = create_response.json()
+            list_response = client.get('/overlays')
+            hide_response = client.post('/overlays/name/diagonal/hide')
+            remove_response = client.delete(f"/overlays/id/{entry['id']}")
+            empty_response = client.get('/overlays')
+
+        assert create_response.status_code == 200, f'{entry=}'
+        assert set(entry) == {
+            'id',
+            'name',
+            'kind',
+            'visible',
+            'request',
+            'camera_dependencies',
+            'metric_dependency',
+            'projector_output_descriptor',
+        }, f'{entry=}'
+        assert 'materialised_primitives' not in entry, f'{entry=}'
+        assert list_response.status_code == 200
+        assert list_response.json() == [entry], f'{list_response.json()=}'
+        assert hide_response.status_code == 200
+        assert hide_response.json()['visible'] is False
+        assert remove_response.status_code == 200
+        assert empty_response.json() == []
+
     def test_calibration_pattern_can_be_held_without_changing_calibration(self) -> None:
         runtime = CameraRuntime(
             FakeDiscovery(

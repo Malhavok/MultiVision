@@ -21,6 +21,10 @@ from multivision.fiducials import (
 )
 from multivision.config import Configuration
 from multivision.geometry import HomographyPair, Point2D
+from multivision.overlays import (
+    LineRequest,
+    ProjectorMaterialisation,
+)
 from multivision.persistence import PersistedCalibration
 from multivision.service import PointOverlayService
 from multivision.session import FrameMetadata, SessionCameraRegistry
@@ -529,6 +533,65 @@ class MultiVisionServiceCameraManagementTest(unittest.TestCase):
         disconnected_area = service.get_camera_area('camera-0')
         assert disconnected_area.area_enabled is False, f'{disconnected_area=}'
         assert disconnected_area.available_area is None, f'{disconnected_area=}'
+
+    def test_overlay_camera_names_are_stored_as_stable_slot_ids(self) -> None:
+        runtime = CalibrationSessionRuntime(capture_indexes=(0,))
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            SimpleNamespace(
+                camera_to_projector=(
+                    (1.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0),
+                    (0.0, 0.0, 1.0),
+                ),
+            ),
+        )
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+        )
+        service.rename_camera('camera-0', 'overhead')
+
+        entry = service.create_overlay(
+            LineRequest(
+                start={'space': 'camera_px', 'camera': 'overhead', 'x': 1, 'y': 1},
+                end={'space': 'projector_px', 'x': 10, 'y': 10},
+            ),
+        )
+        service.rename_camera('camera-0', 'side')
+
+        entries = service.list_overlays()
+        assert entry.request.start.camera == 'camera-0', f'{entry=}'
+        assert entry.camera_dependencies == ('camera-0',), f'{entry=}'
+        assert entries == [entry], f'{entries=}'
+
+    def test_overlay_creation_prunes_stale_camera_dependencies(self) -> None:
+        runtime = CalibrationSessionRuntime()
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+        )
+        camera_request = LineRequest(
+            start={'space': 'camera_px', 'camera': 'camera-0', 'x': 1, 'y': 1},
+            end={'space': 'projector_px', 'x': 10, 'y': 10},
+        )
+        stale_entry = service.overlay_registry.create(
+            camera_request,
+            ProjectorMaterialisation(),
+        )
+        runtime.registry.mark_unavailable('camera-0', 'disconnected')
+
+        service.create_overlay(
+            LineRequest(
+                start={'space': 'projector_px', 'x': 1, 'y': 1},
+                end={'space': 'projector_px', 'x': 10, 'y': 10},
+            ),
+        )
+
+        entries = service.overlay_registry.list()
+        assert stale_entry.id not in {entry.id for entry in entries}, f'{entries=}'
+        assert len(entries) == 1, f'{entries=}'
 
     def test_close_and_reopen_clear_only_the_changed_camera_spatial_state(self) -> None:
         runtime = FakeSessionRuntime()

@@ -83,6 +83,100 @@ class CliTest(unittest.TestCase):
             ('DELETE', 'http://service.test/overlay', None),
         ]
 
+    def test_generic_overlay_commands_delegate_to_http(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            return ServiceResponse(200, 'application/json', b'{"id": "overlay-1"}')
+
+        client = MultiVisionClient('http://service.test', request_sender=request_sender)
+        specs = {
+            'grid': {
+                'origin': {'space': 'projector_px', 'x': 1, 'y': 2},
+                'geometry_space': 'projector_px',
+                'spacing': {'value': 10, 'unit': 'px'},
+                'extent': {
+                    'width': {'value': 30, 'unit': 'px'},
+                    'height': {'value': 20, 'unit': 'px'},
+                },
+            },
+            'circle': {
+                'centre': {'space': 'projector_px', 'x': 10, 'y': 20},
+                'geometry_space': 'projector_px',
+                'radius': {'value': 5, 'unit': 'px'},
+            },
+            'rect': {
+                'centre': {'space': 'projector_px', 'x': 10, 'y': 20},
+                'geometry_space': 'projector_px',
+                'width': {'value': 10, 'unit': 'px'},
+                'height': {'value': 8, 'unit': 'px'},
+            },
+            'line': {
+                'start': {'space': 'projector_px', 'x': 1, 'y': 2},
+                'end': {'space': 'projector_px', 'x': 3, 'y': 4},
+            },
+            'ruler': {
+                'start': {'space': 'projector_px', 'x': 1, 'y': 2},
+                'end': {'space': 'projector_px', 'x': 3, 'y': 4},
+                'measurement_space': 'projector_px',
+                'unit': 'px',
+            },
+        }
+        commands = [
+            [
+                'overlay', overlay_kind, '--spec-json', json.dumps(spec),
+            ]
+            for overlay_kind, spec in specs.items()
+        ] + [
+            ['overlays', 'list'],
+            ['overlay', 'show', '--id', 'overlay-1'],
+            ['overlay', 'hide', '--name', 'my overlay'],
+            ['overlay', 'remove', '--id', 'overlay-1'],
+            ['overlays', 'clear'],
+        ]
+
+        for command in commands:
+            with self.subTest(command=command), redirect_stdout(io.StringIO()):
+                assert main(command, client) == 0
+
+        assert [
+            (method, url, payload)
+            for method, url, payload, _timeout_seconds in requests
+        ] == [
+            ('POST', f'http://service.test/overlays/{overlay_kind}', spec)
+            for overlay_kind, spec in specs.items()
+        ] + [
+            ('GET', 'http://service.test/overlays', None),
+            ('POST', 'http://service.test/overlays/id/overlay-1/show', None),
+            ('POST', 'http://service.test/overlays/name/my%20overlay/hide', None),
+            ('DELETE', 'http://service.test/overlays/id/overlay-1', None),
+            ('DELETE', 'http://service.test/overlays', None),
+        ], f'{requests=}'
+
+    def test_invalid_overlay_spec_is_rejected_before_http(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+        client = MultiVisionClient(
+            request_sender=lambda method, url, payload, timeout: (
+                requests.append((method, url, payload, timeout))
+                or ServiceResponse(200, 'application/json', b'{}')
+            ),
+        )
+
+        with redirect_stderr(io.StringIO()):
+            result = main(
+                ['overlay', 'circle', '--spec-json', '{"radius": {"value": 0, "unit": "px"}}'],
+                client,
+            )
+
+        assert result == 1
+        assert requests == [], f'{requests=}'
+
     def test_metric_commands_delegate_to_http_with_expected_payloads(self) -> None:
         requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
 

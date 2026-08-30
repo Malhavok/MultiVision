@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from multivision.errors import ConfigurationError
+from multivision.overlays import OverlayConfiguration
 from multivision.types import (
     Resolution,
     is_valid_resolution,
@@ -89,6 +90,7 @@ class Configuration:
     metric_calibration_thresholds: MetricCalibrationThresholds = field(
         default_factory=MetricCalibrationThresholds,
     )
+    overlay_limits: OverlayConfiguration = field(default_factory=OverlayConfiguration)
 
     def __post_init__(self) -> None:
         _validate_resolution(self.projector_resolution, 'projector_resolution')
@@ -102,6 +104,8 @@ class Configuration:
             raise ConfigurationError(
                 'metric_calibration_thresholds must be MetricCalibrationThresholds',
             )
+        if not isinstance(self.overlay_limits, OverlayConfiguration):
+            raise ConfigurationError('overlay_limits must be OverlayConfiguration')
         _validate_positive_integer(self.calibration_version, 'calibration_version')
 
     @property
@@ -125,6 +129,9 @@ class Configuration:
         metric_thresholds = _parse_metric_thresholds(
             data.get('metric_calibration_thresholds', {}),
         )
+        overlay_limits = _parse_overlay_configuration(
+            data.get('overlay_limits', {}),
+        )
         calibration_version = data.get('calibration_version', 1)
 
         return cls(
@@ -132,6 +139,7 @@ class Configuration:
             projector_output_identity=projector_output_identity,
             calibration_thresholds=thresholds,
             metric_calibration_thresholds=metric_thresholds,
+            overlay_limits=overlay_limits,
             calibration_version=calibration_version,
         )
 
@@ -179,6 +187,7 @@ class Configuration:
                 ),
                 'min_spatial_coverage': self.metric_calibration_thresholds.min_spatial_coverage,
             },
+            'overlay_limits': self.overlay_limits.to_data(),
             'calibration_version': self.calibration_version,
         }
 
@@ -311,6 +320,13 @@ def _parse_metric_thresholds(data: Any) -> MetricCalibrationThresholds:
         ),
     }
     return MetricCalibrationThresholds(**values)
+
+
+def _parse_overlay_configuration(data: Any) -> OverlayConfiguration:
+    try:
+        return OverlayConfiguration.from_data(data)
+    except (TypeError, ValueError) as ex:
+        raise ConfigurationError(str(ex)) from ex
 
 
 def _parse_thresholds(data: Any) -> CalibrationThresholds:

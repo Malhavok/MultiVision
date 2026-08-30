@@ -20,6 +20,7 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    UUID4,
     field_validator,
 )
 
@@ -39,6 +40,7 @@ from multivision.errors import (
     GeometryError,
     HardwareError,
     MultiVisionError,
+    OverlayNotFoundError,
     SessionCameraError,
 )
 from multivision.fiducials import (
@@ -56,6 +58,14 @@ from multivision.metric import (
     MetricValidationRecord,
 )
 from multivision.metric_target import METRIC_TARGET
+from multivision.overlays import (
+    CircleRequest,
+    GridRequest,
+    LineRequest,
+    OverlayEntry,
+    RectRequest,
+    RulerRequest,
+)
 from multivision.persistence import PersistedCalibration
 from multivision.service import RedCircleOverlay
 from multivision.session import (
@@ -465,6 +475,74 @@ def create_app(
         owned_service.clear_overlay()
         return {'cleared': True}
 
+    @app.post('/overlays/grid')
+    def create_grid_overlay(request: GridRequest) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.create_overlay(request))
+
+    @app.post('/overlays/circle')
+    def create_circle_overlay(request: CircleRequest) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.create_overlay(request))
+
+    @app.post('/overlays/rect')
+    def create_rect_overlay(request: RectRequest) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.create_overlay(request))
+
+    @app.post('/overlays/line')
+    def create_line_overlay(request: LineRequest) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.create_overlay(request))
+
+    @app.post('/overlays/ruler')
+    def create_ruler_overlay(request: RulerRequest) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.create_overlay(request))
+
+    @app.get('/overlays')
+    def list_overlay_state() -> list[dict[str, Any]]:
+        return [
+            _overlay_entry_to_data(entry)
+            for entry in owned_service.list_overlays()
+        ]
+
+    @app.post('/overlays/id/{overlay_id}/show')
+    def show_overlay_by_id(
+        overlay_id: Annotated[UUID4, Path()],
+    ) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.show_overlay(overlay_id))
+
+    @app.post('/overlays/id/{overlay_id}/hide')
+    def hide_overlay_by_id(
+        overlay_id: Annotated[UUID4, Path()],
+    ) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.hide_overlay(overlay_id))
+
+    @app.delete('/overlays/id/{overlay_id}')
+    def remove_overlay_by_id(
+        overlay_id: Annotated[UUID4, Path()],
+    ) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.remove_overlay(overlay_id))
+
+    @app.post('/overlays/name/{overlay_name}/show')
+    def show_overlay_by_name(
+        overlay_name: Annotated[str, Path(min_length=1)],
+    ) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.show_overlay(overlay_name))
+
+    @app.post('/overlays/name/{overlay_name}/hide')
+    def hide_overlay_by_name(
+        overlay_name: Annotated[str, Path(min_length=1)],
+    ) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.hide_overlay(overlay_name))
+
+    @app.delete('/overlays/name/{overlay_name}')
+    def remove_overlay_by_name(
+        overlay_name: Annotated[str, Path(min_length=1)],
+    ) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.remove_overlay(overlay_name))
+
+    @app.delete('/overlays')
+    def clear_overlays() -> dict[str, bool]:
+        owned_service.clear_overlays()
+        return {'cleared': True}
+
     return app
 
 
@@ -846,6 +924,24 @@ def _overlay_to_data(overlay: RedCircleOverlay) -> dict[str, Any]:
     return overlay.to_data()
 
 
+def _overlay_entry_to_data(entry: OverlayEntry) -> dict[str, Any]:
+    if not isinstance(entry, OverlayEntry):
+        raise GeometryError('Overlay service returned an invalid overlay entry')
+    request_data = entry.request.model_dump(mode='json')
+    return {
+        'id': str(entry.id),
+        'name': entry.name,
+        'kind': entry.kind,
+        'visible': entry.visible,
+        'request': request_data,
+        'camera_dependencies': list(entry.camera_dependencies),
+        'metric_dependency': entry.metric_dependency,
+        'projector_output_descriptor': _descriptor_to_data(
+            entry.projector_output_descriptor,
+        ),
+    }
+
+
 def _frame_response(frame: Frame, logical_name: str) -> Response:
     if (
         not isinstance(frame.frame_counter, int)
@@ -930,7 +1026,7 @@ def _error_code(exception: MultiVisionError) -> str:
 
 
 def _error_status(exception: MultiVisionError) -> int:
-    if isinstance(exception, CameraSlotNotFoundError):
+    if isinstance(exception, (CameraSlotNotFoundError, OverlayNotFoundError)):
         return 404
     if isinstance(exception, SessionCameraError):
         return 409

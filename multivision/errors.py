@@ -68,6 +68,12 @@ class CameraUnavailableError(HardwareError):
     code = 'CAMERA_UNAVAILABLE'
 
 
+class OverlayNotFoundError(MultiVisionError, KeyError):
+    """Raised when a generic overlay selector is not present in the session."""
+
+    code = 'OVERLAY_NOT_FOUND'
+
+
 class SessionCameraError(MultiVisionError, ValueError):
     """Base class for invalid in-memory session camera operations."""
 

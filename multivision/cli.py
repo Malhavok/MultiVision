@@ -265,6 +265,56 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     clear_parser = overlay_subparsers.add_parser('clear', help='clear the current overlay')
     clear_parser.set_defaults(command_handler='overlay_clear')
+    for overlay_kind in ('grid', 'circle', 'rect', 'line', 'ruler'):
+        create_overlay_parser = overlay_subparsers.add_parser(
+            overlay_kind,
+            help=f'create a {overlay_kind} overlay',
+        )
+        create_overlay_parser.add_argument(
+            '--spec-json',
+            required=True,
+            type=_parse_json_object,
+            help='validated overlay request as a JSON object',
+        )
+        create_overlay_parser.set_defaults(
+            command_handler='overlay_create',
+            overlay_kind=overlay_kind,
+        )
+    for lifecycle_action in ('show', 'hide', 'remove'):
+        lifecycle_parser = overlay_subparsers.add_parser(
+            lifecycle_action,
+            help=f'{lifecycle_action} a generic overlay',
+        )
+        selector_group = lifecycle_parser.add_mutually_exclusive_group(required=True)
+        selector_group.add_argument('--id', dest='overlay_id', type=_parse_non_empty_argument)
+        selector_group.add_argument(
+            '--name',
+            dest='overlay_name',
+            type=_parse_non_empty_argument,
+        )
+        lifecycle_parser.set_defaults(
+            command_handler='overlay_lifecycle',
+            overlay_lifecycle_action=lifecycle_action,
+        )
+
+    overlays_parser = subparsers.add_parser(
+        'overlays',
+        help='manage generic overlays',
+    )
+    overlays_subparsers = overlays_parser.add_subparsers(
+        dest='overlays_command',
+        required=True,
+    )
+    overlays_list_parser = overlays_subparsers.add_parser(
+        'list',
+        help='list generic overlays',
+    )
+    overlays_list_parser.set_defaults(command_handler='overlays_list')
+    overlays_clear_parser = overlays_subparsers.add_parser(
+        'clear',
+        help='clear generic overlays',
+    )
+    overlays_clear_parser.set_defaults(command_handler='overlays_clear')
 
     metric_parser = subparsers.add_parser(
         'metric',
@@ -385,6 +435,10 @@ def _run_command(
         'snapshot': _snapshot,
         'point': _point,
         'overlay_clear': _overlay_clear,
+        'overlay_create': _overlay_create,
+        'overlay_lifecycle': _overlay_lifecycle,
+        'overlays_list': _overlays_list,
+        'overlays_clear': _overlays_clear,
         'metric_target_generate': _metric_target_generate,
         'metric_calibrate': _metric_calibrate,
         'metric_status': _metric_status,
@@ -498,6 +552,83 @@ def _overlay_clear(
     _arguments: argparse.Namespace,
 ) -> ServiceResponse:
     return client.delete('/overlay')
+
+
+def _overlay_create(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    spec = _validate_overlay_spec(arguments.overlay_kind, arguments.spec_json)
+    return client.post(f'/overlays/{arguments.overlay_kind}', spec)
+
+
+def _overlay_lifecycle(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    selector = _get_overlay_selector(arguments)
+    selector_kind, selector_value = selector
+    path_selector = _quote_path_component(selector_value)
+    path = f'/overlays/{selector_kind}/{path_selector}'
+    if arguments.overlay_lifecycle_action == 'remove':
+        return client.delete(path)
+    return client.post(f'{path}/{arguments.overlay_lifecycle_action}')
+
+
+def _overlays_list(
+    client: MultiVisionClient,
+    _arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.get('/overlays')
+
+
+def _overlays_clear(
+    client: MultiVisionClient,
+    _arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.delete('/overlays')
+
+
+def _validate_overlay_spec(
+    overlay_kind: str,
+    spec: dict[str, Any],
+) -> dict[str, Any]:
+    request_types: dict[str, type[Any]]
+    from multivision.overlays import (
+        CircleRequest,
+        GridRequest,
+        LineRequest,
+        RectRequest,
+        RulerRequest,
+    )
+
+    request_types = {
+        'grid': GridRequest,
+        'circle': CircleRequest,
+        'rect': RectRequest,
+        'line': LineRequest,
+        'ruler': RulerRequest,
+    }
+    try:
+        request_types[overlay_kind].model_validate(spec)
+    except KeyError as ex:
+        raise ValueError(f'Unknown overlay kind: {overlay_kind}') from ex
+    except ValueError as ex:
+        raise ValueError(f'Invalid {overlay_kind} overlay spec: {ex}') from ex
+    return spec
+
+
+def _get_overlay_selector(
+    arguments: argparse.Namespace,
+) -> tuple[str, str]:
+    overlay_id = getattr(arguments, 'overlay_id', None)
+    overlay_name = getattr(arguments, 'overlay_name', None)
+    if (overlay_id is None) == (overlay_name is None):
+        raise ValueError('exactly one of --id or --name is required')
+    if overlay_id is not None:
+        return 'id', overlay_id
+    assert overlay_name is not None
+    return 'name', overlay_name
 
 
 def _metric_target_generate(
@@ -629,6 +760,16 @@ def _validate_service_url(service_url: str) -> None:
         parsed_url.port
     except ValueError as ex:
         raise ValueError('service_url must contain a valid port') from ex
+
+
+def _parse_json_object(value: str) -> dict[str, Any]:
+    try:
+        parsed_value = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as ex:
+        raise argparse.ArgumentTypeError('must be valid JSON') from ex
+    if not isinstance(parsed_value, dict):
+        raise argparse.ArgumentTypeError('must be a JSON object')
+    return parsed_value
 
 
 def _parse_finite_float(value: str) -> float:
