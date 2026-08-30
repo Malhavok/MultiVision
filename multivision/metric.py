@@ -398,7 +398,9 @@ def _validate_metric_calibration_result(
         surface_to_projector = validate_homography(
             result.homography.surface_to_projector,
         )
-        expected_surface_to_projector = invert_homography(projector_to_surface)
+        expected_surface_to_projector = validate_homography(
+            invert_homography(projector_to_surface),
+        )
     except (InvalidHomographyError, TypeError, ValueError) as ex:
         raise ValueError('Metric result contains invalid homography matrices') from ex
     if not all(
