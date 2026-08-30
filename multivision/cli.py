@@ -15,7 +15,7 @@ from typing import Any, NamedTuple
 
 
 DEFAULT_SERVICE_URL = 'http://127.0.0.1:8000'
-DEFAULT_TIMEOUT_SECONDS = 5.0
+DEFAULT_TIMEOUT_SECONDS = 30.0
 
 
 class ServiceResponse(NamedTuple):

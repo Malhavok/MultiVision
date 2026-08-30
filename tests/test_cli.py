@@ -363,7 +363,7 @@ class CliTest(unittest.TestCase):
                     'to': {'x': 110.0, 'y': 10.0},
                     'unit': 'mm',
                 },
-                5.0,
+                30.0,
             ),
         ], f'{requests=}'
 

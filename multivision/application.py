@@ -1140,8 +1140,7 @@ class MultiVisionService:
         correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None = None,
     ) -> CalibrationStatus:
         with self._spatial_capture_operation_lock:
-            with self._camera_management_lock:
-                return self._verify_camera_locked(logical_name, correspondences)
+            return self._verify_camera_locked(logical_name, correspondences)
 
     def _verify_camera_locked(
         self,

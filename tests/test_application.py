@@ -14,8 +14,13 @@ from multivision.errors import (
     InvalidAvailableAreaError,
     InvalidCalibrationStateError,
 )
+from multivision.fiducials import (
+    CameraCorrespondences,
+    FiducialCorrespondence,
+)
 from multivision.config import Configuration
 from multivision.geometry import HomographyPair, Point2D
+from multivision.persistence import PersistedCalibration
 from multivision.service import PointOverlayService
 from multivision.session import FrameMetadata, SessionCameraRegistry
 from multivision.types import (
@@ -509,6 +514,89 @@ class MultiVisionServiceCameraManagementTest(unittest.TestCase):
         assert reopened_camera.calibration_status is CalibrationStatus.UNCALIBRATED
         assert reopened_camera.calibration is None
         assert point_service.cleared == ['camera-0', 'camera-0']
+
+    def test_verification_capture_does_not_block_main_thread_status_reads(self) -> None:
+        resolution = Resolution(640, 480)
+        configuration = Configuration(projector_resolution=resolution)
+        runtime = CalibrationSessionRuntime((0,))
+        identity = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        calibration = PersistedCalibration(
+            'camera-0',
+            resolution,
+            resolution,
+            1,
+            identity,
+            identity,
+            CalibrationMetrics(20, 80, 80, 1.0, 0.0, 0.0, 1.0),
+            1.0,
+            ((0.0, 0.0), (640.0, 0.0), (640.0, 480.0), (0.0, 480.0)),
+            projector_output_descriptor=configuration.projector_output_descriptor,
+        )
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            calibration,
+        )
+        service = MultiVisionService(
+            configuration,
+            camera_runtime=runtime,  # type: ignore[arg-type]
+            point_service=FakePointService(),  # type: ignore[arg-type]
+        )
+        correspondences = CameraCorrespondences(
+            tuple(
+                FiducialCorrespondence(
+                    marker.marker_id,
+                    marker.corner_index,
+                    marker.projector_position,
+                    marker.projector_position,
+                )
+                for marker in service.calibration_pattern.marker_corners
+            ),
+            'camera-0',
+        )
+        capture_started = threading.Event()
+        release_capture = threading.Event()
+        verification_errors: list[BaseException] = []
+        verification_results: list[CalibrationStatus] = []
+
+        def blocked_capture(*_args: object, **_kwargs: object) -> CameraCorrespondences:
+            capture_started.set()
+            assert release_capture.wait(1), 'verification capture was not released'
+            return correspondences
+
+        def verify_camera() -> None:
+            try:
+                verification_results.append(service.verify('camera-0'))
+            except BaseException as ex:  # noqa: BLE001 (test thread cleanup).
+                verification_errors.append(ex)
+
+        status_read_finished = threading.Event()
+
+        def read_statuses() -> None:
+            service.get_camera_statuses()
+            status_read_finished.set()
+
+        with patch.object(service, '_get_correspondences_for_operation', blocked_capture):
+            verification_thread = threading.Thread(target=verify_camera)
+            verification_thread.start()
+            assert capture_started.wait(1), 'verification capture did not start'
+
+            status_thread = threading.Thread(target=read_statuses)
+            status_thread.start()
+            assert status_read_finished.wait(0.5), (
+                'main-thread status reads were blocked during verification capture'
+            )
+
+            release_capture.set()
+            verification_thread.join(1)
+            status_thread.join(1)
+
+        assert not verification_thread.is_alive(), 'verification did not finish'
+        assert not status_thread.is_alive(), 'status read did not finish'
+        assert verification_errors == [], f'{verification_errors=}'
+        assert verification_results == [CalibrationStatus.CALIBRATED], (
+            f'{verification_results=}'
+        )
 
     def test_late_calibration_cannot_restore_state_after_close_and_reopen(self) -> None:
         runtime = CalibrationSessionRuntime()

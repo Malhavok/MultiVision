@@ -698,11 +698,25 @@ def _calculate_target_coverage(
 def _build_detector_parameters(aruco: Any) -> Any:
     parameters_class = getattr(aruco, 'DetectorParameters', None)
     if parameters_class is not None:
-        return parameters_class()
-    parameters_factory = getattr(aruco, 'DetectorParameters_create', None)
-    if parameters_factory is not None:
-        return parameters_factory()
-    raise FiducialDetectionError('OpenCV does not provide detector parameters')
+        parameters = parameters_class()
+    else:
+        parameters_factory = getattr(aruco, 'DetectorParameters_create', None)
+        if parameters_factory is None:
+            raise FiducialDetectionError('OpenCV does not provide detector parameters')
+        parameters = parameters_factory()
+
+    # Projected tags span much larger regions than the default adaptive window,
+    # and tabletop texture otherwise leaves the correct quads rejected before decoding.
+    detector_settings = {
+        'adaptiveThreshWinSizeMax': 101,
+        'adaptiveThreshWinSizeStep': 10,
+        'aprilTagMinWhiteBlackDiff': 2,
+        'perspectiveRemovePixelPerCell': 8,
+    }
+    for setting_name, setting_value in detector_settings.items():
+        if hasattr(parameters, setting_name):
+            setattr(parameters, setting_name, setting_value)
+    return parameters
 
 
 def _normalise_markers(markers: object) -> tuple[DetectedMarker, ...]:

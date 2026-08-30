@@ -39,6 +39,38 @@ class FiducialTest(unittest.TestCase):
             for point in marker.corners
         ), f'{detections=}'
 
+    def test_detector_uses_projection_safe_parameters(self) -> None:
+        class FakeParameters:
+            adaptiveThreshWinSizeMax = 23
+            adaptiveThreshWinSizeStep = 10
+            aprilTagMinWhiteBlackDiff = 5
+            perspectiveRemovePixelPerCell = 4
+
+        class FakeAruco:
+            DICT_APRILTAG_36h11 = object()
+            DetectorParameters = FakeParameters
+
+            def getPredefinedDictionary(self, dictionary_constant: object) -> object:
+                return dictionary_constant
+
+            def detectMarkers(
+                self,
+                frame: Any,
+                dictionary: object,
+                parameters: Any,
+            ) -> tuple[list[Any], list[Any], list[Any]]:
+                return [], [], []
+
+        detector = OpenCVArucoDetector(
+            cv2_module=type('FakeCV2', (), {'aruco': FakeAruco()})(),
+        )
+        parameters = detector._parameters
+
+        assert parameters.adaptiveThreshWinSizeMax == 101, f'{parameters=}'
+        assert parameters.adaptiveThreshWinSizeStep == 10, f'{parameters=}'
+        assert parameters.aprilTagMinWhiteBlackDiff == 2, f'{parameters=}'
+        assert parameters.perspectiveRemovePixelPerCell == 8, f'{parameters=}'
+
     def test_assembly_rejects_non_iterable_detections_and_frames(self) -> None:
         pattern = build_calibration_pattern(Resolution(1000, 800))
 
