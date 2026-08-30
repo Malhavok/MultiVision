@@ -757,6 +757,7 @@ class PygameDisplayRuntime:
                 self._preview_layouts[camera.slot_id],
                 camera.session_camera,
                 area_colours.get(camera.slot_id),
+                metric_state,
             )
 
         try:
@@ -875,6 +876,7 @@ class PygameDisplayRuntime:
         layout: CameraPreviewLayout,
         session_camera: SessionCamera | None = None,
         area_colour: tuple[int, int, int] | None = None,
+        metric_state: MetricCalibrationStatus = MetricCalibrationStatus.UNCALIBRATED,
     ) -> None:
         assert self._window_surface is not None
         self._draw_rectangle(self._window_surface, layout.panel_bounds, DARK_GREY)
@@ -894,6 +896,12 @@ class PygameDisplayRuntime:
             layout.panel_bounds.left + 8,
             layout.panel_bounds.top + 24,
             calibration_colour,
+        )
+        self._draw_text(
+            f'metrics-calibrated: {metric_state.value}',
+            layout.panel_bounds.left + 250,
+            layout.panel_bounds.top + 24,
+            _metric_calibration_colour(metric_state),
         )
         self._draw_text(
             f'slot: {slot_id}  state: {camera_state.value}',
@@ -1643,6 +1651,14 @@ def _calibration_colour(status: CalibrationStatus) -> tuple[int, int, int]:
     if status is CalibrationStatus.CALIBRATED:
         return GREEN
     if status is CalibrationStatus.STALE:
+        return RED
+    return ORANGE
+
+
+def _metric_calibration_colour(status: MetricCalibrationStatus) -> tuple[int, int, int]:
+    if status is MetricCalibrationStatus.CALIBRATED:
+        return GREEN
+    if status is MetricCalibrationStatus.STALE:
         return RED
     return ORANGE
 
