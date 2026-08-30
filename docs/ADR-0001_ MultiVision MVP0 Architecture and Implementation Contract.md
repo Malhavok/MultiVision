@@ -328,7 +328,7 @@ DICT_APRILTAG_36h11
 
 This avoids introducing a separate detection stack unless testing demonstrates a reason to do so.
 
-The projected pattern should contain approximately 9–12 uniquely identified tags distributed across the usable projection area.
+The projected pattern should contain uniquely identified tags distributed across the usable projection area. Camera calibration may proceed with the configured minimum of two complete tags (eight corners), provided spatial coverage and all other quality gates pass.
 
 Example:
 

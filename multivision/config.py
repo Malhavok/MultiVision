@@ -37,7 +37,7 @@ class CalibrationThresholds:
     max_mean_reprojection_error: float = 5.0
     max_reprojection_error: float = 10.0
     min_inlier_ratio: float = 0.5
-    min_unique_tags: int = 4
+    min_unique_tags: int = 2
     min_spatial_coverage: float = 0.1
     valid_region_margin: float = 0.05
 
@@ -48,6 +48,7 @@ class CalibrationThresholds:
 @dataclass(frozen=True)
 class MetricCalibrationThresholds:
     ransac_reprojection_threshold_mm: float = 3.0
+    max_capture_white_balance_delta: float = 0.01
     max_capture_corner_jitter_pixels: float = 2.0
     max_mean_fit_error_mm: float = 2.0
     max_fit_error_mm: float = 5.0
@@ -152,6 +153,9 @@ class Configuration:
             'metric_calibration_thresholds': {
                 'ransac_reprojection_threshold_mm': (
                     self.metric_calibration_thresholds.ransac_reprojection_threshold_mm
+                ),
+                'max_capture_white_balance_delta': (
+                    self.metric_calibration_thresholds.max_capture_white_balance_delta
                 ),
                 'max_capture_corner_jitter_pixels': (
                     self.metric_calibration_thresholds.max_capture_corner_jitter_pixels
@@ -268,6 +272,10 @@ def _parse_metric_thresholds(data: Any) -> MetricCalibrationThresholds:
             'ransac_reprojection_threshold_mm',
             defaults.ransac_reprojection_threshold_mm,
         ),
+        'max_capture_white_balance_delta': data.get(
+            'max_capture_white_balance_delta',
+            defaults.max_capture_white_balance_delta,
+        ),
         'max_capture_corner_jitter_pixels': data.get(
             'max_capture_corner_jitter_pixels',
             defaults.max_capture_corner_jitter_pixels,
@@ -371,6 +379,7 @@ def _validate_metric_thresholds(value: MetricCalibrationThresholds) -> None:
         value,
         (
             'ransac_reprojection_threshold_mm',
+            'max_capture_white_balance_delta',
             'max_capture_corner_jitter_pixels',
             'max_mean_fit_error_mm',
             'max_fit_error_mm',
@@ -383,6 +392,10 @@ def _validate_metric_thresholds(value: MetricCalibrationThresholds) -> None:
     if value.ransac_reprojection_threshold_mm <= 0:
         raise ConfigurationError(
             'ransac_reprojection_threshold_mm must be positive',
+        )
+    if value.max_capture_white_balance_delta <= 0 or value.max_capture_white_balance_delta > 1:
+        raise ConfigurationError(
+            'max_capture_white_balance_delta must be between 0 and 1',
         )
     if value.max_capture_corner_jitter_pixels <= 0:
         raise ConfigurationError(

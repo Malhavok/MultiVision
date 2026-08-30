@@ -94,6 +94,8 @@ CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS = 5.0
 METRIC_CAPTURE_WAIT_TIMEOUT_SECONDS = 5.0
 METRIC_CAPTURE_SETTLE_SECONDS = 3.0
 METRIC_CAPTURE_FRAME_COUNT = 3
+METRIC_CAPTURE_CANDIDATE_FRAME_COUNT = 15
+CALIBRATION_PATTERN_EDGE_MARGIN_PIXELS = 24.0
 AREA_COLOURS = (
     (70, 190, 255),
     (255, 180, 70),
@@ -168,7 +170,7 @@ class MultiVisionService:
         self.calibration_pattern = (
             calibration_pattern
             if calibration_pattern is not None
-            else build_calibration_pattern(
+            else _build_projector_calibration_pattern(
                 self._projector_output_descriptor.projector_resolution,
             )
         )
@@ -636,7 +638,7 @@ class MultiVisionService:
             if checked_descriptor == self._projector_output_descriptor:
                 return checked_descriptor
             self._metric_capture_generation += 1
-            updated_calibration_pattern = build_calibration_pattern(
+            updated_calibration_pattern = _build_projector_calibration_pattern(
                 checked_descriptor.projector_resolution,
             )
             self.camera_runtime.mark_calibrations_stale(checked_descriptor)
@@ -853,15 +855,20 @@ class MultiVisionService:
         if callable(get_consecutive_frames):
             captured_frames = get_consecutive_frames(
                 slot_id,
-                METRIC_CAPTURE_FRAME_COUNT,
+                METRIC_CAPTURE_CANDIDATE_FRAME_COUNT,
                 METRIC_CAPTURE_WAIT_TIMEOUT_SECONDS,
             )
-            if not isinstance(captured_frames, Sequence) or len(captured_frames) != (
+            if not isinstance(captured_frames, Sequence) or len(captured_frames) < (
                 METRIC_CAPTURE_FRAME_COUNT
             ) or any(not isinstance(frame, Frame) for frame in captured_frames):
                 raise CalibrationError(
                     'Camera runtime returned invalid consecutive metric frames',
                 )
+            captured_frames = _select_stable_metric_frames(
+                captured_frames,
+                self.configuration.metric_calibration_thresholds
+                .max_capture_white_balance_delta,
+            )
         else:
             captured_frames = tuple(
                 self.snapshot(slot_id)
@@ -1423,6 +1430,69 @@ class MultiVisionService:
             )
 
 
+def _select_stable_metric_frames(
+    frames: Sequence[Frame],
+    maximum_white_balance_delta: float,
+) -> tuple[Frame, ...]:
+    if not math.isfinite(maximum_white_balance_delta) or maximum_white_balance_delta <= 0:
+        raise CalibrationError('Metric white-balance tolerance is invalid')
+    signatures = tuple(_white_balance_signature(frame.data) for frame in frames)
+    for start_index in range(len(frames) - METRIC_CAPTURE_FRAME_COUNT + 1):
+        window_signatures = signatures[
+            start_index:start_index + METRIC_CAPTURE_FRAME_COUNT
+        ]
+        if _white_balance_window_is_stable(
+            window_signatures,
+            maximum_white_balance_delta,
+        ):
+            return tuple(
+                frames[start_index:start_index + METRIC_CAPTURE_FRAME_COUNT]
+            )
+    raise CalibrationError(
+        'Metric capture did not find three consecutive white-balance-stable frames',
+    )
+
+
+def _white_balance_signature(frame_data: object) -> tuple[float, ...] | None:
+    try:
+        import numpy
+        array = numpy.asarray(frame_data)
+        if array.ndim < 3 or array.shape[2] < 3:
+            return None
+        channel_medians = numpy.median(
+            array[..., :3].reshape(-1, 3),
+            axis=0,
+        )
+        total = float(numpy.sum(channel_medians))
+        if not math.isfinite(total) or total <= 0:
+            return None
+        signature = tuple(float(value) / total for value in channel_medians)
+    except (ImportError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in signature):
+        return None
+    return signature
+
+
+def _white_balance_window_is_stable(
+    signatures: Sequence[tuple[float, ...] | None],
+    maximum_delta: float,
+) -> bool:
+    if any(signature is None for signature in signatures):
+        return True
+    checked_signatures = tuple(
+        signature for signature in signatures if signature is not None
+    )
+    return all(
+        max(
+            abs(first_channel - second_channel)
+            for first_channel, second_channel in zip(first_signature, second_signature)
+        ) <= maximum_delta
+        for first_index, first_signature in enumerate(checked_signatures)
+        for second_signature in checked_signatures[first_index + 1:]
+    )
+
+
 def _normalise_injected_metric_frames(
     correspondences: (
         MetricTargetCorrespondences
@@ -1488,6 +1558,21 @@ def _same_camera_calibration(first: object, second: object) -> bool:
         if first_value != second_value:
             return False
     return True
+
+
+def _build_projector_calibration_pattern(
+    projector_resolution: Resolution,
+) -> CalibrationPattern:
+    margin = CALIBRATION_PATTERN_EDGE_MARGIN_PIXELS
+    return build_calibration_pattern(
+        projector_resolution,
+        usable_area=CoordinateBounds(
+            margin,
+            margin,
+            projector_resolution.width - margin,
+            projector_resolution.height - margin,
+        ),
+    )
 
 
 def _replace_metric_camera_id(

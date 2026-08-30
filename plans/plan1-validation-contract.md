@@ -30,7 +30,7 @@ Configuration is a single, standard-library-readable file with one overridable p
 
 ## Calibration contract
 
-- The pattern uses approximately 9–12 uniquely identified OpenCV-supported AprilTag-family markers, preferably `DICT_APRILTAG_36h11`, distributed across the usable projection area. Exact count/spacing remain tunable, but coverage must be recorded.
+- The pattern uses uniquely identified OpenCV-supported AprilTag-family markers, preferably `DICT_APRILTAG_36h11`, distributed across the usable projection area. Calibration may proceed with the configured minimum of 2 complete markers (8 corners), but spatial coverage and all other quality gates remain mandatory and coverage must be recorded.
 - Every valid detected marker contributes its four corners. Correspondences retain marker identity and corner ordering and are independent per camera.
 - Calibration uses OpenCV homography estimation with RANSAC, stores the inverse explicitly, and records unique tag count, correspondence-corner count, RANSAC inlier count/ratio, mean or median reprojection error, maximum reprojection error and a spatial coverage metric.
 - Quality thresholds are configuration, not scattered constants. A mathematically solvable but tightly clustered marker set is rejected as weak calibration. The valid region represents useful marker support, with only a small configurable margin.

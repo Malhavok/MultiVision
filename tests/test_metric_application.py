@@ -1,12 +1,17 @@
 import math
 import threading
+
+import numpy
 import time
 import unittest
 from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from multivision.application import MultiVisionService
+from multivision.application import (
+    MultiVisionService,
+    _select_stable_metric_frames,
+)
 from multivision.config import Configuration, ProjectorOutputDescriptor
 from multivision.errors import (
     CalibrationError,
@@ -94,6 +99,31 @@ class MetricApplicationTest(unittest.TestCase):
             service.calibrate_metric('camera-0', _build_correspondences(0.0))
 
         assert service.get_calibration_stage().value == 'METRIC_CALIBRATED'
+
+    def test_metric_capture_selects_a_white_balance_stable_frame_window(self) -> None:
+        frames = tuple(
+            Frame(
+                numpy.full((4, 4, 3), values, dtype=numpy.uint8),
+                frame_counter,
+                1.0,
+            )
+            for frame_counter, values in enumerate(
+                (
+                    (100, 100, 100),
+                    (120, 80, 100),
+                    (100, 100, 100),
+                    (101, 100, 100),
+                    (100, 101, 100),
+                ),
+                start=1,
+            )
+        )
+
+        selected = _select_stable_metric_frames(frames, 0.01)
+
+        assert [frame.frame_counter for frame in selected] == [3, 4, 5], (
+            f'{selected=}'
+        )
 
     def test_metric_capture_requires_a_calibration_for_the_current_output(self) -> None:
         runtime = MetricSessionRuntime()

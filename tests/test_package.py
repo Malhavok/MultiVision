@@ -136,6 +136,7 @@ class PackageTest(unittest.TestCase):
     def test_metric_configuration_rejects_invalid_values(self) -> None:
         invalid_values = {
             'ransac_reprojection_threshold_mm': [0, -1, math.nan, math.inf],
+            'max_capture_white_balance_delta': [0, -1, 1.1, math.nan, math.inf],
             'max_capture_corner_jitter_pixels': [0, -1, math.nan, math.inf],
             'max_mean_fit_error_mm': [-1, math.nan, math.inf],
             'max_fit_error_mm': [-1, math.nan, math.inf],

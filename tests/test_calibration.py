@@ -44,6 +44,24 @@ class CalibrationTest(unittest.TestCase):
         assert result.projector_to_camera != result.camera_to_projector, f'{result=}'
         assert is_point_in_region(Point2D(500, 400), result.valid_region), f'{result=}'
 
+    def test_two_well_spread_tags_are_sufficient_for_calibration(self) -> None:
+        pattern = build_calibration_pattern(Resolution(1000, 800))
+        source_to_camera = ((1.1, 0.05, 40), (0.02, 1.15, 30), (0.0002, 0.0001, 1))
+        all_correspondences = _correspondences(pattern, source_to_camera)
+        two_tag_correspondences = CameraCorrespondences(
+            tuple(
+                correspondence
+                for correspondence in all_correspondences.correspondences
+                if correspondence.marker_id in {0, len(pattern.markers) - 1}
+            ),
+            'camera-a',
+        )
+
+        result = calibrate_homography(two_tag_correspondences, pattern)
+
+        assert result.metrics.unique_tag_count == 2, f'{result.metrics=}'
+        assert result.metrics.correspondence_corner_count == 8, f'{result.metrics=}'
+
     def test_noisy_correspondences_are_accepted_with_quality_metrics(self) -> None:
         pattern = build_calibration_pattern(Resolution(1000, 800))
         source_to_camera = ((1.1, 0.05, 40), (0.02, 1.15, 30), (0.0002, 0.0001, 1))
