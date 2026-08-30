@@ -232,8 +232,10 @@ class ApiTest(unittest.TestCase):
                 json={'enabled': True},
             )
 
-        def without_volatile_frame_fields(response: object) -> dict[str, object]:
-            data = response.json()  # type: ignore[union-attr]
+        def without_volatile_frame_fields(
+            response: object | dict[str, object],
+        ) -> dict[str, object]:
+            data = response if isinstance(response, dict) else response.json()  # type: ignore[union-attr]
             return {
                 key: value
                 for key, value in data.items()
@@ -278,9 +280,9 @@ class ApiTest(unittest.TestCase):
 
         assert invalid_polygon_response.status_code == 422
         assert invalid_polygon_response.json()['error']['code'] == 'AVAILABLE_AREA_INVALID'
-        assert after_invalid_request == before_invalid_request, (
-            f'{after_invalid_request=}, {before_invalid_request=}'
-        )
+        assert without_volatile_frame_fields(after_invalid_request) == (
+            without_volatile_frame_fields(before_invalid_request)
+        ), f'{after_invalid_request=}, {before_invalid_request=}'
         assert close_response.status_code == 200
         assert unavailable_response.status_code == 503
         assert unavailable_response.json()['error']['code'] == 'CAMERA_UNAVAILABLE'

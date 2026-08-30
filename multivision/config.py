@@ -46,6 +46,33 @@ class CalibrationThresholds:
 
 
 @dataclass(frozen=True)
+class MetricCalibrationThresholds:
+    ransac_reprojection_threshold_mm: float = 3.0
+    max_capture_corner_jitter_pixels: float = 2.0
+    max_mean_fit_error_mm: float = 2.0
+    max_fit_error_mm: float = 5.0
+    min_inlier_ratio: float = 0.5
+    min_unique_target_fiducials: int = 4
+    min_spatial_coverage: float = 0.5
+
+    def __post_init__(self) -> None:
+        _validate_metric_thresholds(self)
+
+
+@dataclass(frozen=True)
+class ProjectorOutputDescriptor:
+    projector_resolution: Resolution
+    output_identity: str = 'default'
+
+    def __post_init__(self) -> None:
+        _validate_resolution(
+            self.projector_resolution,
+            'projector_output.projector_resolution',
+        )
+        _validate_output_identity(self.output_identity)
+
+
+@dataclass(frozen=True)
 class Configuration:
     projector_resolution: Resolution = field(
         default_factory=lambda: Resolution(1920, 1080),
@@ -54,28 +81,53 @@ class Configuration:
         default_factory=CalibrationThresholds,
     )
     calibration_version: int = 1
+    projector_output_identity: str = 'default'
+    metric_calibration_thresholds: MetricCalibrationThresholds = field(
+        default_factory=MetricCalibrationThresholds,
+    )
 
     def __post_init__(self) -> None:
         _validate_resolution(self.projector_resolution, 'projector_resolution')
+        _validate_output_identity(self.projector_output_identity)
         if not isinstance(self.calibration_thresholds, CalibrationThresholds):
             raise ConfigurationError('calibration_thresholds must be CalibrationThresholds')
+        if not isinstance(
+            self.metric_calibration_thresholds,
+            MetricCalibrationThresholds,
+        ):
+            raise ConfigurationError(
+                'metric_calibration_thresholds must be MetricCalibrationThresholds',
+            )
         _validate_positive_integer(self.calibration_version, 'calibration_version')
+
+    @property
+    def projector_output_descriptor(self) -> ProjectorOutputDescriptor:
+        return ProjectorOutputDescriptor(
+            self.projector_resolution,
+            self.projector_output_identity,
+        )
 
     @classmethod
     def from_data(
-        cls,
+        cls: type['Configuration'],
         data: Mapping[str, Any],
     ) -> 'Configuration':
         if not isinstance(data, Mapping):
             raise ConfigurationError('The configuration root must be an object')
 
         projector_resolution = _parse_resolution(data.get('projector_resolution', {}))
+        projector_output_identity = data.get('projector_output_identity', 'default')
         thresholds = _parse_thresholds(data.get('calibration_thresholds', {}))
+        metric_thresholds = _parse_metric_thresholds(
+            data.get('metric_calibration_thresholds', {}),
+        )
         calibration_version = data.get('calibration_version', 1)
 
         return cls(
             projector_resolution=projector_resolution,
+            projector_output_identity=projector_output_identity,
             calibration_thresholds=thresholds,
+            metric_calibration_thresholds=metric_thresholds,
             calibration_version=calibration_version,
         )
 
@@ -85,6 +137,7 @@ class Configuration:
                 'width': self.projector_resolution.width,
                 'height': self.projector_resolution.height,
             },
+            'projector_output_identity': self.projector_output_identity,
             'calibration_thresholds': {
                 'max_mean_reprojection_error': (
                     self.calibration_thresholds.max_mean_reprojection_error
@@ -94,6 +147,21 @@ class Configuration:
                 'min_unique_tags': self.calibration_thresholds.min_unique_tags,
                 'min_spatial_coverage': self.calibration_thresholds.min_spatial_coverage,
                 'valid_region_margin': self.calibration_thresholds.valid_region_margin,
+            },
+            'metric_calibration_thresholds': {
+                'ransac_reprojection_threshold_mm': (
+                    self.metric_calibration_thresholds.ransac_reprojection_threshold_mm
+                ),
+                'max_capture_corner_jitter_pixels': (
+                    self.metric_calibration_thresholds.max_capture_corner_jitter_pixels
+                ),
+                'max_mean_fit_error_mm': self.metric_calibration_thresholds.max_mean_fit_error_mm,
+                'max_fit_error_mm': self.metric_calibration_thresholds.max_fit_error_mm,
+                'min_inlier_ratio': self.metric_calibration_thresholds.min_inlier_ratio,
+                'min_unique_target_fiducials': (
+                    self.metric_calibration_thresholds.min_unique_target_fiducials
+                ),
+                'min_spatial_coverage': self.metric_calibration_thresholds.min_spatial_coverage,
             },
             'calibration_version': self.calibration_version,
         }
@@ -186,6 +254,41 @@ def _parse_resolution(data: Any) -> Resolution:
     return Resolution(width, height)
 
 
+def _parse_metric_thresholds(data: Any) -> MetricCalibrationThresholds:
+    if not isinstance(data, Mapping):
+        raise ConfigurationError('metric_calibration_thresholds must be an object')
+
+    defaults = MetricCalibrationThresholds()
+    values = {
+        'ransac_reprojection_threshold_mm': data.get(
+            'ransac_reprojection_threshold_mm',
+            defaults.ransac_reprojection_threshold_mm,
+        ),
+        'max_capture_corner_jitter_pixels': data.get(
+            'max_capture_corner_jitter_pixels',
+            defaults.max_capture_corner_jitter_pixels,
+        ),
+        'max_mean_fit_error_mm': data.get(
+            'max_mean_fit_error_mm',
+            defaults.max_mean_fit_error_mm,
+        ),
+        'max_fit_error_mm': data.get(
+            'max_fit_error_mm',
+            defaults.max_fit_error_mm,
+        ),
+        'min_inlier_ratio': data.get('min_inlier_ratio', defaults.min_inlier_ratio),
+        'min_unique_target_fiducials': data.get(
+            'min_unique_target_fiducials',
+            defaults.min_unique_target_fiducials,
+        ),
+        'min_spatial_coverage': data.get(
+            'min_spatial_coverage',
+            defaults.min_spatial_coverage,
+        ),
+    }
+    return MetricCalibrationThresholds(**values)
+
+
 def _parse_thresholds(data: Any) -> CalibrationThresholds:
     if not isinstance(data, Mapping):
         raise ConfigurationError('calibration_thresholds must be an object')
@@ -237,26 +340,74 @@ def _validate_resolution(value: Any, field_name: str) -> None:
 
 
 def _validate_thresholds(value: Any) -> None:
-    for field_name in (
-        'max_mean_reprojection_error',
-        'max_reprojection_error',
-        'min_inlier_ratio',
-        'min_spatial_coverage',
-        'valid_region_margin',
-    ):
-        field_value = getattr(value, field_name)
-        if not isinstance(field_value, (int, float)) or isinstance(field_value, bool):
-            raise ConfigurationError(f'{field_name} must be a number')
-        if not math.isfinite(field_value):
-            raise ConfigurationError(f'{field_name} must be finite')
-        if field_value < 0:
-            raise ConfigurationError(f'{field_name} must not be negative')
+    _validate_finite_non_negative_numbers(
+        value,
+        (
+            'max_mean_reprojection_error',
+            'max_reprojection_error',
+            'min_inlier_ratio',
+            'min_spatial_coverage',
+            'valid_region_margin',
+        ),
+    )
 
     _validate_positive_integer(value.min_unique_tags, 'min_unique_tags')
     if value.min_inlier_ratio > 1 or value.min_spatial_coverage > 1:
         raise ConfigurationError('ratio and coverage thresholds must be between 0 and 1')
     if value.valid_region_margin > 1:
         raise ConfigurationError('valid_region_margin must be between 0 and 1')
+
+
+def _validate_metric_thresholds(value: MetricCalibrationThresholds) -> None:
+    _validate_finite_non_negative_numbers(
+        value,
+        (
+            'ransac_reprojection_threshold_mm',
+            'max_capture_corner_jitter_pixels',
+            'max_mean_fit_error_mm',
+            'max_fit_error_mm',
+            'min_inlier_ratio',
+            'min_spatial_coverage',
+        ),
+    )
+
+    if value.ransac_reprojection_threshold_mm <= 0:
+        raise ConfigurationError(
+            'ransac_reprojection_threshold_mm must be positive',
+        )
+    if value.max_capture_corner_jitter_pixels <= 0:
+        raise ConfigurationError(
+            'max_capture_corner_jitter_pixels must be positive',
+        )
+    _validate_positive_integer(
+        value.min_unique_target_fiducials,
+        'min_unique_target_fiducials',
+    )
+    if value.min_inlier_ratio > 1 or value.min_spatial_coverage > 1:
+        raise ConfigurationError('ratio and coverage thresholds must be between 0 and 1')
+
+
+def _validate_finite_non_negative_numbers(
+    value: Any,
+    field_names: tuple[str, ...],
+) -> None:
+    for field_name in field_names:
+        field_value = getattr(value, field_name)
+        if not isinstance(field_value, (int, float)) or isinstance(field_value, bool):
+            raise ConfigurationError(f'{field_name} must be a number')
+        try:
+            is_finite = math.isfinite(field_value)
+        except (OverflowError, TypeError, ValueError):
+            is_finite = False
+        if not is_finite:
+            raise ConfigurationError(f'{field_name} must be finite')
+        if field_value < 0:
+            raise ConfigurationError(f'{field_name} must not be negative')
+
+
+def _validate_output_identity(value: Any) -> None:
+    if not isinstance(value, str) or len(value) == 0:
+        raise ConfigurationError('projector_output_identity must be a non-empty string')
 
 
 def _validate_positive_integer(value: Any, field_name: str) -> None:

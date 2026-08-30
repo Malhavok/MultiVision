@@ -21,16 +21,17 @@ from multivision.calibration import (
 from multivision.config import (
     DEFAULT_CONFIG_PATH,
     CalibrationThresholds,
+    ProjectorOutputDescriptor,
     _get_configuration_file_lock,
 )
 from multivision.errors import (
     CalibrationError,
+    ConfigurationError,
     GeometryError,
     InvalidCalibrationStateError,
     InvalidHomographyError,
 )
 from multivision.fiducials import CameraCorrespondences, FiducialCorrespondence
-from multivision.pattern import CalibrationPattern
 from multivision.geometry import (
     CoordinateBounds,
     MatrixLike,
@@ -44,6 +45,7 @@ from multivision.geometry import (
     validate_homography,
     validate_point_in_region,
 )
+from multivision.pattern import CalibrationPattern
 from multivision.types import (
     CalibrationStatus,
     Resolution,
@@ -59,6 +61,7 @@ class PersistedCalibration:
     camera_id: str
     camera_resolution: Resolution
     projector_resolution: Resolution
+    projector_output_descriptor: ProjectorOutputDescriptor
     version: int
     projector_to_camera: tuple[tuple[float, float, float], ...]
     camera_to_projector: tuple[tuple[float, float, float], ...]
@@ -77,10 +80,17 @@ class PersistedCalibration:
         metrics: CalibrationMetrics,
         timestamp: float,
         valid_region: RegionLike,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
+        projector_output_identity: str | None = None,
     ) -> None:
         _validate_camera_id(camera_id)
         _validate_resolution(camera_resolution, 'camera_resolution')
         _validate_resolution(projector_resolution, 'projector_resolution')
+        checked_projector_output_descriptor = _normalise_projector_output_descriptor(
+            projector_resolution,
+            projector_output_descriptor,
+            projector_output_identity,
+        )
         _validate_version(version)
         try:
             checked_projector_to_camera = validate_homography(projector_to_camera)
@@ -95,6 +105,11 @@ class PersistedCalibration:
         object.__setattr__(self, 'camera_id', camera_id)
         object.__setattr__(self, 'camera_resolution', camera_resolution)
         object.__setattr__(self, 'projector_resolution', projector_resolution)
+        object.__setattr__(
+            self,
+            'projector_output_descriptor',
+            checked_projector_output_descriptor,
+        )
         object.__setattr__(self, 'version', version)
         object.__setattr__(self, 'projector_to_camera', checked_projector_to_camera)
         object.__setattr__(self, 'camera_to_projector', checked_camera_to_projector)
@@ -106,6 +121,10 @@ class PersistedCalibration:
     def calibration_version(self) -> int:
         return self.version
 
+    @property
+    def projector_output_identity(self) -> str:
+        return self.projector_output_descriptor.output_identity
+
     @classmethod
     def from_result(
         cls,
@@ -115,6 +134,8 @@ class PersistedCalibration:
         version: int = 1,
         timestamp: float | None = None,
         camera_id: str | None = None,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
+        projector_output_identity: str | None = None,
     ) -> 'PersistedCalibration':
         if not isinstance(result, CalibrationResult):
             raise CalibrationError('result must be CalibrationResult')
@@ -131,6 +152,8 @@ class PersistedCalibration:
             result.metrics,
             time.time() if timestamp is None else timestamp,
             result.valid_region,
+            projector_output_descriptor,
+            projector_output_identity,
         )
 
     @classmethod
@@ -152,16 +175,26 @@ class PersistedCalibration:
         version = data.get('version', data.get('calibration_version'))
         if version is None:
             raise CalibrationError('Calibration record is missing required fields')
+        projector_resolution = _parse_resolution(
+            data['projector_resolution'],
+            'projector_resolution',
+        )
+        projector_output_descriptor = _parse_projector_output_descriptor_data(
+            data.get('projector_output_descriptor'),
+            projector_resolution,
+            data.get('projector_output_identity'),
+        )
         return cls(
             data['camera_id'],
             _parse_resolution(data['camera_resolution'], 'camera_resolution'),
-            _parse_resolution(data['projector_resolution'], 'projector_resolution'),
+            projector_resolution,
             version,
             data['projector_to_camera'],
             data['camera_to_projector'],
             _parse_metrics(data['metrics']),
             data['timestamp'],
             _parse_region(data['valid_region']),
+            projector_output_descriptor,
         )
 
     def to_data(self) -> dict[str, Any]:
@@ -169,6 +202,12 @@ class PersistedCalibration:
             'camera_id': self.camera_id,
             'camera_resolution': _resolution_to_data(self.camera_resolution),
             'projector_resolution': _resolution_to_data(self.projector_resolution),
+            'projector_output_descriptor': {
+                'projector_resolution': _resolution_to_data(
+                    self.projector_output_descriptor.projector_resolution,
+                ),
+                'output_identity': self.projector_output_descriptor.output_identity,
+            },
             'version': self.version,
             'projector_to_camera': [list(row) for row in self.projector_to_camera],
             'camera_to_projector': [list(row) for row in self.camera_to_projector],
@@ -291,10 +330,26 @@ class CalibrationRegistry:
         calibrations: Mapping[str, PersistedCalibration] | None = None,
         calibration_version: int = 1,
         projector_resolution: Resolution | None = None,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
     ) -> None:
         _validate_version(calibration_version)
         if projector_resolution is not None:
             _validate_resolution(projector_resolution, 'projector_resolution')
+        if projector_output_descriptor is not None and not isinstance(
+            projector_output_descriptor,
+            ProjectorOutputDescriptor,
+        ):
+            raise CalibrationError(
+                'projector_output_descriptor must be ProjectorOutputDescriptor',
+            )
+        if (
+            projector_output_descriptor is not None
+            and projector_resolution is not None
+            and projector_output_descriptor.projector_resolution != projector_resolution
+        ):
+            raise CalibrationError(
+                'projector_output_descriptor resolution does not match projector_resolution',
+            )
         if calibrations is None:
             initial_calibrations: Mapping[str, PersistedCalibration] = {}
         elif not isinstance(calibrations, Mapping):
@@ -314,6 +369,7 @@ class CalibrationRegistry:
         }
         self._calibration_version = calibration_version
         self._projector_resolution = projector_resolution
+        self._projector_output_descriptor = projector_output_descriptor
         self._statuses = {
             camera_id: CalibrationStatus.UNVERIFIED
             for camera_id in self._calibrations
@@ -326,10 +382,16 @@ class CalibrationRegistry:
         store: CalibrationStore,
         calibration_version: int = 1,
         projector_resolution: Resolution | None = None,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
     ) -> 'CalibrationRegistry':
         if not isinstance(store, CalibrationStore):
             raise CalibrationError('store must be CalibrationStore')
-        return cls(store.load(), calibration_version, projector_resolution)
+        return cls(
+            store.load(),
+            calibration_version,
+            projector_resolution,
+            projector_output_descriptor,
+        )
 
     @property
     def calibrations(self) -> dict[str, PersistedCalibration]:
@@ -375,6 +437,7 @@ class CalibrationRegistry:
         version: int | None = None,
         timestamp: float | None = None,
         camera_id: str | None = None,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
     ) -> PersistedCalibration:
         record = PersistedCalibration.from_result(
             result,
@@ -383,20 +446,39 @@ class CalibrationRegistry:
             self._calibration_version if version is None else version,
             timestamp,
             camera_id,
+            projector_output_descriptor or self._projector_output_descriptor,
         )
         with self._lock:
             self._calibrations[record.camera_id] = record
             self._statuses[record.camera_id] = CalibrationStatus.UNVERIFIED
         return record
 
+    def update_projector_descriptor(
+        self,
+        projector_output_descriptor: ProjectorOutputDescriptor,
+    ) -> None:
+        """Set the current output descriptor used for applicability checks."""
+        if not isinstance(projector_output_descriptor, ProjectorOutputDescriptor):
+            raise CalibrationError(
+                'projector_output_descriptor must be ProjectorOutputDescriptor',
+            )
+        with self._lock:
+            self._projector_output_descriptor = projector_output_descriptor
+            self._projector_resolution = projector_output_descriptor.projector_resolution
+            for camera_id, calibration in self._calibrations.items():
+                if calibration.projector_output_descriptor != projector_output_descriptor:
+                    self._statuses[camera_id] = CalibrationStatus.STALE
+
     def get_status_error_code(
         self,
         camera_id: str,
         camera_resolution: Resolution | None = None,
         projector_resolution: Resolution | None = None,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
     ) -> str:
         """Return the stable failure code for a calibration applicability check."""
         _validate_camera_id(camera_id)
+        _validate_optional_projector_descriptor(projector_output_descriptor)
         with self._lock:
             record = self._calibrations.get(camera_id)
             if record is None:
@@ -411,6 +493,9 @@ class CalibrationRegistry:
                 self._calibration_version,
                 camera_resolution,
                 effective_projector_resolution,
+                projector_output_descriptor
+                if projector_output_descriptor is not None
+                else self._projector_output_descriptor,
             )
             if applicability_error_code is not None:
                 return applicability_error_code
@@ -425,8 +510,10 @@ class CalibrationRegistry:
         camera_id: str,
         camera_resolution: Resolution | None = None,
         projector_resolution: Resolution | None = None,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
     ) -> CalibrationStatus:
         _validate_camera_id(camera_id)
+        _validate_optional_projector_descriptor(projector_output_descriptor)
         with self._lock:
             record = self._calibrations.get(camera_id)
             if record is None:
@@ -441,6 +528,9 @@ class CalibrationRegistry:
                 self._calibration_version,
                 camera_resolution,
                 effective_projector_resolution,
+                projector_output_descriptor
+                if projector_output_descriptor is not None
+                else self._projector_output_descriptor,
             ) is not None:
                 self._statuses[camera_id] = CalibrationStatus.STALE
             return self._statuses[camera_id]
@@ -453,8 +543,10 @@ class CalibrationRegistry:
         projector_resolution: Resolution | None = None,
         thresholds: CalibrationThresholds | None = None,
         pattern: CalibrationPattern | None = None,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
     ) -> CalibrationStatus:
         _validate_camera_id(camera_id)
+        _validate_optional_projector_descriptor(projector_output_descriptor)
         checked_thresholds = (
             thresholds
             if thresholds is not None
@@ -476,6 +568,9 @@ class CalibrationRegistry:
                 self._calibration_version,
                 camera_resolution,
                 effective_projector_resolution,
+                projector_output_descriptor
+                if projector_output_descriptor is not None
+                else self._projector_output_descriptor,
             ) is not None:
                 self._statuses[camera_id] = CalibrationStatus.STALE
                 return self._statuses[camera_id]
@@ -498,10 +593,17 @@ class CalibrationRegistry:
         point: Sequence[Real],
         camera_resolution: Resolution | None = None,
         projector_resolution: Resolution | None = None,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
     ) -> Point2D:
         _validate_camera_id(camera_id)
+        _validate_optional_projector_descriptor(projector_output_descriptor)
         with self._lock:
-            status = self.get_status(camera_id, camera_resolution, projector_resolution)
+            status = self.get_status(
+                camera_id,
+                camera_resolution,
+                projector_resolution,
+                projector_output_descriptor,
+            )
             if status is not CalibrationStatus.CALIBRATED:
                 error = InvalidCalibrationStateError(
                     f'Camera {camera_id!r} calibration is {status.value}',
@@ -510,6 +612,7 @@ class CalibrationRegistry:
                     camera_id,
                     camera_resolution,
                     projector_resolution,
+                    projector_output_descriptor,
                 )
                 raise error
             record = self._calibrations[camera_id]
@@ -636,11 +739,24 @@ def _are_inverse_matrices(
     )
 
 
+def _validate_optional_projector_descriptor(
+    projector_output_descriptor: ProjectorOutputDescriptor | None,
+) -> None:
+    if projector_output_descriptor is not None and not isinstance(
+        projector_output_descriptor,
+        ProjectorOutputDescriptor,
+    ):
+        raise CalibrationError(
+            'projector_output_descriptor must be ProjectorOutputDescriptor',
+        )
+
+
 def _applicability_error_code(
     record: PersistedCalibration,
     calibration_version: int,
     camera_resolution: Resolution | None,
     projector_resolution: Resolution | None,
+    projector_output_descriptor: ProjectorOutputDescriptor | None = None,
 ) -> str | None:
     if record.version != calibration_version:
         return 'CALIBRATION_STALE'
@@ -648,7 +764,94 @@ def _applicability_error_code(
         return 'CAMERA_RESOLUTION_CHANGED'
     if projector_resolution is not None and projector_resolution != record.projector_resolution:
         return 'PROJECTOR_RESOLUTION_CHANGED'
+    if (
+        projector_output_descriptor is not None
+        and projector_output_descriptor != record.projector_output_descriptor
+    ):
+        if (
+            projector_output_descriptor.projector_resolution
+            != record.projector_output_descriptor.projector_resolution
+        ):
+            return 'PROJECTOR_RESOLUTION_CHANGED'
+        return 'PROJECTOR_OUTPUT_CHANGED'
     return None
+
+
+def _normalise_projector_output_descriptor(
+    projector_resolution: Resolution,
+    projector_output_descriptor: ProjectorOutputDescriptor | None,
+    projector_output_identity: str | None,
+) -> ProjectorOutputDescriptor:
+    if projector_output_descriptor is not None and not isinstance(
+        projector_output_descriptor,
+        ProjectorOutputDescriptor,
+    ):
+        raise CalibrationError(
+            'projector_output_descriptor must be ProjectorOutputDescriptor',
+        )
+    if (
+        projector_output_descriptor is not None
+        and projector_output_identity is not None
+        and projector_output_descriptor.output_identity != projector_output_identity
+    ):
+        raise CalibrationError('Projector output descriptor values disagree')
+    if projector_output_descriptor is not None:
+        if projector_output_descriptor.projector_resolution != projector_resolution:
+            raise CalibrationError(
+                'Projector output descriptor resolution does not match calibration',
+            )
+        return projector_output_descriptor
+    try:
+        return ProjectorOutputDescriptor(
+            projector_resolution,
+            'default' if projector_output_identity is None else projector_output_identity,
+        )
+    except ConfigurationError as ex:
+        raise CalibrationError('Calibration projector descriptor is invalid') from ex
+
+
+def _parse_projector_output_descriptor_data(
+    data: Any,
+    projector_resolution: Resolution,
+    output_identity: Any,
+) -> ProjectorOutputDescriptor:
+    if data is None:
+        if output_identity is not None and not isinstance(output_identity, str):
+            raise CalibrationError('projector_output_identity must be a string')
+        try:
+            return _normalise_projector_output_descriptor(
+                projector_resolution,
+                None,
+                output_identity,
+            )
+        except (ConfigurationError, TypeError, ValueError) as ex:
+            raise CalibrationError('Calibration projector descriptor is invalid') from ex
+    if not isinstance(data, Mapping):
+        raise CalibrationError('Calibration projector descriptor must be an object')
+    descriptor_resolution_data = data.get(
+        'projector_resolution',
+        data.get('resolution'),
+    )
+    descriptor_resolution = (
+        projector_resolution
+        if descriptor_resolution_data is None
+        else _parse_resolution(
+            descriptor_resolution_data,
+            'projector_output_descriptor.projector_resolution',
+        )
+    )
+    descriptor_identity = data.get(
+        'output_identity',
+        data.get('identity', 'default'),
+    )
+    try:
+        return _normalise_projector_output_descriptor(
+            projector_resolution,
+            ProjectorOutputDescriptor(descriptor_resolution, descriptor_identity),
+            output_identity,
+        )
+    except (ConfigurationError, TypeError, ValueError) as ex:
+        raise CalibrationError('Calibration projector descriptor is invalid') from ex
 
 
 def _normalise_region(region: RegionLike) -> tuple[Point2D, ...]:

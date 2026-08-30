@@ -6,7 +6,7 @@ import math
 import threading
 import types
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     Any,
     Callable,
@@ -15,6 +15,7 @@ from typing import (
 )
 
 from multivision.calibration import CalibrationMetrics
+from multivision.config import ProjectorOutputDescriptor
 from multivision.errors import MultiVisionError
 from multivision.geometry import (
     CoordinateBounds,
@@ -22,6 +23,7 @@ from multivision.geometry import (
     PreviewTransform,
     build_preview_transform,
 )
+from multivision.metric import MetricCalibrationStatus
 from multivision.pattern import CalibrationPattern
 from multivision.service import RedCircleOverlay
 from multivision.session import SessionCamera
@@ -44,6 +46,10 @@ DARK_GREY = (35, 35, 35)
 GREEN = (85, 205, 115)
 ORANGE = (235, 175, 75)
 RED = (220, 75, 75)
+METRIC_RULER_COLOUR = WHITE
+METRIC_RULER_LINE_WIDTH = 2
+METRIC_RULER_MINOR_TICK_WIDTH = 1
+METRIC_RULER_MAJOR_TICK_WIDTH = 2
 
 
 class MarkerImageRenderer(Protocol):
@@ -81,9 +87,51 @@ class ProjectorAreaLike(Protocol):
     area_colour: tuple[int, int, int]
 
 
+class MetricRulerTickLike(Protocol):
+    is_major: bool
+    projector_start: Point2D
+    projector_end: Point2D
+
+
+class MetricRulerMarkerLike(Protocol):
+    projector_extent: Sequence[Point2D]
+
+
+class MetricRulerLike(Protocol):
+    projector_start: Point2D
+    projector_end: Point2D
+    ticks: Sequence[MetricRulerTickLike]
+    markers: Sequence[MetricRulerMarkerLike]
+    label: str
+    label_position: Point2D
+    label_bounds: CoordinateBounds
+
+
 class DisplayServiceLike(Protocol):
     @property
     def overlay(self) -> RedCircleOverlay | None:
+        ...
+
+    @property
+    def projector_output_descriptor(self) -> ProjectorOutputDescriptor:
+        ...
+
+    @property
+    def metric_state(self) -> MetricCalibrationStatus:
+        ...
+
+    def get_metric_status(self) -> MetricCalibrationStatus:
+        ...
+
+    @property
+    def metric_ruler(self) -> MetricRulerLike | None:
+        ...
+
+    @property
+    def metric_capture_active(self) -> bool:
+        ...
+
+    def mark_metric_capture_presented(self) -> None:
         ...
 
     def get_camera_statuses(self) -> list[CameraStatus]:
@@ -133,16 +181,38 @@ class _DisplayCamera(NamedTuple):
 
 @dataclass(frozen=True)
 class DisplayConfiguration:
-    """Window and output settings that do not belong to camera geometry."""
+    """Window settings plus the service-selected projector output descriptor."""
 
     window_resolution: Resolution = Resolution(1280, 720)
     projector_resolution: Resolution = Resolution(1920, 1080)
     frames_per_second: int = 30
     caption: str = 'MultiVision'
+    projector_output_descriptor: ProjectorOutputDescriptor | None = None
 
     def __post_init__(self) -> None:
         _validate_resolution(self.window_resolution, 'window_resolution')
-        _validate_resolution(self.projector_resolution, 'projector_resolution')
+        if self.projector_output_descriptor is not None:
+            if not isinstance(
+                self.projector_output_descriptor,
+                ProjectorOutputDescriptor,
+            ):
+                raise ValueError(
+                    'projector_output_descriptor must be ProjectorOutputDescriptor',
+                )
+            # The service descriptor is authoritative – callers need not duplicate
+            # its resolution in the display-only configuration.
+            object.__setattr__(
+                self,
+                'projector_resolution',
+                self.projector_output_descriptor.projector_resolution,
+            )
+        else:
+            _validate_resolution(self.projector_resolution, 'projector_resolution')
+            object.__setattr__(
+                self,
+                'projector_output_descriptor',
+                ProjectorOutputDescriptor(self.projector_resolution),
+            )
         if (
             not isinstance(self.frames_per_second, int)
             or isinstance(self.frames_per_second, bool)
@@ -260,6 +330,7 @@ class ProjectorRenderer:
         )
 
     def clear(self, surface: Any) -> None:
+        self._require_main_thread()
         surface.fill(BLACK)
 
     def render_calibration_pattern(
@@ -268,6 +339,7 @@ class ProjectorRenderer:
         pattern: CalibrationPattern,
     ) -> None:
         """Draw the known pattern in projector-native pixels only."""
+        self._require_main_thread()
         if not isinstance(pattern, CalibrationPattern):
             raise TypeError('pattern must be CalibrationPattern')
         surface.fill(WHITE)
@@ -300,6 +372,7 @@ class ProjectorRenderer:
         font: Any | None = None,
     ) -> None:
         """Draw the current enabled diagnostic areas in slot order."""
+        self._require_main_thread()
         if not isinstance(areas, Sequence) or isinstance(areas, (str, bytes)):
             raise TypeError('areas must be a sequence of projector areas')
         if font is None:
@@ -337,11 +410,96 @@ class ProjectorRenderer:
                 ),
             )
 
+    def render_metric_ruler(
+        self,
+        surface: Any,
+        ruler: MetricRulerLike | None,
+        font: Any | None = None,
+    ) -> None:
+        """Draw service-produced projector-native ruler primitives unchanged."""
+        self._require_main_thread()
+        if ruler is None:
+            return
+        if not isinstance(ruler.label, str):
+            raise TypeError('metric ruler labels must be strings')
+        if font is None:
+            font = self._pygame.font.Font(None, 16)
+        surface_size = _get_surface_size(surface, 0)
+        marker_points = tuple(
+            _round_projector_points(marker.projector_extent)
+            for marker in ruler.markers
+        )
+        projector_start = _round_projector_point(ruler.projector_start)
+        projector_end = _round_projector_point(ruler.projector_end)
+        tick_points = tuple(
+            (
+                _round_projector_point(tick.projector_start),
+                _round_projector_point(tick.projector_end),
+                METRIC_RULER_MAJOR_TICK_WIDTH
+                if tick.is_major
+                else METRIC_RULER_MINOR_TICK_WIDTH,
+            )
+            for tick in ruler.ticks
+        )
+        for points in marker_points:
+            _validate_raster_projector_points(
+                points,
+                surface_size,
+                METRIC_RULER_LINE_WIDTH,
+            )
+        _validate_raster_projector_points(
+            (projector_start, projector_end),
+            surface_size,
+            METRIC_RULER_LINE_WIDTH,
+        )
+        for tick_start, tick_end, line_width in tick_points:
+            _validate_raster_projector_points(
+                (tick_start, tick_end),
+                surface_size,
+                line_width,
+            )
+
+        for points in marker_points:
+            self._pygame.draw.polygon(
+                surface,
+                METRIC_RULER_COLOUR,
+                points,
+                METRIC_RULER_LINE_WIDTH,
+            )
+        self._pygame.draw.line(
+            surface,
+            METRIC_RULER_COLOUR,
+            projector_start,
+            projector_end,
+            METRIC_RULER_LINE_WIDTH,
+        )
+        for tick_start, tick_end, line_width in tick_points:
+            self._pygame.draw.line(
+                surface,
+                METRIC_RULER_COLOUR,
+                tick_start,
+                tick_end,
+                line_width,
+            )
+
+        label_surface = font.render(ruler.label, True, METRIC_RULER_COLOUR)
+        label_size = _get_surface_size(label_surface, 0)
+        label_left = round(ruler.label_position.x - label_size[0] / 2)
+        label_top = round(ruler.label_position.y - label_size[1] / 2)
+        surface.blit(
+            label_surface,
+            (
+                min(max(label_left, 0), max(0, surface_size[0] - label_size[0])),
+                min(max(label_top, 0), max(0, surface_size[1] - label_size[1])),
+            ),
+        )
+
     def render_overlay(
         self,
         surface: Any,
         overlay: RedCircleOverlay | None,
     ) -> None:
+        self._require_main_thread()
         if overlay is None:
             return
         if not isinstance(overlay, RedCircleOverlay):
@@ -352,6 +510,11 @@ class ProjectorRenderer:
             (round(overlay.projector_point.x), round(overlay.projector_point.y)),
             overlay.radius,
         )
+
+    @staticmethod
+    def _require_main_thread() -> None:
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError('Pygame display operations must run on the main thread')
 
 
 class PygameDisplayRuntime:
@@ -372,6 +535,14 @@ class PygameDisplayRuntime:
             configuration = DisplayConfiguration()
         if not isinstance(configuration, DisplayConfiguration):
             raise TypeError('configuration must be DisplayConfiguration')
+        self.service = service
+        service_descriptor = _get_service_projector_descriptor(service)
+        if service_descriptor is not None:
+            configuration = replace(
+                configuration,
+                projector_resolution=service_descriptor.projector_resolution,
+                projector_output_descriptor=service_descriptor,
+            )
         if calibration_pattern is not None and not isinstance(
             calibration_pattern,
             CalibrationPattern,
@@ -386,10 +557,16 @@ class PygameDisplayRuntime:
                 'calibration_pattern and configuration must use the same projector resolution',
             )
 
-        self.service = service
         self.configuration = configuration
+        self._projector_output_descriptor = (
+            service_descriptor
+            if service_descriptor is not None
+            else configuration.projector_output_descriptor
+        )
         self.calibration_pattern = calibration_pattern
         self._last_point_error: str | None = None
+        self._last_metric_error: str | None = None
+        self._last_projector_error: str | None = None
         self._pygame = pygame_module
         self._frame_surface_converter = (
             frame_surface_converter
@@ -422,6 +599,10 @@ class PygameDisplayRuntime:
     @property
     def projector_surface(self) -> Any | None:
         return self._projector_surface
+
+    @property
+    def projector_output_descriptor(self) -> ProjectorOutputDescriptor:
+        return self._projector_output_descriptor
 
     @property
     def preview_layouts(self) -> dict[str, CameraPreviewLayout]:
@@ -544,18 +725,27 @@ class PygameDisplayRuntime:
     def render_once(self) -> None:
         """Render one frame from current statuses and latest camera snapshots."""
         self._require_main_thread()
+        self._synchronise_projector_descriptor()
         self.initialise()
         assert self._window_surface is not None
         assert self._projector_surface is not None
         assert self._projector_renderer is not None
+        self._last_metric_error = None
+        self._last_projector_error = None
         self._window_surface.fill(DARK_GREY)
         display_cameras = self._get_display_cameras()
         self._preview_layouts = self._build_preview_layouts(display_cameras)
         pattern_visible = self.service.calibration_pattern_visible
         if not isinstance(pattern_visible, bool):
             raise TypeError('service returned an invalid calibration pattern state')
-        projector_areas = [] if pattern_visible else self._get_projector_areas()
-        if not pattern_visible:
+        metric_capture_active = self._get_metric_capture_active()
+        metric_state, metric_ruler = self._get_metric_snapshot()
+        projector_areas = (
+            []
+            if pattern_visible or metric_capture_active
+            else self._get_projector_areas()
+        )
+        if not pattern_visible and not metric_capture_active:
             self._area_colours = {
                 area.slot_id: area.area_colour
                 for area in projector_areas
@@ -569,25 +759,23 @@ class PygameDisplayRuntime:
                 area_colours.get(camera.slot_id),
             )
 
-        projector_is_ready = True
-        if self.calibration_pattern is None or not pattern_visible:
-            self._projector_renderer.clear(self._projector_surface)
-        else:
-            try:
+        try:
+            if metric_capture_active:
+                self._projector_renderer.clear(self._projector_surface)
+                mark_metric_capture_presented = getattr(
+                    self.service,
+                    'mark_metric_capture_presented',
+                    None,
+                )
+                if callable(mark_metric_capture_presented):
+                    mark_metric_capture_presented()
+            elif self.calibration_pattern is None or not pattern_visible:
+                self._projector_renderer.clear(self._projector_surface)
+            else:
                 self._projector_renderer.render_calibration_pattern(
                     self._projector_surface,
                     self.calibration_pattern,
                 )
-            except Exception as ex:  # noqa: BLE001 (Projector failures must not stop previews).
-                projector_is_ready = False
-                self._projector_renderer.clear(self._projector_surface)
-                self._draw_text(
-                    f'Projector unavailable: {ex}',
-                    8,
-                    8,
-                    RED,
-                )
-            else:
                 mark_pattern_presented = getattr(
                     self.service,
                     'mark_calibration_pattern_presented',
@@ -595,16 +783,39 @@ class PygameDisplayRuntime:
                 )
                 if callable(mark_pattern_presented):
                     mark_pattern_presented()
-        if projector_is_ready and not pattern_visible:
-            self._projector_renderer.render_areas(
-                self._projector_surface,
-                projector_areas,
-                self._projector_area_font,
-            )
-        if projector_is_ready:
-            self._projector_renderer.render_overlay(
-                self._projector_surface,
-                self.service.overlay,
+            if not pattern_visible and not metric_capture_active:
+                self._projector_renderer.render_areas(
+                    self._projector_surface,
+                    projector_areas,
+                    self._projector_area_font,
+                )
+                if metric_state is MetricCalibrationStatus.CALIBRATED:
+                    try:
+                        self._projector_renderer.render_metric_ruler(
+                            self._projector_surface,
+                            metric_ruler,
+                            self._font,
+                        )
+                    except Exception as ex:  # noqa: BLE001 (Bad metric snapshot).
+                        self._last_metric_error = f'Metric ruler unavailable: {ex}'
+                self._projector_renderer.render_overlay(
+                    self._projector_surface,
+                    self.service.overlay,
+                )
+        except Exception as ex:  # noqa: BLE001 (Projector failures must not stop previews).
+            self._last_projector_error = f'Projector unavailable: {ex}'
+            try:
+                self._projector_renderer.clear(self._projector_surface)
+            except Exception:  # noqa: BLE001 (The original projector failure is authoritative).
+                pass
+        if self._last_projector_error is not None:
+            self._draw_text(self._last_projector_error, 8, 8, RED)
+        if self._last_metric_error is not None:
+            self._draw_text(
+                self._last_metric_error,
+                8,
+                self.configuration.window_resolution.height - 38,
+                RED,
             )
         if self._last_point_error is not None:
             self._draw_text(
@@ -642,6 +853,8 @@ class PygameDisplayRuntime:
                 self._font = None
                 self._projector_area_font = None
                 self._area_colours = {}
+                self._last_projector_error = None
+                self._last_metric_error = None
                 self._is_initialised = False
         if output_error is not None:
             raise output_error
@@ -649,7 +862,12 @@ class PygameDisplayRuntime:
     def _present_projector_surface(self) -> None:
         if self._projector_output is None or self._projector_surface is None:
             return
-        self._projector_output.present(self._projector_surface)
+        try:
+            self._projector_output.present(self._projector_surface)
+        except Exception as ex:  # noqa: BLE001 (A projector seam must not stop the UI loop).
+            self._last_projector_error = f'Projector unavailable: {ex}'
+            if self._window_surface is not None and self._font is not None:
+                self._draw_text(self._last_projector_error, 8, 8, RED)
 
     def _render_camera_card(
         self,
@@ -872,6 +1090,83 @@ class PygameDisplayRuntime:
             raise TypeError('service returned an invalid projector area list')
         return areas
 
+    def _get_metric_capture_active(self) -> bool:
+        try:
+            metric_capture_active = getattr(self.service, 'metric_capture_active', False)
+        except Exception as ex:  # noqa: BLE001 (A display snapshot must not stop the UI loop).
+            self._last_metric_error = f'Metric capture state unavailable: {ex}'
+            return True
+        if not isinstance(metric_capture_active, bool):
+            self._last_metric_error = 'Metric capture state unavailable'
+            return True
+        return metric_capture_active
+
+    def _get_metric_snapshot(
+        self,
+    ) -> tuple[MetricCalibrationStatus, MetricRulerLike | None]:
+        try:
+            get_metric_status = getattr(self.service, 'get_metric_status', None)
+        except Exception as ex:  # noqa: BLE001 (Status is a display boundary).
+            self._last_metric_error = f'Metric status unavailable: {ex}'
+            return MetricCalibrationStatus.UNCALIBRATED, None
+        if callable(get_metric_status):
+            try:
+                raw_state = get_metric_status()
+            except Exception as ex:  # noqa: BLE001 (Status is a display boundary).
+                self._last_metric_error = f'Metric status unavailable: {ex}'
+                return MetricCalibrationStatus.UNCALIBRATED, None
+        else:
+            missing_state = object()
+            try:
+                raw_state = getattr(self.service, 'metric_state', missing_state)
+            except Exception as ex:  # noqa: BLE001 (Status is a display boundary).
+                self._last_metric_error = f'Metric status unavailable: {ex}'
+                return MetricCalibrationStatus.UNCALIBRATED, None
+            if raw_state is missing_state:
+                self._last_metric_error = 'Metric status unavailable'
+                return MetricCalibrationStatus.UNCALIBRATED, None
+        if not isinstance(raw_state, MetricCalibrationStatus):
+            self._last_metric_error = 'Metric status unavailable'
+            return MetricCalibrationStatus.UNCALIBRATED, None
+        if raw_state is not MetricCalibrationStatus.CALIBRATED:
+            return raw_state, None
+        try:
+            ruler = getattr(self.service, 'metric_ruler', None)
+        except Exception as ex:  # noqa: BLE001 (A bad snapshot must not stop the UI loop).
+            self._last_metric_error = f'Metric ruler unavailable: {ex}'
+            return raw_state, None
+        if ruler is None:
+            return raw_state, None
+        if not _is_metric_ruler_snapshot(ruler):
+            self._last_metric_error = 'Metric ruler unavailable'
+            return raw_state, None
+        return raw_state, ruler
+
+    def _synchronise_projector_descriptor(self) -> None:
+        descriptor = _get_service_projector_descriptor(self.service)
+        if descriptor is None or descriptor == self._projector_output_descriptor:
+            return
+        self._projector_output_descriptor = descriptor
+        self.configuration = replace(
+            self.configuration,
+            projector_resolution=descriptor.projector_resolution,
+            projector_output_descriptor=descriptor,
+        )
+        try:
+            calibration_pattern = getattr(self.service, 'calibration_pattern', None)
+        except Exception:  # noqa: BLE001 (A bad service pattern must not stop the UI loop).
+            calibration_pattern = None
+        self.calibration_pattern = (
+            calibration_pattern
+            if isinstance(calibration_pattern, CalibrationPattern)
+            else None
+        )
+        if not self._is_initialised:
+            return
+        self._projector_surface = self._get_pygame().Surface(
+            tuple(descriptor.projector_resolution),
+        )
+
     def _get_display_cameras(self) -> list[_DisplayCamera]:
         statuses = self.service.get_camera_statuses()
         if not isinstance(statuses, list):
@@ -1061,6 +1356,76 @@ def build_camera_preview_layouts(
     return layouts
 
 
+def _get_service_projector_descriptor(
+    service: object,
+) -> ProjectorOutputDescriptor | None:
+    try:
+        descriptor = getattr(service, 'projector_output_descriptor', None)
+    except Exception:  # noqa: BLE001 (A display snapshot must not stop the UI loop).
+        return None
+    if not isinstance(descriptor, ProjectorOutputDescriptor):
+        return None
+    return descriptor
+
+
+def _is_metric_ruler_snapshot(value: object) -> bool:
+    try:
+        projector_start = getattr(value, 'projector_start')
+        projector_end = getattr(value, 'projector_end')
+        label_position = getattr(value, 'label_position')
+        label_bounds = getattr(value, 'label_bounds')
+        if not _is_finite_display_point(projector_start):
+            return False
+        if not _is_finite_display_point(projector_end):
+            return False
+        if not isinstance(getattr(value, 'label'), str):
+            return False
+        if not isinstance(label_bounds, CoordinateBounds):
+            return False
+        if not _is_finite_display_point(label_position):
+            return False
+        if not all(_is_finite_display_number(bound) for bound in label_bounds):
+            return False
+        ticks = getattr(value, 'ticks')
+        markers = getattr(value, 'markers')
+        if not isinstance(ticks, Sequence) or not isinstance(markers, Sequence):
+            return False
+        if len(markers) != 2:
+            return False
+        if any(
+            not isinstance(getattr(tick, 'is_major'), bool)
+            or not _is_finite_display_point(getattr(tick, 'projector_start'))
+            or not _is_finite_display_point(getattr(tick, 'projector_end'))
+            for tick in ticks
+        ):
+            return False
+        return all(
+            isinstance(getattr(marker, 'projector_extent'), Sequence)
+            and len(getattr(marker, 'projector_extent')) >= 3
+            and all(
+                _is_finite_display_point(point)
+                for point in getattr(marker, 'projector_extent')
+            )
+            for marker in markers
+        )
+    except Exception:  # noqa: BLE001 (Malformed service snapshots are display input).
+        return False
+
+
+def _is_finite_display_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
+def _is_finite_display_point(value: object) -> bool:
+    return (
+        isinstance(value, Point2D)
+        and _is_finite_display_number(value.x)
+        and _is_finite_display_number(value.y)
+    )
+
+
 def _make_projector_output(
     pygame_module: Any,
     configuration: DisplayConfiguration,
@@ -1138,6 +1503,36 @@ def _render_apriltag_image(
     quiet_surface.fill(WHITE)
     quiet_surface.blit(marker_surface, (quiet_zone, quiet_zone))
     return quiet_surface
+
+
+def _round_projector_point(point: Point2D) -> tuple[int, int]:
+    if not isinstance(point, Point2D):
+        raise TypeError('projector primitive points must be Point2D values')
+    return round(point.x), round(point.y)
+
+
+def _round_projector_points(points: Sequence[Point2D]) -> tuple[tuple[int, int], ...]:
+    if len(points) < 3:
+        raise ValueError('projector marker primitives must contain at least three points')
+    return tuple(_round_projector_point(point) for point in points)
+
+
+def _validate_raster_projector_points(
+    points: Sequence[tuple[int, int]],
+    surface_size: tuple[int, int],
+    line_width: int = 1,
+) -> None:
+    if surface_size[0] <= 0 or surface_size[1] <= 0:
+        raise ValueError('projector surface must have a positive size')
+    if line_width <= 0:
+        raise ValueError('metric ruler line width must be positive')
+    raster_margin = math.ceil(line_width / 2)
+    if any(
+        not raster_margin <= x_pos < surface_size[0] - raster_margin
+        or not raster_margin <= y_pos < surface_size[1] - raster_margin
+        for x_pos, y_pos in points
+    ):
+        raise ValueError('metric ruler primitive is outside the projector surface')
 
 
 def _get_surface_size(surface: Any, fallback_size: int) -> tuple[int, int]:
@@ -1275,10 +1670,14 @@ def _validate_resolution(resolution: object, field_name: str) -> None:
 
 __all__ = [
     'BLACK',
+    'METRIC_RULER_COLOUR',
     'CameraPreviewLayout',
     'DisplayConfiguration',
     'FrameSurfaceConverter',
     'MarkerImageRenderer',
+    'MetricRulerLike',
+    'MetricRulerMarkerLike',
+    'MetricRulerTickLike',
     'DisplayServiceLike',
     'ProjectorAreaLike',
     'ProjectorOutput',

@@ -313,3 +313,184 @@ physical plan2 or plan3 acceptance until this procedure has been run on the
 target Mac with the actual cameras and projector/display and the observations
 have been recorded. Deterministic tests and fake-device runs do not substitute
 for that record or claim any hardware-only result.
+
+## Plan4 metric hardware procedure
+
+This is a separate physical procedure for Plan4 metric calibration. Run it on
+the target Mac with the intended projector/display, tabletop, at least two
+identified cameras and a physical ruler. The requirements and evidence boundary
+are in the [Plan4 validation contract](../plans/plan4-validation-contract.md).
+Do not mix these observations with the Plan2/Plan3 checks above: a passing
+camera calibration, generated SVG, API response or synthetic test is not
+physical evidence of metric accuracy.
+
+### 1. Generate and verify the printed target
+
+From the project root, generate the target before starting metric calibration:
+
+```sh
+PYTHON="$PWD/.venv/bin/python"
+TARGET="$PWD/metric-target.svg"
+"$PYTHON" -m multivision.cli metric target generate --output "$TARGET"
+```
+
+Record the generated path, target format/version and marker family from the
+artifact or later metric status response. Print the SVG with **100% / Actual
+size** selected. Disable `Fit to page`, printer scaling, browser scaling and
+any other automatic resizing. Do not treat the SVG dimensions as proof that the
+printer preserved them.
+
+Before continuing, place a physical ruler on the printed reference segment and
+record:
+
+```text
+expected reference: 100.0 mm
+measured printed reference: ______ mm
+printing deviation: ______ mm
+printer/model and actual-size setting: ____________________
+```
+
+If the printed reference is not 100.0 mm within the agreed physical tolerance,
+stop and reprint it correctly. Do not calibrate with a scaled sheet or silently
+fold its scale error into the projector calibration.
+
+### 2. Place the target and calibrate the shared metric surface
+
+Use the same running service and camera slots identified from the startup
+snapshot. Confirm with `cameras list` and `calibration status` that the selected
+observation camera is `OPEN`/`AVAILABLE`, has a currently `CALIBRATED`
+camera-to-projector calibration, and uses the current projector resolution and
+logical output identity. Record the camera slot and its physical description;
+the metric transform is shared and is not owned by this camera.
+
+Lay the verified target flat on the tabletop, fully within the intended useful
+surface, and leave it there. Do not move, rotate, lift or realign it after this
+point. Ensure the target is visible to the selected camera and do not manually
+add projector marks to the capture. Start the metric capture:
+
+```sh
+CAMERA=camera-0                 # replace with the identified calibrated slot
+"$PYTHON" -m multivision.cli metric calibrate --camera "$CAMERA"
+"$PYTHON" -m multivision.cli metric status
+```
+
+The service should blank the normal projector layers, acknowledge that blank
+frame, settle, and accept three consecutive target observations without target
+movement or disagreement. Record the result only if it is `CALIBRATED`,
+including all of the following from `metric status`:
+
+```text
+observation camera slot/generation: ____________________
+target format/version and marker family: _______________
+unique target markers and correspondence corners: _______
+RANSAC inliers and inlier ratio: _______________________
+mean fit error (mm) and maximum fit error (mm): ________
+spatial coverage: ______________________________________
+projector resolution/output identity: _________________
+```
+
+A failed or unstable capture is a failed attempt, not evidence of accuracy.
+Retry only after correcting the physical setup; do not restore an older metric
+record or move the sheet during a capture.
+
+### 3. Project and physically measure rulers
+
+Use surface-mm coordinates accepted by the service. Choose several safe pairs
+whose projected endpoints are visible, then deliberately cover separated
+positions and orientations: for example, horizontal segments on opposite sides,
+a vertical segment, a diagonal segment and segments whose line, ticks and end
+markers lie near different intended usable-area edges. The examples below are
+only a shape guide; choose coordinates appropriate to the placed target and
+projector bounds.
+
+For each ruler, request the line and optionally record the independent physical
+measurement in the same command:
+
+```sh
+"$PYTHON" -m multivision.cli metric ruler \\
+  --from-mm X1,Y1 --to-mm X2,Y2 --unit mm \\
+  --observed-length MEASURED --observed-unit mm
+```
+
+Use `cm` or `in` for `--unit` on at least one check if those display units are
+part of the intended use. Put a physical ruler against each projected line,
+measure the distance between its projected start and end markers, and record a
+row for every position/orientation/edge case:
+
+```text
+ruler id | surface endpoints | display unit | requested length (mm)
+         | measured length (mm) | absolute error (mm) | position/orientation/edge notes
+```
+
+The requested length comes from the two surface endpoints. The absolute error
+must be the independently measured value compared with that request; it must
+not be copied from `fit_error_mm`. If a request would put any line, tick or
+marker outside the projector bounds, expect an explicit failure and choose a
+safe geometry rather than accepting clipped or approximated output.
+
+### 4. Verify another camera consumes the shared transform
+
+Select a second physical camera with its own currently valid camera/projector
+calibration. Do not run `metric calibrate` for it and do not create a second
+metric transform. Keep the shared ruler visible, use the second camera's live
+preview or camera-native point operation to identify the same physical endpoint
+or surface location, and confirm that its projected point agrees with the
+existing ruler. Then run `metric status` again and record that the same single
+metric record, target version and transform remain in use; the observation-camera
+field remains provenance for the original calibration, not camera-owned metric
+state.
+
+### 5. Clear and deliberately invalidate metric calibration
+
+First check explicit clearing in the same running session:
+
+```sh
+"$PYTHON" -m multivision.cli metric clear
+"$PYTHON" -m multivision.cli metric status
+"$PYTHON" -m multivision.cli metric ruler \\
+  --from-mm 100,100 --to-mm 200,100 --unit mm
+```
+
+Record `UNCALIBRATED`, the absence of a ruler, and the structured
+`METRIC_UNAVAILABLE` failure. Run `metric clear` a second time to check that
+clear is idempotent. No old transform or projected ruler may remain usable.
+
+To exercise the separate stale path, re-establish a fresh calibrated metric
+record, then, **without restarting the service**, use the supported same-process
+projector descriptor control to change the projector resolution or logical
+output identity. A restart is not a substitute: it produces a fresh
+`UNCALIBRATED` session rather than testing descriptor invalidation. Record that
+both camera and metric geometry are invalidated atomically:
+
+```text
+metric status: STALE
+camera calibration status: STALE / not spatially usable
+ruler: removed
+```
+
+Attempt both a metric ruler request and a camera-dependent metric recalibration.
+Each must fail closed with an explicit stale/calibration error, and no stale
+transform may be projected. If the target hardware build does not expose the
+same-process descriptor control, record this stale check as **not exercised**
+rather than claiming it passed or simulating it with a mock.
+
+### 6. Keep physical evidence separate from synthetic tests
+
+Maintain two separate records. The physical record contains the printer
+settings and measured 100-mm reference, target placement, camera identities,
+fit/status output, every physical ruler measurement and the clear/invalidation
+observations above. The synthetic record may contain only deterministic software
+checks, for example:
+
+```sh
+"$PYTHON" -m pytest
+```
+
+Synthetic tests can establish target geometry, homography behaviour, unit
+conversion, state transitions and raster-safe rendering. They cannot establish
+that the printer produced a 1:1 target, that the sheet was flat or stationary,
+that the projector/table/camera geometry was physically unchanged, or that a
+projected ruler matches a physical ruler. Do not claim hardware accuracy from
+code, generated SVGs, screenshots, API responses, fake cameras/projectors or
+mocks. This procedure records no manual or external check as passed until the
+actual observations have been run and attached to the physical record.

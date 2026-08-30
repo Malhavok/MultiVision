@@ -20,6 +20,8 @@ from multivision.geometry import (
     CoordinateBounds,
     HomographyPair,
     Point2D,
+    calculate_convex_hull,
+    calculate_polygon_area,
     is_finite_point,
     is_point_in_bounds,
     is_point_in_resolution,
@@ -118,8 +120,8 @@ def calibrate_homography(
         raise CalibrationError(
             'Correspondences contain camera points outside the native resolution',
         )
-    projector_hull = _convex_hull(projector_points)
-    if len(projector_hull) < 3 or len(_convex_hull(camera_points)) < 3:
+    projector_hull = calculate_convex_hull(projector_points)
+    if len(projector_hull) < 3 or len(calculate_convex_hull(camera_points)) < 3:
         raise CalibrationError('Correspondences must span two-dimensional regions')
     initial_spatial_coverage = _calculate_spatial_coverage(projector_hull, pattern)
     if initial_spatial_coverage < checked_thresholds.min_spatial_coverage:
@@ -174,8 +176,8 @@ def calibrate_homography(
         for point, is_inlier in zip(camera_points, inlier_mask)
         if is_inlier
     )
-    projector_hull = _convex_hull(inlier_projector_points)
-    camera_hull = _convex_hull(inlier_camera_points)
+    projector_hull = calculate_convex_hull(inlier_projector_points)
+    camera_hull = calculate_convex_hull(inlier_camera_points)
     if len(projector_hull) < 3 or len(camera_hull) < 3:
         raise CalibrationError('RANSAC inliers must span two-dimensional regions')
 
@@ -287,7 +289,7 @@ def _validate_pattern(pattern: CalibrationPattern) -> None:
                 for corner in marker.corners
             )
             or len(set(marker.corners)) != 4
-            or not math.isfinite(marker_area := _polygon_area(marker.corners))
+            or not math.isfinite(marker_area := calculate_polygon_area(marker.corners))
             or marker_area <= 0
         ):
             raise CalibrationError('pattern contains an invalid marker')
@@ -383,7 +385,7 @@ def _calculate_spatial_coverage(
     )
     if not math.isfinite(usable_area_size) or usable_area_size <= 0:
         raise CalibrationError('Calibration usable area has an invalid size')
-    spatial_coverage = _polygon_area(projector_hull) / usable_area_size
+    spatial_coverage = calculate_polygon_area(projector_hull) / usable_area_size
     if not math.isfinite(spatial_coverage):
         raise CalibrationError('Calibration spatial coverage is not finite')
     return spatial_coverage
@@ -468,25 +470,6 @@ def _calculate_reprojection_errors(
     return tuple(errors)
 
 
-def _convex_hull(points: Sequence[Point2D]) -> tuple[Point2D, ...]:
-    unique_points = sorted(set(points))
-    if len(unique_points) < 3:
-        return tuple(unique_points)
-
-    lower: list[Point2D] = []
-    for point in unique_points:
-        while len(lower) >= 2 and _cross_product(lower[-2], lower[-1], point) <= 0:
-            lower.pop()
-        lower.append(point)
-
-    upper: list[Point2D] = []
-    for point in reversed(unique_points):
-        while len(upper) >= 2 and _cross_product(upper[-2], upper[-1], point) <= 0:
-            upper.pop()
-        upper.append(point)
-    return tuple(lower[:-1] + upper[:-1])
-
-
 def _expand_convex_hull(
     hull: Sequence[Point2D],
     margin: float,
@@ -505,24 +488,6 @@ def _expand_convex_hull(
     if any(not is_finite_point(point) for point in expanded_hull):
         raise CalibrationError('Calibration valid region is not finite')
     return expanded_hull
-
-
-def _cross_product(first: Point2D, second: Point2D, third: Point2D) -> float:
-    return (
-        (second.x - first.x) * (third.y - first.y)
-        - (second.y - first.y) * (third.x - first.x)
-    )
-
-
-def _polygon_area(polygon: Sequence[Point2D]) -> float:
-    return abs(
-        sum(
-            polygon[idx].x * polygon[(idx + 1) % len(polygon)].y
-            - polygon[(idx + 1) % len(polygon)].x * polygon[idx].y
-            for idx in range(len(polygon))
-        )
-        / 2
-    )
 
 
 __all__ = [

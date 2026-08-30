@@ -1,9 +1,11 @@
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from multivision.application import CameraArea
 from multivision.calibration import CalibrationMetrics
+from multivision.config import ProjectorOutputDescriptor
 from multivision.display import (
     BLACK,
     DisplayConfiguration,
@@ -13,6 +15,7 @@ from multivision.display import (
     build_camera_preview_layouts,
 )
 from multivision.geometry import CoordinateBounds, Point2D
+from multivision.metric import MetricCalibrationStatus, build_metric_ruler
 from multivision.pattern import build_calibration_pattern
 from multivision.service import RedCircleOverlay
 from multivision.session import SessionCameraRegistry
@@ -92,6 +95,7 @@ class FakePygame:
         self.draw = SimpleNamespace(
             rect=lambda *arguments: self.draw_calls.append(('rect', arguments)),
             polygon=lambda *arguments: self.draw_calls.append(('polygon', arguments)),
+            line=lambda *arguments: self.draw_calls.append(('line', arguments)),
             circle=lambda *arguments: self.draw_calls.append(('circle', arguments)),
         )
         self.transform = SimpleNamespace(
@@ -152,6 +156,18 @@ class AreaDisplayService(FakeCameraRuntime):
 
     def get_camera_areas(self) -> list[CameraArea]:
         return self.areas
+
+
+class MetricDisplayService(AreaDisplayService):
+    def __init__(self, ruler: object | None, areas: list[CameraArea]) -> None:
+        super().__init__(areas)
+        self.metric_ruler = ruler
+        self.metric_state = MetricCalibrationStatus.CALIBRATED
+        self.metric_capture_active = False
+        self.metric_capture_presented_count = 0
+
+    def mark_metric_capture_presented(self) -> None:
+        self.metric_capture_presented_count += 1
 
 
 class SessionDisplayService:
@@ -745,6 +761,420 @@ class DisplayTest(unittest.TestCase):
         ProjectorRenderer(pygame_module).render_areas(surface, [area])
 
         assert pygame_module.font_sizes == [48], f'{pygame_module.font_sizes=}'
+
+    def test_metric_ruler_renderer_draws_projector_primitives_and_explicit_label(self) -> None:
+        pygame_module = FakePygame()
+        surface = FakeSurface((200, 100))
+        ruler = build_metric_ruler(
+            (20.0, 50.0),
+            (80.0, 50.0),
+            'mm',
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            Resolution(200, 100),
+        )
+
+        ProjectorRenderer(pygame_module).render_metric_ruler(surface, ruler)
+
+        assert [call[0] for call in pygame_module.draw_calls] == [
+            'polygon',
+            'polygon',
+            'line',
+            *(['line'] * len(ruler.ticks)),
+        ], f'{pygame_module.draw_calls=}'
+        assert pygame_module.rendered_text == ['60.0 mm'], (
+            f'{pygame_module.rendered_text=}'
+        )
+        assert not any(call[0] == 'circle' for call in pygame_module.draw_calls)
+        for call in pygame_module.draw_calls:
+            points = call[1][2] if call[0] == 'polygon' else call[1][2:4]
+            assert all(
+                0 <= x_pos < surface.size[0] and 0 <= y_pos < surface.size[1]
+                for x_pos, y_pos in points
+            ), f'{call=}'
+        assert surface.blits[0][1] == (50, 50), f'{surface.blits=}'
+
+    def test_metric_ruler_renderer_rejects_non_raster_safe_primitives(self) -> None:
+        pygame_module = FakePygame()
+        surface = FakeSurface((200, 100))
+        ruler = build_metric_ruler(
+            (20.0, 50.0),
+            (80.0, 50.0),
+            'mm',
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            Resolution(200, 100),
+        )._replace(projector_start=Point2D(-1.0, 50.0))
+
+        with self.assertRaises(ValueError):
+            ProjectorRenderer(pygame_module).render_metric_ruler(surface, ruler)
+
+        assert pygame_module.draw_calls == [], f'{pygame_module.draw_calls=}'
+        assert surface.blits == [], f'{surface.blits=}'
+
+    def test_metric_ruler_renderer_is_main_thread_only(self) -> None:
+        pygame_module = FakePygame()
+        ruler = build_metric_ruler(
+            (20.0, 50.0),
+            (80.0, 50.0),
+            'cm',
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            Resolution(200, 100),
+        )
+        errors: list[BaseException] = []
+
+        def render_from_worker() -> None:
+            try:
+                ProjectorRenderer(pygame_module).render_metric_ruler(
+                    FakeSurface((200, 100)),
+                    ruler,
+                )
+            except BaseException as ex:
+                errors.append(ex)
+
+        worker = threading.Thread(target=render_from_worker)
+        worker.start()
+        worker.join()
+
+        assert len(errors) == 1, f'{errors=}'
+        assert isinstance(errors[0], RuntimeError), f'{errors=}'
+
+    def test_projector_ruler_is_ordered_between_areas_and_point_overlay(self) -> None:
+        ruler = build_metric_ruler(
+            (20.0, 50.0),
+            (80.0, 50.0),
+            'mm',
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            Resolution(200, 100),
+        )
+        service = MetricDisplayService(
+            ruler,
+            [
+                CameraArea(
+                    'camera-0',
+                    'overhead',
+                    True,
+                    (Point2D(10, 20), Point2D(100, 20), Point2D(100, 80)),
+                    (70, 190, 255),
+                ),
+            ],
+        )
+        service.overlay = RedCircleOverlay(
+            'overhead',
+            'overhead-device',
+            Point2D(1, 2),
+            Point2D(150, 50),
+        )
+        pygame_module = FakePygame()
+        display_runtime = PygameDisplayRuntime(
+            service,
+            DisplayConfiguration(projector_resolution=Resolution(200, 100)),
+            pygame_module=pygame_module,
+            frame_surface_converter=lambda _frame, _pygame: FakeSurface((1, 1)),
+        )
+
+        display_runtime.render_once()
+
+        projector_draw_calls = [
+            call
+            for call in pygame_module.draw_calls
+            if call[1][0] is display_runtime.projector_surface
+        ]
+        assert projector_draw_calls[0][0] == 'polygon', f'{projector_draw_calls=}'
+        assert projector_draw_calls[1][0:1] == ('polygon',), f'{projector_draw_calls=}'
+        assert projector_draw_calls[3][0] == 'line', f'{projector_draw_calls=}'
+        assert projector_draw_calls[-1][0] == 'circle', f'{projector_draw_calls=}'
+
+    def test_projector_normal_layers_are_suppressed_during_metric_blank_capture(self) -> None:
+        ruler = build_metric_ruler(
+            (20.0, 50.0),
+            (80.0, 50.0),
+            'mm',
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            Resolution(200, 100),
+        )
+        service = MetricDisplayService(
+            ruler,
+            [
+                CameraArea(
+                    'camera-0',
+                    'overhead',
+                    True,
+                    (Point2D(10, 20), Point2D(100, 20), Point2D(100, 80)),
+                    (70, 190, 255),
+                ),
+            ],
+        )
+        service.overlay = RedCircleOverlay(
+            'overhead',
+            'overhead-device',
+            Point2D(1, 2),
+            Point2D(150, 50),
+        )
+        service.metric_capture_active = True
+        pygame_module = FakePygame()
+        display_runtime = PygameDisplayRuntime(
+            service,
+            DisplayConfiguration(projector_resolution=Resolution(200, 100)),
+            pygame_module=pygame_module,
+            frame_surface_converter=lambda _frame, _pygame: FakeSurface((1, 1)),
+        )
+
+        display_runtime.render_once()
+
+        projector_draw_calls = [
+            call
+            for call in pygame_module.draw_calls
+            if call[1][0] is display_runtime.projector_surface
+        ]
+        assert projector_draw_calls == [], f'{projector_draw_calls=}'
+        assert display_runtime.projector_surface.fills == [BLACK]
+        assert service.metric_capture_presented_count == 1
+
+    def test_projector_ruler_is_suppressed_during_camera_calibration(self) -> None:
+        ruler = build_metric_ruler(
+            (20.0, 50.0),
+            (80.0, 50.0),
+            'in',
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            Resolution(200, 100),
+        )
+        service = MetricDisplayService(ruler, [])
+        service.calibration_pattern_visible = True
+        pygame_module = FakePygame()
+        pattern = build_calibration_pattern(Resolution(200, 100))
+        display_runtime = PygameDisplayRuntime(
+            service,
+            DisplayConfiguration(projector_resolution=Resolution(200, 100)),
+            calibration_pattern=pattern,
+            pygame_module=pygame_module,
+            marker_image_renderer=lambda _family, _id, size, _pygame: FakeSurface(
+                (size, size),
+            ),
+        )
+
+        display_runtime.render_once()
+
+        projector_draw_calls = [
+            call
+            for call in pygame_module.draw_calls
+            if call[1][0] is display_runtime.projector_surface
+        ]
+        assert projector_draw_calls == [], f'{projector_draw_calls=}'
+        assert '2.4 in' not in pygame_module.rendered_text, (
+            f'{pygame_module.rendered_text=}'
+        )
+
+    def test_metric_state_is_fail_closed_when_missing_or_stale(self) -> None:
+        ruler = build_metric_ruler(
+            (20.0, 50.0),
+            (80.0, 50.0),
+            'mm',
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            Resolution(200, 100),
+        )
+        service = MetricDisplayService(ruler, [])
+        pygame_module = FakePygame()
+        display_runtime = PygameDisplayRuntime(
+            service,
+            DisplayConfiguration(projector_resolution=Resolution(200, 100)),
+            pygame_module=pygame_module,
+        )
+
+        del service.metric_state
+        display_runtime.render_once()
+        assert '60.0 mm' not in pygame_module.rendered_text
+
+        service.metric_state = MetricCalibrationStatus.STALE
+        display_runtime.render_once()
+        assert '60.0 mm' not in pygame_module.rendered_text
+
+    def test_malformed_metric_ruler_does_not_clear_other_projector_layers(self) -> None:
+        service = MetricDisplayService(
+            build_metric_ruler(
+                (20.0, 50.0),
+                (80.0, 50.0),
+                'mm',
+                ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+                Resolution(200, 100),
+            )._replace(projector_start=Point2D(float('nan'), 50.0)),
+            [],
+        )
+        service.overlay = RedCircleOverlay(
+            'overhead',
+            'overhead-device',
+            Point2D(1, 2),
+            Point2D(150, 50),
+        )
+        pygame_module = FakePygame()
+        display_runtime = PygameDisplayRuntime(
+            service,
+            DisplayConfiguration(projector_resolution=Resolution(200, 100)),
+            pygame_module=pygame_module,
+        )
+
+        display_runtime.render_once()
+
+        projector_draw_calls = [
+            call
+            for call in pygame_module.draw_calls
+            if call[1][0] is display_runtime.projector_surface
+        ]
+        assert [call[0] for call in projector_draw_calls] == ['circle']
+        assert 'Metric ruler unavailable' in pygame_module.rendered_text
+
+    def test_metric_render_failure_preserves_point_overlay(self) -> None:
+        service = MetricDisplayService(
+            build_metric_ruler(
+                (20.0, 50.0),
+                (80.0, 50.0),
+                'mm',
+                ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+                Resolution(200, 100),
+            ),
+            [],
+        )
+        service.overlay = RedCircleOverlay(
+            'overhead',
+            'overhead-device',
+            Point2D(1, 2),
+            Point2D(150, 50),
+        )
+        pygame_module = FakePygame()
+        display_runtime = PygameDisplayRuntime(
+            service,
+            DisplayConfiguration(projector_resolution=Resolution(200, 100)),
+            pygame_module=pygame_module,
+        )
+
+        with patch(
+            'multivision.display.ProjectorRenderer.render_metric_ruler',
+            side_effect=RuntimeError('malformed ruler'),
+        ):
+            display_runtime.render_once()
+
+        projector_draw_calls = [
+            call
+            for call in pygame_module.draw_calls
+            if call[1][0] is display_runtime.projector_surface
+        ]
+        assert [call[0] for call in projector_draw_calls] == ['circle']
+        assert 'Metric ruler unavailable: malformed ruler' in pygame_module.rendered_text
+        assert 'Projector unavailable: malformed ruler' not in pygame_module.rendered_text
+
+    def test_projector_descriptor_change_updates_surface_and_suppresses_stale_ruler(self) -> None:
+        service = MetricDisplayService(
+            build_metric_ruler(
+                (20.0, 50.0),
+                (80.0, 50.0),
+                'mm',
+                ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+                Resolution(200, 100),
+            ),
+            [],
+        )
+        service.projector_output_descriptor = ProjectorOutputDescriptor(
+            Resolution(200, 100),
+            'projector-a',
+        )
+        service.metric_state = MetricCalibrationStatus.CALIBRATED
+        pygame_module = FakePygame()
+        display_runtime = PygameDisplayRuntime(
+            service,
+            DisplayConfiguration(projector_resolution=Resolution(200, 100)),
+            pygame_module=pygame_module,
+        )
+        display_runtime.render_once()
+        rendered_text_before_change = list(pygame_module.rendered_text)
+
+        service.projector_output_descriptor = ProjectorOutputDescriptor(
+            Resolution(300, 150),
+            'projector-b',
+        )
+        service.metric_state = MetricCalibrationStatus.STALE
+        display_runtime.render_once()
+
+        assert display_runtime.projector_output_descriptor == service.projector_output_descriptor
+        assert display_runtime.projector_surface.size == (300, 150)
+        new_rendered_text = pygame_module.rendered_text[len(rendered_text_before_change):]
+        assert '60.0 mm' not in new_rendered_text
+
+    def test_projector_output_failure_does_not_stop_the_next_frame(self) -> None:
+        class FlakyProjectorOutput(FakeProjectorOutput):
+            def __init__(self) -> None:
+                super().__init__()
+                self.present_count = 0
+
+            def present(self, surface: FakeSurface) -> None:
+                self.present_count += 1
+                if self.present_count == 1:
+                    raise RuntimeError('temporary projector failure')
+                super().present(surface)
+
+        pygame_module = FakePygame()
+        projector_output = FlakyProjectorOutput()
+        display_runtime = PygameDisplayRuntime(
+            FakeCameraRuntime(),
+            pygame_module=pygame_module,
+            projector_output=projector_output,
+        )
+
+        display_runtime.run(max_frames=2)
+
+        assert projector_output.present_count == 2
+        assert len(projector_output.presented_surfaces) == 1
+        assert 'Projector unavailable: temporary projector failure' in pygame_module.rendered_text
+
+    def test_projector_ruler_replacement_and_clear_are_deterministic(self) -> None:
+        first_ruler = build_metric_ruler(
+            (20.0, 50.0),
+            (80.0, 50.0),
+            'mm',
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            Resolution(200, 100),
+        )
+        second_ruler = build_metric_ruler(
+            (30.0, 40.0),
+            (90.0, 40.0),
+            'cm',
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            Resolution(200, 100),
+        )
+        service = MetricDisplayService(first_ruler, [])
+        pygame_module = FakePygame()
+        display_runtime = PygameDisplayRuntime(
+            service,
+            DisplayConfiguration(projector_resolution=Resolution(200, 100)),
+            pygame_module=pygame_module,
+            frame_surface_converter=lambda _frame, _pygame: FakeSurface((1, 1)),
+        )
+
+        display_runtime.render_once()
+        first_frame_calls = list(pygame_module.draw_calls)
+        display_runtime.render_once()
+        repeated_frame_calls = pygame_module.draw_calls[len(first_frame_calls):]
+        service.metric_ruler = second_ruler
+        display_runtime.render_once()
+        second_frame_calls = pygame_module.draw_calls[
+            len(first_frame_calls) + len(repeated_frame_calls):
+        ]
+        service.metric_ruler = None
+        display_runtime.render_once()
+        clear_frame_calls = pygame_module.draw_calls[
+            len(first_frame_calls)
+            + len(repeated_frame_calls)
+            + len(second_frame_calls):
+        ]
+
+        assert repeated_frame_calls == first_frame_calls, (
+            f'{repeated_frame_calls=}, {first_frame_calls=}'
+        )
+        assert second_frame_calls != first_frame_calls, f'{second_frame_calls=}'
+        clear_projector_calls = [
+            call
+            for call in clear_frame_calls
+            if call[1][0] is display_runtime.projector_surface
+        ]
+        assert clear_projector_calls == [], f'{clear_projector_calls=}'
+        assert display_runtime.projector_surface.fills == [BLACK, BLACK, BLACK, BLACK]
 
     def test_camera_preview_border_uses_projector_area_colour(self) -> None:
         pygame_module = FakePygame()

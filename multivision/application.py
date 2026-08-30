@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import math
 import pathlib
 import threading
 import time
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import NamedTuple
 
 from multivision.calibration import CalibrationMetrics, calibrate_homography
 from multivision.camera import CameraRuntime
 from multivision.config import (
     Configuration,
+    ProjectorOutputDescriptor,
     load_configuration,
 )
 from multivision.discovery import PlatformDeviceDiscovery
@@ -27,16 +30,21 @@ from multivision.errors import (
 from multivision.geometry import (
     CoordinateBounds,
     Point2D,
+    PointLike,
     Polygon,
     PreviewTransform,
     calculate_available_projector_area,
+    validate_homography,
 )
 from multivision.fiducials import (
     CameraCorrespondences,
     FiducialCorrespondence,
     FiducialDetector,
+    MetricTargetCorrespondence,
+    MetricTargetCorrespondences,
     OpenCVArucoDetector,
     assemble_correspondences,
+    detect_and_assemble_metric_correspondences,
     detect_fiducials,
 )
 from multivision.hardware import (
@@ -46,6 +54,18 @@ from multivision.hardware import (
     SleepInhibitor,
     SystemSleepInhibitor,
 )
+from multivision.metric import (
+    MetricCalibrationRecord,
+    MetricCalibrationRegistry,
+    MetricCalibrationStatus,
+    MetricRulerOverlay,
+    MetricValidationRecord,
+    build_metric_ruler,
+    calibrate_metric_homography,
+    validate_metric_correspondences,
+    validate_positive_length,
+)
+from multivision.metric_target import METRIC_TARGET
 from multivision.pattern import CalibrationPattern, build_calibration_pattern
 from multivision.persistence import (
     CalibrationRegistry,
@@ -60,6 +80,7 @@ from multivision.types import (
     DeviceInfo,
     Frame,
     RuntimeStatus,
+    Resolution,
     SessionCameraState,
     is_valid_resolution,
 )
@@ -68,6 +89,9 @@ from multivision.types import (
 CALIBRATION_PATTERN_WAIT_TIMEOUT_SECONDS = 5.0
 CALIBRATION_PATTERN_SETTLE_SECONDS = 3.0
 CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS = 5.0
+METRIC_CAPTURE_WAIT_TIMEOUT_SECONDS = 5.0
+METRIC_CAPTURE_SETTLE_SECONDS = 3.0
+METRIC_CAPTURE_FRAME_COUNT = 3
 AREA_COLOURS = (
     (70, 190, 255),
     (255, 180, 70),
@@ -127,6 +151,12 @@ class MultiVisionService:
         if not isinstance(configuration, Configuration):
             raise ValueError('configuration must be Configuration')
         self.configuration = configuration
+        self._projector_output_descriptor = configuration.projector_output_descriptor
+        self.metric_calibration_registry = MetricCalibrationRegistry(
+            self._projector_output_descriptor,
+        )
+        # The ruler is deliberately separate from the shared calibration record.
+        self._metric_ruler: MetricRulerOverlay | None = None
 
         self.calibration_store = (
             calibration_store
@@ -136,7 +166,9 @@ class MultiVisionService:
         self.calibration_pattern = (
             calibration_pattern
             if calibration_pattern is not None
-            else build_calibration_pattern(configuration.projector_resolution)
+            else build_calibration_pattern(
+                self._projector_output_descriptor.projector_resolution,
+            )
         )
         if not isinstance(self.calibration_pattern, CalibrationPattern):
             raise ValueError('calibration_pattern must be CalibrationPattern')
@@ -155,7 +187,8 @@ class MultiVisionService:
             if calibration_registry is not None
             else CalibrationRegistry(
                 calibration_version=self.configuration.calibration_version,
-                projector_resolution=self.configuration.projector_resolution,
+                projector_resolution=self._projector_output_descriptor.projector_resolution,
+                projector_output_descriptor=self._projector_output_descriptor,
             )
         )
         self.point_service = (
@@ -164,10 +197,12 @@ class MultiVisionService:
             else PointOverlayService(
                 self.camera_runtime,
                 self.calibration_registry,
-                configuration.projector_resolution,
+                self._projector_output_descriptor.projector_resolution,
                 calibration_version=self.configuration.calibration_version,
+                projector_output_descriptor=self._projector_output_descriptor,
             )
         )
+        self.point_service.projector_output_descriptor = self._projector_output_descriptor
         self.detector = detector
         self.sleep_inhibitor = (
             sleep_inhibitor
@@ -179,12 +214,143 @@ class MultiVisionService:
         self._calibration_capture_count = 0
         self._calibration_capture_lock = threading.RLock()
         self._calibration_pattern_presented = threading.Event()
+        self._metric_capture_count = 0
+        self._metric_capture_lock = threading.RLock()
+        # Camera-pattern and metric-blank handshakes must never overlap.
+        self._spatial_capture_operation_lock = threading.RLock()
+        self._metric_capture_generation = 0
+        self._metric_blank_presented = threading.Event()
         self._is_running = False
         self._has_stopped = False
 
     @property
     def is_running(self) -> bool:
         return self._is_running
+
+    @property
+    def projector_output_descriptor(self) -> ProjectorOutputDescriptor:
+        with self._camera_management_lock:
+            return self._projector_output_descriptor
+
+    @property
+    def metric_calibration(self) -> MetricCalibrationRecord | None:
+        """Return the one shared session-local metric record, if present."""
+        with self._camera_management_lock:
+            return self.metric_calibration_registry.record
+
+    @property
+    def metric_registry(self) -> MetricCalibrationRegistry:
+        """Return the service-owned shared metric registry."""
+        return self.metric_calibration_registry
+
+    @property
+    def metric_state(self) -> MetricCalibrationStatus:
+        """Return the shared metric calibration state for diagnostics."""
+        with self._camera_management_lock:
+            return self.metric_calibration_registry.state
+
+    @property
+    def metric_ruler(self) -> MetricRulerOverlay | None:
+        """Return the session-local ruler, if it remains spatially usable."""
+        with self._camera_management_lock:
+            if self._metric_ruler is None:
+                return None
+            if not self.metric_calibration_registry.is_usable(
+                self._projector_output_descriptor,
+            ):
+                self._metric_ruler = None
+            return self._metric_ruler
+
+    def set_metric_ruler(
+        self,
+        surface_start: PointLike,
+        surface_end: PointLike,
+        unit: object = 'mm',
+    ) -> MetricRulerOverlay:
+        """Replace the ruler only after its complete geometry is validated."""
+        ruler, _validation = self.set_metric_ruler_with_validation(
+            surface_start,
+            surface_end,
+            unit,
+        )
+        return ruler
+
+    def set_metric_ruler_with_validation(
+        self,
+        surface_start: PointLike,
+        surface_end: PointLike,
+        unit: object = 'mm',
+        observed_length: object | None = None,
+        observed_unit: object = 'mm',
+    ) -> tuple[MetricRulerOverlay, MetricValidationRecord | None]:
+        """Replace a ruler and optionally record its physical observation atomically."""
+        with self._camera_management_lock:
+            record = self._require_usable_metric_calibration()
+            assert record.surface_to_projector is not None
+            ruler = build_metric_ruler(
+                surface_start,
+                surface_end,
+                unit,
+                record.surface_to_projector,
+                self._projector_output_descriptor.projector_resolution,
+            )
+            validation = None
+            if observed_length is not None:
+                validation = self.metric_calibration_registry.add_validation_record(
+                    ruler.length_mm,
+                    observed_length,
+                    'mm',
+                    observed_unit,
+                )
+            self._metric_ruler = ruler
+            return ruler, validation
+
+    def clear_metric_ruler(self) -> None:
+        """Remove the ruler without changing metric or point-overlay state."""
+        with self._camera_management_lock:
+            self._metric_ruler = None
+
+    def get_metric_status(self) -> MetricCalibrationStatus:
+        """Return a fail-closed status for the current projector descriptor."""
+        status, _record = self.get_metric_status_snapshot()
+        return status
+
+    def get_metric_status_snapshot(
+        self,
+    ) -> tuple[MetricCalibrationStatus, MetricCalibrationRecord | None]:
+        """Return one consistent metric status and record snapshot."""
+        with self._camera_management_lock:
+            status = self.metric_calibration_registry.get_status(
+                self._projector_output_descriptor,
+            )
+            return status, self.metric_calibration_registry.record
+
+    def clear_metric_calibration(self) -> None:
+        """Clear the shared metric transform and its independent ruler state."""
+        with self._camera_management_lock:
+            self._metric_capture_generation += 1
+            self.metric_calibration_registry.clear()
+            self._metric_ruler = None
+
+    def record_physical_validation(
+        self,
+        requested_length: object,
+        observed_length: object | None = None,
+        requested_unit: object = 'mm',
+        observed_unit: object = 'mm',
+    ) -> MetricValidationRecord | None:
+        """Record an optional physical observation without changing the transform."""
+        with self._camera_management_lock:
+            self._require_usable_metric_calibration()
+            if observed_length is None:
+                validate_positive_length(requested_length, requested_unit)
+                return None
+            return self.metric_calibration_registry.add_validation_record(
+                requested_length,
+                observed_length,
+                requested_unit,
+                observed_unit,
+            )
 
     @property
     def overlay(self) -> RedCircleOverlay | None:
@@ -207,6 +373,18 @@ class MultiVisionService:
         with self._calibration_capture_lock:
             if self._calibration_capture_count > 0:
                 self._calibration_pattern_presented.set()
+
+    @property
+    def metric_capture_active(self) -> bool:
+        """Return whether the main-thread projector must remain blank."""
+        with self._metric_capture_lock:
+            return self._metric_capture_count > 0
+
+    def mark_metric_capture_presented(self) -> None:
+        """Acknowledge a main-thread blank projector frame."""
+        with self._metric_capture_lock:
+            if self._metric_capture_count > 0:
+                self._metric_blank_presented.set()
 
     def start(self) -> None:
         """Start persistent capture ownership once for the service lifetime."""
@@ -244,15 +422,16 @@ class MultiVisionService:
                 raise shutdown_error
 
     def get_camera_status(self, logical_name: str) -> CameraStatus:
-        resolved_slot = self._resolve_camera_reference(logical_name)
-        runtime_status = self.camera_runtime.get_status(resolved_slot)
-        if not isinstance(runtime_status, CameraStatus):
-            raise CameraUnavailableError(
-                f'Camera {logical_name!r} returned an invalid status',
-            )
-        _validate_camera_status(runtime_status, resolved_slot)
-        calibration_status = self._get_calibration_status(runtime_status)
-        return runtime_status._replace(calibration_status=calibration_status)
+        with self._camera_management_lock:
+            resolved_slot = self._resolve_camera_reference(logical_name)
+            runtime_status = self.camera_runtime.get_status(resolved_slot)
+            if not isinstance(runtime_status, CameraStatus):
+                raise CameraUnavailableError(
+                    f'Camera {logical_name!r} returned an invalid status',
+                )
+            _validate_camera_status(runtime_status, resolved_slot)
+            calibration_status = self._get_calibration_status(runtime_status)
+            return runtime_status._replace(calibration_status=calibration_status)
 
     def get_discovered_devices(self) -> list[DeviceInfo]:
         devices = self.camera_runtime.get_discovered_devices()
@@ -264,19 +443,20 @@ class MultiVisionService:
         return devices
 
     def get_camera_statuses(self) -> list[CameraStatus]:
-        statuses = self.camera_runtime.get_statuses()
-        if not isinstance(statuses, list):
-            raise CameraUnavailableError('Camera runtime returned an invalid status list')
-        checked_statuses: list[CameraStatus] = []
-        for status in statuses:
-            if not isinstance(status, CameraStatus):
-                raise CameraUnavailableError(
-                    'Camera runtime returned an invalid camera status',
-                )
-            _validate_camera_status(status)
-            calibration_status = self._get_calibration_status(status)
-            checked_statuses.append(status._replace(calibration_status=calibration_status))
-        return checked_statuses
+        with self._camera_management_lock:
+            statuses = self.camera_runtime.get_statuses()
+            if not isinstance(statuses, list):
+                raise CameraUnavailableError('Camera runtime returned an invalid status list')
+            checked_statuses: list[CameraStatus] = []
+            for status in statuses:
+                if not isinstance(status, CameraStatus):
+                    raise CameraUnavailableError(
+                        'Camera runtime returned an invalid camera status',
+                    )
+                _validate_camera_status(status)
+                calibration_status = self._get_calibration_status(status)
+                checked_statuses.append(status._replace(calibration_status=calibration_status))
+            return checked_statuses
 
     def snapshot(self, logical_name: str) -> Frame:
         """Return the latest frame retained by the persistent camera runtime."""
@@ -290,10 +470,11 @@ class MultiVisionService:
     def get_session_cameras(self) -> list[SessionCamera]:
         """Return the fixed, deterministically ordered session camera inventory."""
         # The display must read snapshots while calibration holds lifecycle writes locked.
-        cameras = self._get_session_cameras()
-        if cameras is None:
-            return []
-        return cameras
+        with self._camera_management_lock:
+            cameras = self._get_session_cameras()
+            if cameras is None:
+                return []
+            return cameras
 
     def calculate_available_area(self, camera_reference: str) -> Polygon:
         """Calculate the current calibrated projector area without enabling it."""
@@ -378,6 +559,296 @@ class MultiVisionService:
                 return camera
             finally:
                 self.point_service.clear_overlay_for_camera(slot_id)
+
+    def update_projector_descriptor(
+        self,
+        projector_output_descriptor: ProjectorOutputDescriptor | Resolution,
+        output_identity: str = 'default',
+    ) -> ProjectorOutputDescriptor:
+        """Change the active output and invalidate all dependent geometry."""
+        if isinstance(projector_output_descriptor, Resolution):
+            checked_descriptor = ProjectorOutputDescriptor(
+                projector_output_descriptor,
+                output_identity,
+            )
+        elif isinstance(projector_output_descriptor, ProjectorOutputDescriptor):
+            if output_identity != 'default' and (
+                output_identity != projector_output_descriptor.output_identity
+            ):
+                raise ValueError('output_identity disagrees with the descriptor')
+            checked_descriptor = projector_output_descriptor
+        else:
+            raise ValueError(
+                'projector_output_descriptor must be ProjectorOutputDescriptor or Resolution',
+            )
+
+        with self._camera_management_lock:
+            if checked_descriptor == self._projector_output_descriptor:
+                return checked_descriptor
+            self._metric_capture_generation += 1
+            updated_calibration_pattern = build_calibration_pattern(
+                checked_descriptor.projector_resolution,
+            )
+            self.camera_runtime.mark_calibrations_stale(checked_descriptor)
+            self.calibration_registry.update_projector_descriptor(checked_descriptor)
+            self.metric_calibration_registry.update_projector_descriptor(
+                checked_descriptor,
+            )
+            self._metric_ruler = None
+            self.point_service.clear_overlay()
+            self._projector_output_descriptor = checked_descriptor
+            self.calibration_pattern = updated_calibration_pattern
+            self.configuration = replace(
+                self.configuration,
+                projector_resolution=checked_descriptor.projector_resolution,
+                projector_output_identity=checked_descriptor.output_identity,
+            )
+            self.point_service.projector_resolution = checked_descriptor.projector_resolution
+            self.point_service.projector_output_descriptor = checked_descriptor
+            return checked_descriptor
+
+    def calibrate_metric(
+        self,
+        logical_name: str,
+        correspondences: (
+            MetricTargetCorrespondences
+            | Sequence[MetricTargetCorrespondence]
+            | Sequence[MetricTargetCorrespondences]
+            | None
+        ) = None,
+    ) -> MetricCalibrationRecord:
+        """Capture and atomically publish the shared metric calibration."""
+        with self._spatial_capture_operation_lock:
+            with self._camera_management_lock:
+                # A failed replacement attempt must never leave an older transform
+                # available to callers who assume the capture was authoritative.
+                self._metric_capture_generation += 1
+                capture_generation = self._metric_capture_generation
+                self.metric_calibration_registry.clear()
+                self._metric_ruler = None
+                camera, calibration = self._require_metric_camera(logical_name)
+                camera_generation = camera.lifecycle_generation
+
+            # The main-thread display must read this state and acknowledge the blank frame.
+            self._begin_metric_capture()
+            try:
+                frames = self._get_metric_capture_frames(
+                    camera.slot_id,
+                    correspondences,
+                )
+                averaged_correspondences = _average_metric_correspondences(
+                    frames,
+                    self.configuration.metric_calibration_thresholds
+                    .max_capture_corner_jitter_pixels,
+                    camera.slot_id,
+                )
+                result = calibrate_metric_homography(
+                    averaged_correspondences,
+                    getattr(calibration, 'camera_to_projector'),
+                    self._projector_output_descriptor.projector_resolution,
+                    self.configuration.metric_calibration_thresholds,
+                    target=METRIC_TARGET,
+                )
+
+                with self._camera_management_lock:
+                    if capture_generation != self._metric_capture_generation:
+                        raise CalibrationError(
+                            'Metric calibration was invalidated during capture',
+                        )
+                    current_camera, current_calibration = self._require_metric_camera(
+                        camera.slot_id,
+                    )
+                    if (
+                        current_camera.lifecycle_generation != camera_generation
+                        or not _same_camera_calibration(
+                            current_calibration,
+                            calibration,
+                        )
+                    ):
+                        raise CalibrationError(
+                            'The selected camera changed during metric calibration',
+                        )
+                    return self.metric_calibration_registry.register(
+                        result,
+                        self._projector_output_descriptor,
+                        observation_camera_slot=camera.slot_id,
+                        observation_camera_calibration=calibration,
+                    )
+            finally:
+                self._finish_metric_capture()
+
+    def _require_metric_camera(
+        self,
+        logical_name: str,
+    ) -> tuple[SessionCamera, object]:
+        status = self._require_available_camera(logical_name)
+        session_camera = self._get_session_camera(status.logical_name)
+        if session_camera is None:
+            raise CameraUnavailableError(
+                f'Camera {logical_name!r} has no session identity',
+            )
+        calibration_status = self._get_calibration_status(status)
+        if calibration_status is not CalibrationStatus.CALIBRATED:
+            error = InvalidCalibrationStateError(
+                f'Camera {session_camera.slot_id!r} calibration is '
+                f'{calibration_status.value}',
+            )
+            error.code = f'CALIBRATION_{calibration_status.value}'
+            raise error
+        calibration = session_camera.calibration
+        if calibration is None:
+            raise InvalidCalibrationStateError(
+                f'Camera {session_camera.slot_id!r} has no camera calibration',
+            )
+        if (
+            getattr(calibration, 'projector_output_descriptor', None)
+            != self._projector_output_descriptor
+        ):
+            error = InvalidCalibrationStateError(
+                f'Camera {session_camera.slot_id!r} calibration is not output-applicable',
+            )
+            error.code = 'CALIBRATION_STALE'
+            raise error
+        if (
+            status.native_resolution is None
+            or (
+                getattr(calibration, 'camera_resolution', status.native_resolution)
+                != status.native_resolution
+            )
+        ):
+            error = InvalidCalibrationStateError(
+                f'Camera {session_camera.slot_id!r} calibration resolution is stale',
+            )
+            error.code = 'CAMERA_RESOLUTION_CHANGED'
+            raise error
+        try:
+            validate_homography(getattr(calibration, 'camera_to_projector'))
+        except (AttributeError, TypeError, ValueError):
+            error = InvalidCalibrationStateError(
+                f'Camera {session_camera.slot_id!r} calibration transform is invalid',
+            )
+            error.code = 'CALIBRATION_INVALID'
+            raise error
+        return session_camera, calibration
+
+    def _require_usable_metric_calibration(self) -> MetricCalibrationRecord:
+        record = self.metric_calibration_registry.get_record()
+        if record is None:
+            error = InvalidCalibrationStateError(
+                'Metric calibration is unavailable',
+            )
+            error.code = 'METRIC_UNAVAILABLE'
+            raise error
+        if not self.metric_calibration_registry.is_usable(
+            self._projector_output_descriptor,
+        ):
+            error = InvalidCalibrationStateError(
+                'Metric calibration is stale or unavailable',
+            )
+            error.code = (
+                'METRIC_STALE'
+                if self.metric_calibration_registry.state
+                is MetricCalibrationStatus.STALE
+                else 'METRIC_UNAVAILABLE'
+            )
+            raise error
+        current_record = self.metric_calibration_registry.get_record()
+        if current_record is None:
+            error = InvalidCalibrationStateError(
+                'Metric calibration is unavailable',
+            )
+            error.code = 'METRIC_UNAVAILABLE'
+            raise error
+        return current_record
+
+    def _begin_metric_capture(self) -> None:
+        with self._metric_capture_lock:
+            self._metric_blank_presented.clear()
+            self._metric_capture_count += 1
+
+    def _finish_metric_capture(self) -> None:
+        with self._metric_capture_lock:
+            self._metric_capture_count -= 1
+            if self._metric_capture_count == 0:
+                self._metric_blank_presented.clear()
+
+    def _get_metric_capture_frames(
+        self,
+        slot_id: str,
+        correspondences: (
+            MetricTargetCorrespondences
+            | Sequence[MetricTargetCorrespondence]
+            | Sequence[MetricTargetCorrespondences]
+            | None
+        ),
+    ) -> tuple[MetricTargetCorrespondences, ...]:
+        injected_frames = _normalise_injected_metric_frames(correspondences, slot_id)
+        if injected_frames is not None:
+            return injected_frames
+        if not self._metric_blank_presented.wait(METRIC_CAPTURE_WAIT_TIMEOUT_SECONDS):
+            raise CalibrationError(
+                'The metric blank frame was not acknowledged by the main-thread display',
+            )
+        time.sleep(METRIC_CAPTURE_SETTLE_SECONDS)
+        detector = self.detector
+        if detector is None:
+            detector = OpenCVArucoDetector()
+        get_consecutive_frames = getattr(
+            self.camera_runtime,
+            'get_consecutive_frames',
+            None,
+        )
+        if callable(get_consecutive_frames):
+            captured_frames = get_consecutive_frames(
+                slot_id,
+                METRIC_CAPTURE_FRAME_COUNT,
+                METRIC_CAPTURE_WAIT_TIMEOUT_SECONDS,
+            )
+            if not isinstance(captured_frames, Sequence) or len(captured_frames) != (
+                METRIC_CAPTURE_FRAME_COUNT
+            ) or any(not isinstance(frame, Frame) for frame in captured_frames):
+                raise CalibrationError(
+                    'Camera runtime returned invalid consecutive metric frames',
+                )
+        else:
+            captured_frames = tuple(
+                self.snapshot(slot_id)
+                for _frame_index in range(METRIC_CAPTURE_FRAME_COUNT)
+            )
+
+        frames: list[MetricTargetCorrespondences] = []
+        previous_frame_counter: int | None = None
+        for frame in captured_frames:
+            if (
+                not isinstance(frame.frame_counter, int)
+                or isinstance(frame.frame_counter, bool)
+                or frame.frame_counter < 0
+                or (
+                    previous_frame_counter is not None
+                    and frame.frame_counter != previous_frame_counter + 1
+                )
+            ):
+                raise CalibrationError(
+                    'Metric capture did not receive three consecutive camera frames',
+                )
+            previous_frame_counter = frame.frame_counter
+            frames.append(
+                detect_and_assemble_metric_correspondences(
+                    frame.data,
+                    detector,
+                    target=METRIC_TARGET,
+                    camera_id=slot_id,
+                    minimum_marker_count=(
+                        self.configuration.metric_calibration_thresholds
+                        .min_unique_target_fiducials
+                    ),
+                    minimum_spatial_coverage=(
+                        self.configuration.metric_calibration_thresholds
+                        .min_spatial_coverage
+                    ),
+                ),
+            )
+        return tuple(frames)
 
     def calibrate(
         self,
@@ -568,7 +1039,7 @@ class MultiVisionService:
             camera_frame,
             native_resolution,
             camera_to_projector,
-            self.configuration.projector_resolution,
+            self._projector_output_descriptor.projector_resolution,
         )
         if available_area is None:
             raise InvalidAvailableAreaError(
@@ -612,7 +1083,7 @@ class MultiVisionService:
         logical_name: str,
         correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None = None,
     ) -> PersistedCalibration:
-        with self._camera_management_lock:
+        with self._spatial_capture_operation_lock:
             return self._calibrate_camera_locked(logical_name, correspondences)
 
     def _calibrate_camera_locked(
@@ -625,37 +1096,52 @@ class MultiVisionService:
         session_camera = self._get_session_camera(status.logical_name)
         if session_camera is None or status.native_resolution is None:
             raise CameraUnavailableError(f'Camera {logical_name!r} has incomplete metadata')
+        camera_slot_id = session_camera.slot_id
+        camera_lifecycle_generation = session_camera.lifecycle_generation
         checked_correspondences = self._get_correspondences_for_operation(
             status,
             correspondences,
         )
-        result = calibrate_homography(
-            checked_correspondences,
-            self.calibration_pattern,
-            self.configuration.calibration_thresholds,
-            camera_resolution=status.native_resolution,
-        )
-        record = PersistedCalibration.from_result(
-            result,
-            status.native_resolution,
-            self.configuration.projector_resolution,
-            version=self.configuration.calibration_version,
-            camera_id=session_camera.slot_id,
-        )
-        self._set_session_calibration(
-            session_camera.slot_id,
-            CalibrationStatus.UNVERIFIED,
-            record,
-        )
-        return record
+        with self._camera_management_lock:
+            current_status = self._require_available_camera(camera_slot_id)
+            current_camera = self._get_session_camera(camera_slot_id)
+            if current_camera is None or current_status.native_resolution is None:
+                raise CameraUnavailableError(
+                    f'Camera {logical_name!r} has incomplete metadata',
+                )
+            if current_camera.lifecycle_generation != camera_lifecycle_generation:
+                raise CalibrationError(
+                    'The selected camera changed during calibration',
+                )
+            result = calibrate_homography(
+                checked_correspondences,
+                self.calibration_pattern,
+                self.configuration.calibration_thresholds,
+                camera_resolution=current_status.native_resolution,
+            )
+            record = PersistedCalibration.from_result(
+                result,
+                current_status.native_resolution,
+                self._projector_output_descriptor.projector_resolution,
+                version=self.configuration.calibration_version,
+                projector_output_descriptor=self._projector_output_descriptor,
+                camera_id=current_camera.slot_id,
+            )
+            self._set_session_calibration(
+                current_camera.slot_id,
+                CalibrationStatus.UNVERIFIED,
+                record,
+            )
+            return record
 
     def _verify_camera(
         self,
         logical_name: str,
         correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None = None,
     ) -> CalibrationStatus:
-        with self._camera_management_lock:
-            return self._verify_camera_locked(logical_name, correspondences)
+        with self._spatial_capture_operation_lock:
+            with self._camera_management_lock:
+                return self._verify_camera_locked(logical_name, correspondences)
 
     def _verify_camera_locked(
         self,
@@ -677,14 +1163,16 @@ class MultiVisionService:
         session_registry = CalibrationRegistry(
             {session_camera.slot_id: calibration},
             calibration_version=self.configuration.calibration_version,
-            projector_resolution=self.configuration.projector_resolution,
+            projector_resolution=self._projector_output_descriptor.projector_resolution,
+            projector_output_descriptor=self._projector_output_descriptor,
         )
         calibration_status = session_registry.verify(
             session_camera.slot_id,
             checked_correspondences,
             camera_resolution=status.native_resolution,
-            projector_resolution=self.configuration.projector_resolution,
+            projector_resolution=self._projector_output_descriptor.projector_resolution,
             thresholds=self.configuration.calibration_thresholds,
+            projector_output_descriptor=self._projector_output_descriptor,
             pattern=self.calibration_pattern,
         )
         self._set_session_calibration(
@@ -812,7 +1300,8 @@ class MultiVisionService:
                 calibration.camera_id != session_camera.slot_id
                 or calibration.version != self.configuration.calibration_version
                 or calibration.camera_resolution != status.native_resolution
-                or calibration.projector_resolution != self.configuration.projector_resolution
+                or calibration.projector_output_descriptor
+                != self._projector_output_descriptor
             )
         ):
             return CalibrationStatus.STALE
@@ -881,6 +1370,183 @@ class MultiVisionService:
             raise SessionCameraError(
                 'Camera runtime returned an invalid calibrated session camera',
             )
+
+
+def _normalise_injected_metric_frames(
+    correspondences: (
+        MetricTargetCorrespondences
+        | Sequence[MetricTargetCorrespondence]
+        | Sequence[MetricTargetCorrespondences]
+        | None
+    ),
+    camera_id: str,
+) -> tuple[MetricTargetCorrespondences, ...] | None:
+    if correspondences is None:
+        return None
+    if isinstance(correspondences, MetricTargetCorrespondences):
+        frame = _replace_metric_camera_id(correspondences, camera_id)
+        return (frame,) * METRIC_CAPTURE_FRAME_COUNT
+    try:
+        values = tuple(correspondences)
+    except (TypeError, ValueError) as ex:
+        raise CalibrationError('Metric correspondences must be iterable') from ex
+    if all(isinstance(value, MetricTargetCorrespondence) for value in values):
+        frame = MetricTargetCorrespondences(
+            tuple(values),
+            camera_id,
+        )
+        return (frame,) * METRIC_CAPTURE_FRAME_COUNT
+    if all(isinstance(value, MetricTargetCorrespondences) for value in values):
+        if len(values) != METRIC_CAPTURE_FRAME_COUNT:
+            raise CalibrationError(
+                f'Metric capture requires {METRIC_CAPTURE_FRAME_COUNT} frames',
+            )
+        return tuple(
+            _replace_metric_camera_id(value, camera_id)
+            for value in values
+        )
+    if all(
+        isinstance(value, Sequence)
+        and all(isinstance(item, MetricTargetCorrespondence) for item in value)
+        for value in values
+    ):
+        if len(values) != METRIC_CAPTURE_FRAME_COUNT:
+            raise CalibrationError(
+                f'Metric capture requires {METRIC_CAPTURE_FRAME_COUNT} frames',
+            )
+        return tuple(
+            MetricTargetCorrespondences(tuple(value), camera_id)
+            for value in values
+        )
+    raise CalibrationError(
+        'Metric correspondences must contain target correspondence values or frames',
+    )
+
+
+def _same_camera_calibration(first: object, second: object) -> bool:
+    """Compare the camera geometry used by a capture, not object identity."""
+    for field_name in (
+        'camera_to_projector',
+        'projector_output_descriptor',
+        'camera_resolution',
+        'version',
+        'timestamp',
+    ):
+        first_value = getattr(first, field_name, None)
+        second_value = getattr(second, field_name, None)
+        if first_value != second_value:
+            return False
+    return True
+
+
+def _replace_metric_camera_id(
+    correspondences: MetricTargetCorrespondences,
+    camera_id: str,
+) -> MetricTargetCorrespondences:
+    if correspondences.camera_id not in {None, camera_id}:
+        raise CalibrationError('Metric correspondences belong to another camera')
+    return correspondences._replace(camera_id=camera_id)
+
+
+def _average_metric_correspondences(
+    frames: Sequence[MetricTargetCorrespondences],
+    maximum_corner_jitter_pixels: float,
+    camera_id: str,
+) -> MetricTargetCorrespondences:
+    if len(frames) != METRIC_CAPTURE_FRAME_COUNT:
+        raise CalibrationError(
+            f'Metric capture requires {METRIC_CAPTURE_FRAME_COUNT} frames',
+        )
+    if not math.isfinite(maximum_corner_jitter_pixels) or maximum_corner_jitter_pixels <= 0:
+        raise CalibrationError('Metric corner jitter tolerance is invalid')
+
+    first_frame = validate_metric_correspondences(
+        _replace_metric_camera_id(frames[0], camera_id),
+        target=METRIC_TARGET,
+    )
+    first_by_corner = _metric_correspondences_by_corner(first_frame)
+    first_marker_ids = first_frame.unique_marker_ids
+    averaged: list[MetricTargetCorrespondence] = []
+    frame_corner_maps = [first_by_corner]
+    for frame in frames[1:]:
+        checked_frame = validate_metric_correspondences(
+            _replace_metric_camera_id(frame, camera_id),
+            target=METRIC_TARGET,
+        )
+        frame_by_corner = _metric_correspondences_by_corner(checked_frame)
+        if set(checked_frame.unique_marker_ids) != set(first_marker_ids):
+            raise CalibrationError(
+                'Metric capture frames do not contain the same target marker IDs',
+            )
+        if set(frame_by_corner) != set(first_by_corner):
+            raise CalibrationError(
+                'Metric capture frames do not contain the same target corners',
+            )
+        frame_corner_maps.append(frame_by_corner)
+        for corner_key, first_correspondence in first_by_corner.items():
+            correspondence = frame_by_corner[corner_key]
+            if correspondence.surface_position != first_correspondence.surface_position:
+                raise CalibrationError(
+                    'Metric capture frames disagree about target corner positions',
+                )
+            try:
+                corner_jitter = math.dist(
+                    first_correspondence.camera_position,
+                    correspondence.camera_position,
+                )
+            except (TypeError, ValueError) as ex:
+                raise CalibrationError(
+                    'Metric capture contains an invalid camera corner',
+                ) from ex
+            if not math.isfinite(corner_jitter) or corner_jitter > maximum_corner_jitter_pixels:
+                raise CalibrationError(
+                    'Metric capture detected movement beyond the stability tolerance',
+                )
+
+    for corner_key, first_correspondence in first_by_corner.items():
+        frame_correspondences = [
+            corner_map[corner_key]
+            for corner_map in frame_corner_maps
+        ]
+        try:
+            averaged_camera_position = Point2D(
+                math.fsum(
+                    correspondence.camera_position.x
+                    for correspondence in frame_correspondences
+                ) / METRIC_CAPTURE_FRAME_COUNT,
+                math.fsum(
+                    correspondence.camera_position.y
+                    for correspondence in frame_correspondences
+                ) / METRIC_CAPTURE_FRAME_COUNT,
+            )
+        except (AttributeError, TypeError, ValueError) as ex:
+            raise CalibrationError(
+                'Metric capture contains an invalid camera corner',
+            ) from ex
+        averaged.append(
+            MetricTargetCorrespondence(
+                first_correspondence.marker_id,
+                first_correspondence.corner_index,
+                first_correspondence.surface_position,
+                averaged_camera_position,
+            ),
+        )
+    return MetricTargetCorrespondences(tuple(averaged), camera_id)
+
+
+def _metric_correspondences_by_corner(
+    frame: MetricTargetCorrespondences,
+) -> dict[tuple[int, int], MetricTargetCorrespondence]:
+    values = frame.correspondences
+    if any(not isinstance(value, MetricTargetCorrespondence) for value in values):
+        raise CalibrationError('Metric capture contains malformed correspondences')
+    result: dict[tuple[int, int], MetricTargetCorrespondence] = {}
+    for correspondence in values:
+        corner_key = (correspondence.marker_id, correspondence.corner_index)
+        if corner_key in result:
+            raise CalibrationError('Metric capture contains duplicate target corners')
+        result[corner_key] = correspondence
+    return result
 
 
 def get_camera_area_colour(slot_id: str) -> tuple[int, int, int]:

@@ -10,6 +10,7 @@ from typing import (
     Protocol,
 )
 
+from multivision.config import ProjectorOutputDescriptor
 from multivision.errors import (
     CameraUnavailableError,
     InvalidCalibrationStateError,
@@ -68,6 +69,7 @@ class CalibrationPointRegistry(Protocol):
         point: PointLike,
         camera_resolution: Resolution,
         projector_resolution: Resolution,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
     ) -> Point2D:
         ...
 
@@ -109,6 +111,7 @@ class PointOverlayService:
         projector_resolution: Resolution,
         overlay_radius: int = 12,
         calibration_version: int = 1,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
     ) -> None:
         if not is_valid_resolution(projector_resolution):
             raise ValueError('projector_resolution must be a positive Resolution')
@@ -128,6 +131,7 @@ class PointOverlayService:
         self.camera_runtime = camera_runtime
         self.calibration_registry = calibration_registry
         self.projector_resolution = projector_resolution
+        self.projector_output_descriptor = projector_output_descriptor
         self.overlay_radius = overlay_radius
         self.calibration_version = calibration_version
         self._overlay: RedCircleOverlay | None = None
@@ -353,16 +357,28 @@ class PointOverlayService:
             return 'CAMERA_RESOLUTION_CHANGED'
         if calibration.projector_resolution != self.projector_resolution:
             return 'PROJECTOR_RESOLUTION_CHANGED'
+        if (
+            self.projector_output_descriptor is not None
+            and calibration.projector_output_descriptor != self.projector_output_descriptor
+        ):
+            return 'PROJECTOR_OUTPUT_CHANGED'
         return None
 
     def _get_calibration_status(self, camera: _ResolvedCamera) -> CalibrationStatus:
         session_camera = camera.session_camera
         if session_camera is not None:
             return session_camera.calibration_status
+        if self.projector_output_descriptor is None:
+            return self.calibration_registry.get_status(
+                camera.calibration_id,
+                camera_resolution=camera.status.native_resolution,
+                projector_resolution=self.projector_resolution,
+            )
         return self.calibration_registry.get_status(
             camera.calibration_id,
             camera_resolution=camera.status.native_resolution,
             projector_resolution=self.projector_resolution,
+            projector_output_descriptor=self.projector_output_descriptor,
         )
 
     def _project_camera_point(
@@ -372,11 +388,19 @@ class PointOverlayService:
     ) -> Point2D:
         session_camera = camera.session_camera
         if session_camera is None:
+            if self.projector_output_descriptor is None:
+                return self.calibration_registry.project_camera_to_projector(
+                    camera.calibration_id,
+                    camera_point,
+                    camera_resolution=camera.status.native_resolution,
+                    projector_resolution=self.projector_resolution,
+                )
             return self.calibration_registry.project_camera_to_projector(
                 camera.calibration_id,
                 camera_point,
                 camera_resolution=camera.status.native_resolution,
                 projector_resolution=self.projector_resolution,
+                projector_output_descriptor=self.projector_output_descriptor,
             )
         if session_camera.calibration is None:
             raise InvalidHomographyError(

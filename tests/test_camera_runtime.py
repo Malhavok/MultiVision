@@ -328,6 +328,38 @@ class CameraRuntimeTest(unittest.TestCase):
             for status in runtime.get_statuses()
         ), f'{runtime.get_statuses()=}'
 
+    def test_consecutive_frames_are_not_reconstructed_from_latest_snapshot(self) -> None:
+        capture = FakeCapture('camera', Resolution(640, 480))
+        runtime = CameraRuntime(
+            FakeDiscovery([
+                DeviceInfo(
+                    'device-0',
+                    'Camera 0',
+                    capture_index=0,
+                    native_resolution=Resolution(640, 480),
+                ),
+            ]),
+            FakeCaptureFactory({'device-0': capture}),
+            read_wait_seconds=0.001,
+        )
+
+        runtime.start()
+        try:
+            assert capture.first_frame.wait(1), 'camera frame was not captured'
+            frames = runtime.get_consecutive_frames('camera-0', 3, 1.0)
+        finally:
+            runtime.shutdown()
+
+        assert [frame.frame_counter for frame in frames] == [
+            frames[0].frame_counter,
+            frames[0].frame_counter + 1,
+            frames[0].frame_counter + 2,
+        ], f'{frames=}'
+        assert [frame.data for frame in frames] == [
+            f'camera-{frame.frame_counter}'
+            for frame in frames
+        ], f'{frames=}'
+
     def test_session_open_does_not_publish_open_without_a_handle(self) -> None:
         class BlockingReopenFactory:
             def __init__(self) -> None:

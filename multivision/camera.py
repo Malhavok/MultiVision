@@ -1,8 +1,11 @@
 import math
 import threading
 import time
+from collections import deque
+from collections.abc import Iterable
 from typing import Any
 
+from multivision.config import ProjectorOutputDescriptor
 from multivision.errors import (
     CameraUnavailableError,
     FrameCaptureError,
@@ -65,11 +68,13 @@ class CameraRuntime:
         self._read_wait_seconds = read_wait_seconds
         self._worker_shutdown_timeout_seconds = worker_shutdown_timeout_seconds
         self._lock = threading.RLock()
+        self._frame_condition = threading.Condition(self._lock)
         self._lifecycle_lock = threading.RLock()
         self._stop_event = threading.Event()
         self._captures: dict[str, CaptureDevice] = {}
         self._session_registry: SessionCameraRegistry | None = None
         self._latest_frames: dict[str, Frame] = {}
+        self._frame_history: dict[str, deque[Frame]] = {}
         self._workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
         self._statuses: dict[str, CameraStatus] = {}
         self._has_started = False
@@ -146,6 +151,7 @@ class CameraRuntime:
                             runtime_status=RuntimeStatus.ERROR,
                             error_message=error_message,
                         )
+                    self._frame_condition.notify_all()
                 raise HardwareError(error_message)
 
             with self._lock:
@@ -166,6 +172,9 @@ class CameraRuntime:
                         ),
                     )
                 self._captures.clear()
+                self._latest_frames.clear()
+                self._frame_history.clear()
+                self._frame_condition.notify_all()
                 self._workers.clear()
                 self._has_stopped = True
 
@@ -202,6 +211,24 @@ class CameraRuntime:
                     calibration_status=calibration_status,
                 )
                 return camera
+
+    def mark_calibrations_stale(
+        self,
+        projector_output_descriptor: ProjectorOutputDescriptor,
+    ) -> list[SessionCamera]:
+        """Atomically stale camera geometry tied to another projector output."""
+        with self._lifecycle_lock:
+            self._require_session_runtime()
+            assert self._session_registry is not None
+            with self._lock:
+                stale_cameras = self._session_registry.mark_calibrations_stale(
+                    projector_output_descriptor,
+                )
+                for camera in stale_cameras:
+                    self._statuses[camera.slot_id] = self._statuses[
+                        camera.slot_id
+                    ]._replace(calibration_status=CalibrationStatus.STALE)
+                return stale_cameras
 
     def set_area_enabled(self, slot_id: str, area_enabled: bool) -> SessionCamera:
         """Update session-local area visibility without storing its polygon."""
@@ -275,6 +302,8 @@ class CameraRuntime:
                 capture = self._captures.pop(slot_id, None)
                 worker_entry = self._workers.get(slot_id)
                 self._latest_frames.pop(slot_id, None)
+                self._frame_history.pop(slot_id, None)
+                self._frame_condition.notify_all()
             if worker_entry is not None:
                 worker, stop_event = worker_entry
                 stop_event.set()
@@ -337,6 +366,68 @@ class CameraRuntime:
                     status.error_message or f'Camera {logical_name!r} has no usable frame',
                 )
             return frame
+
+    def get_consecutive_frames(
+        self,
+        logical_name: str,
+        frame_count: int,
+        timeout_seconds: float,
+    ) -> tuple[Frame, ...]:
+        """Return newly published consecutive frames without reusing the latest one."""
+        if (
+            not isinstance(frame_count, int)
+            or isinstance(frame_count, bool)
+            or frame_count <= 0
+        ):
+            raise ValueError('frame_count must be a positive integer')
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError('timeout_seconds must be a finite positive number')
+
+        with self._lifecycle_lock:
+            status = self.get_status(logical_name)
+            if status.runtime_status in {
+                RuntimeStatus.UNAVAILABLE,
+                RuntimeStatus.STOPPED,
+            }:
+                raise CameraUnavailableError(
+                    status.error_message or f'Camera {logical_name!r} is unavailable',
+                )
+            baseline_frame_counter = status.frame_counter
+
+        deadline = time.monotonic() + timeout_seconds
+        with self._frame_condition:
+            while True:
+                status = self._statuses.get(logical_name)
+                if status is None:
+                    raise CameraUnavailableError(
+                        f'Camera {logical_name!r} is not configured',
+                    )
+                if status.runtime_status in {
+                    RuntimeStatus.UNAVAILABLE,
+                    RuntimeStatus.STOPPED,
+                    RuntimeStatus.ERROR,
+                }:
+                    raise CameraUnavailableError(
+                        status.error_message or f'Camera {logical_name!r} is unavailable',
+                    )
+                consecutive_frames = _find_consecutive_frames(
+                    self._frame_history.get(logical_name, ()),
+                    baseline_frame_counter,
+                    frame_count,
+                )
+                if consecutive_frames is not None:
+                    return consecutive_frames
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    raise FrameCaptureError(
+                        f'Camera {logical_name!r} did not publish enough consecutive frames',
+                    )
+                self._frame_condition.wait(remaining_seconds)
 
     def get_discovered_devices(self) -> list[DeviceInfo]:
         """Return the fixed session snapshot without opening another device."""
@@ -527,11 +618,17 @@ class CameraRuntime:
                             if previous_frame is None
                             else previous_frame.frame_counter + 1
                         )
-                        self._latest_frames[device_id] = Frame(
+                        frame = Frame(
                             frame_data,
                             frame_counter,
                             captured_at_seconds,
                         )
+                        self._latest_frames[device_id] = frame
+                        self._frame_history.setdefault(
+                            device_id,
+                            deque(maxlen=32),
+                        ).append(frame)
+                        self._frame_condition.notify_all()
                         self._set_status(
                             device_id,
                             RuntimeStatus.AVAILABLE,
@@ -580,6 +677,8 @@ class CameraRuntime:
                 return
             self._captures.pop(device_id)
             self._latest_frames.pop(device_id, None)
+            self._frame_history.pop(device_id, None)
+            self._frame_condition.notify_all()
             assert self._session_registry is not None
             self._session_registry.mark_unavailable(device_id, error_message)
             self._set_status(
@@ -661,6 +760,12 @@ class CameraRuntime:
                 ),
                 error_message=error_message,
             )
+            if runtime_status in {
+                RuntimeStatus.UNAVAILABLE,
+                RuntimeStatus.STOPPED,
+                RuntimeStatus.ERROR,
+            }:
+                self._frame_condition.notify_all()
 
     def _open_capture(self, device: DeviceInfo) -> CaptureDevice:
         take_capture = getattr(self._discovery, 'take_capture', None)
@@ -703,6 +808,25 @@ class CameraRuntime:
             capture.release()
         except Exception:  # noqa: BLE001 (Cleanup must not hide the original failure).
             pass
+
+
+def _find_consecutive_frames(
+    frame_history: Iterable[Frame],
+    baseline_frame_counter: int,
+    frame_count: int,
+) -> tuple[Frame, ...] | None:
+    expected_frame_counter = baseline_frame_counter + 1
+    selected_frames: list[Frame] = []
+    for frame in frame_history:
+        if frame.frame_counter < expected_frame_counter:
+            continue
+        if frame.frame_counter != expected_frame_counter:
+            return None
+        selected_frames.append(frame)
+        expected_frame_counter += 1
+        if len(selected_frames) == frame_count:
+            return tuple(selected_frames)
+    return None
 
 
 def _read_capture_frame(capture: CaptureDevice) -> tuple[bool, Any]:

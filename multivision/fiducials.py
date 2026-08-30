@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import (
     Iterable,
@@ -15,8 +16,23 @@ from typing import (
     Protocol,
 )
 
-from multivision.errors import FiducialDetectionError
-from multivision.geometry import Point2D
+from multivision.errors import (
+    FiducialDetectionError,
+    InvalidHomographyError,
+)
+from multivision.geometry import (
+    Point2D,
+    calculate_convex_hull,
+    calculate_polygon_area,
+    project_point,
+    validate_homography,
+)
+from multivision.metric_target import (
+    METRIC_TARGET,
+    MetricTarget,
+    MetricTargetMarker,
+    validate_metric_target,
+)
 from multivision.pattern import (
     APRILTAG_36H11,
     APRILTAG_FAMILIES,
@@ -67,6 +83,46 @@ class CameraCorrespondences(NamedTuple):
     def projector_points(self) -> tuple[Point2D, ...]:
         return tuple(
             correspondence.projector_position
+            for correspondence in self.correspondences
+        )
+
+    @property
+    def camera_points(self) -> tuple[Point2D, ...]:
+        return tuple(
+            correspondence.camera_position
+            for correspondence in self.correspondences
+        )
+
+
+class MetricTargetCorrespondence(NamedTuple):
+    """One target corner paired with its camera-native detection."""
+
+    marker_id: int
+    corner_index: int
+    surface_position: Point2D
+    camera_position: Point2D
+
+
+class MetricTargetCorrespondences(NamedTuple):
+    """Strict, target-aware corner correspondences for one camera frame."""
+
+    correspondences: tuple[MetricTargetCorrespondence, ...]
+    camera_id: str | None = None
+
+    @property
+    def unique_marker_ids(self) -> tuple[int, ...]:
+        return tuple(
+            marker_id
+            for marker_id in dict.fromkeys(
+                correspondence.marker_id
+                for correspondence in self.correspondences
+            )
+        )
+
+    @property
+    def surface_points(self) -> tuple[Point2D, ...]:
+        return tuple(
+            correspondence.surface_position
             for correspondence in self.correspondences
         )
 
@@ -129,18 +185,7 @@ class OpenCVArucoDetector:
 
     def detect(self, frame: Any) -> tuple[DetectedMarker, ...]:
         """Return only well-formed four-corner detections from one frame."""
-        try:
-            if self._detector is not None:
-                raw_corners, raw_ids, _ = self._detector.detectMarkers(frame)
-            else:
-                raw_corners, raw_ids, _ = self._aruco.detectMarkers(
-                    frame,
-                    self._dictionary,
-                    parameters=self._parameters,
-                )
-        except Exception as ex:  # noqa: BLE001 (OpenCV is an external boundary).
-            raise FiducialDetectionError('Could not detect fiducials in the frame') from ex
-
+        raw_ids, raw_corners = self._detect_raw(frame)
         if raw_ids is None or raw_corners is None:
             return ()
 
@@ -160,6 +205,56 @@ class OpenCVArucoDetector:
                 detections.append(DetectedMarker(*normalised_marker))
         return tuple(sorted(detections, key=lambda marker: marker.marker_id))
 
+    def detect_strict(self, frame: Any) -> tuple[DetectedMarker, ...]:
+        """Return raw detector evidence, failing on malformed marker data."""
+        raw_ids, raw_corners = self._detect_raw(frame)
+        if raw_ids is None and raw_corners is None:
+            return ()
+        if raw_ids is None or raw_corners is None:
+            available_evidence = raw_corners if raw_ids is None else raw_ids
+            try:
+                evidence_count = len(tuple(available_evidence))  # type: ignore[arg-type]
+            except Exception as ex:  # noqa: BLE001 (the detector is an external boundary).
+                raise FiducialDetectionError(
+                    'Detector returned non-iterable marker evidence',
+                ) from ex
+            if evidence_count == 0:
+                return ()
+            raise FiducialDetectionError(
+                'Detector returned only one of marker IDs and corners',
+            )
+        try:
+            marker_ids = list(raw_ids)
+            marker_corners = list(raw_corners)
+        except Exception as ex:  # noqa: BLE001 (the detector is an external boundary).
+            raise FiducialDetectionError(
+                'Detector returned non-iterable marker evidence',
+            ) from ex
+        if len(marker_ids) != len(marker_corners):
+            raise FiducialDetectionError(
+                'Detector returned mismatched marker IDs and corners',
+            )
+        return _normalise_markers_strict(
+            (marker_id, corners) for marker_id, corners in zip(
+                marker_ids,
+                marker_corners,
+            )
+        )
+
+    def _detect_raw(self, frame: Any) -> tuple[object | None, object | None]:
+        try:
+            if self._detector is not None:
+                raw_corners, raw_ids, _ = self._detector.detectMarkers(frame)
+            else:
+                raw_corners, raw_ids, _ = self._aruco.detectMarkers(
+                    frame,
+                    self._dictionary,
+                    parameters=self._parameters,
+                )
+        except Exception as ex:  # noqa: BLE001 (OpenCV is an external boundary).
+            raise FiducialDetectionError('Could not detect fiducials in the frame') from ex
+        return raw_ids, raw_corners
+
 
 def detect_fiducials(
     frame: Any,
@@ -167,6 +262,119 @@ def detect_fiducials(
 ) -> tuple[DetectedMarker, ...]:
     """Run an injected detector and discard malformed marker results."""
     return _normalise_markers(detector.detect(frame))
+
+
+def detect_metric_fiducials(
+    frame: Any,
+    detector: FiducialDetector,
+) -> tuple[DetectedMarker, ...]:
+    """Run a detector without discarding malformed target evidence."""
+    strict_detector = getattr(detector, 'detect_strict', None)
+    try:
+        if callable(strict_detector):
+            return _normalise_markers_strict(strict_detector(frame))
+        raw_markers = detector.detect(frame)
+        return _normalise_markers_strict(raw_markers)
+    except FiducialDetectionError:
+        raise
+    except Exception as ex:  # noqa: BLE001 (the detector is an external boundary).
+        raise FiducialDetectionError(
+            'Could not perform strict fiducial detection',
+        ) from ex
+
+
+def assemble_metric_correspondences(
+    detected_markers: Iterable[DetectedMarker],
+    target: MetricTarget = METRIC_TARGET,
+    camera_id: str | None = None,
+    minimum_marker_count: int = 4,
+    minimum_spatial_coverage: float = 0.5,
+) -> MetricTargetCorrespondences:
+    """Associate a verified target's ordered corners with camera coordinates."""
+    checked_target = validate_metric_target(target)
+    _validate_metric_assembly_limits(
+        minimum_marker_count,
+        minimum_spatial_coverage,
+    )
+    try:
+        marker_iterator = iter(detected_markers)
+    except TypeError:
+        raise FiducialDetectionError('detected_markers must be iterable') from None
+
+    target_markers = {marker.marker_id: marker for marker in checked_target.markers}
+    markers_by_id: dict[int, DetectedMarker] = {}
+    for detected_marker in _normalise_markers_strict(marker_iterator):
+        if detected_marker.marker_id not in target_markers:
+            raise FiducialDetectionError(
+                f'Detected unknown metric target marker {detected_marker.marker_id}',
+            )
+        if detected_marker.marker_id in markers_by_id:
+            raise FiducialDetectionError(
+                f'Detected duplicate metric target marker {detected_marker.marker_id}',
+            )
+        markers_by_id[detected_marker.marker_id] = detected_marker
+
+    if len(markers_by_id) < minimum_marker_count:
+        raise FiducialDetectionError(
+            f'Metric target needs at least {minimum_marker_count} markers',
+        )
+    provisional_homography = _estimate_target_centre_homography(
+        tuple(
+            (target_markers[marker_id], markers_by_id[marker_id])
+            for marker_id in sorted(markers_by_id)
+        ),
+    )
+
+    correspondences: list[MetricTargetCorrespondence] = []
+    for marker_id in sorted(markers_by_id):
+        target_marker = target_markers[marker_id]
+        detected_marker = markers_by_id[marker_id]
+        ordered_corners = _order_detected_corners(
+            target_marker,
+            detected_marker.corners,
+            provisional_homography,
+        )
+        correspondences.extend(
+            MetricTargetCorrespondence(
+                marker_id,
+                corner_index,
+                surface_position,
+                camera_position,
+            )
+            for corner_index, (surface_position, camera_position) in enumerate(
+                zip(target_marker.corners, ordered_corners),
+            )
+        )
+
+    coverage = _calculate_target_coverage(
+        tuple(correspondence.surface_position for correspondence in correspondences),
+        checked_target,
+    )
+    if coverage < minimum_spatial_coverage:
+        raise FiducialDetectionError(
+            f'Metric target spatial coverage is too small: {coverage!r}',
+        )
+    return MetricTargetCorrespondences(tuple(correspondences), camera_id)
+
+
+def detect_and_assemble_metric_correspondences(
+    frame: Any,
+    detector: FiducialDetector,
+    target: MetricTarget = METRIC_TARGET,
+    camera_id: str | None = None,
+    minimum_marker_count: int = 4,
+    minimum_spatial_coverage: float = 0.5,
+) -> MetricTargetCorrespondences:
+    """Strictly detect and assemble one rotated metric target frame."""
+    checked_target = validate_metric_target(target)
+    _validate_detector_family(detector, checked_target)
+    return assemble_metric_correspondences(
+        detect_metric_fiducials(frame, detector),
+        checked_target,
+        camera_id,
+        minimum_marker_count,
+        minimum_spatial_coverage,
+    )
 
 
 def assemble_correspondences(
@@ -245,6 +453,248 @@ def detect_and_assemble_correspondences(
     return assemble_camera_correspondences(detected_markers_by_camera, pattern)
 
 
+def _normalise_markers_strict(markers: object) -> tuple[DetectedMarker, ...]:
+    if markers is None:
+        raise FiducialDetectionError('Detector returned no marker collection')
+    try:
+        marker_iterator = iter(markers)  # type: ignore[arg-type]
+    except Exception as ex:  # noqa: BLE001 (the detector is an external boundary).
+        raise FiducialDetectionError(
+            'Detector returned a non-iterable marker collection',
+        ) from ex
+
+    normalised_markers: list[DetectedMarker] = []
+    try:
+        for detection_index, marker in enumerate(marker_iterator):
+            normalised_marker = _normalise_marker_from_object(marker)
+            if normalised_marker is None:
+                raise FiducialDetectionError(
+                    f'Detector returned malformed marker evidence at index {detection_index}',
+                )
+            normalised_markers.append(DetectedMarker(*normalised_marker))
+    except FiducialDetectionError:
+        raise
+    except Exception as ex:  # noqa: BLE001 (the detector is an external boundary).
+        raise FiducialDetectionError(
+            'Detector failed while returning marker evidence',
+        ) from ex
+    return tuple(normalised_markers)
+
+
+def _validate_detector_family(
+    detector: FiducialDetector,
+    target: MetricTarget,
+) -> None:
+    detector_family = getattr(detector, 'dictionary_name', None)
+    if detector_family is not None and detector_family != target.marker_family:
+        raise FiducialDetectionError(
+            f'Detector family {detector_family!r} does not match the metric target',
+        )
+
+
+def _validate_metric_assembly_limits(
+    minimum_marker_count: int,
+    minimum_spatial_coverage: float,
+) -> None:
+    if (
+        not isinstance(minimum_marker_count, int)
+        or isinstance(minimum_marker_count, bool)
+        or minimum_marker_count < 4
+    ):
+        raise ValueError('minimum_marker_count must be at least four')
+    if (
+        not isinstance(minimum_spatial_coverage, Real)
+        or isinstance(minimum_spatial_coverage, bool)
+        or not math.isfinite(float(minimum_spatial_coverage))
+        or not 0 <= minimum_spatial_coverage <= 1
+    ):
+        raise ValueError('minimum_spatial_coverage must be between zero and one')
+
+
+def _estimate_target_centre_homography(
+    marker_pairs: Sequence[tuple[MetricTargetMarker, DetectedMarker]],
+) -> tuple[tuple[float, float, float], ...]:
+    centre_pairs = tuple(
+        (
+            _marker_centre(target_marker.corners),
+            _marker_centre(detected_marker.corners),
+        )
+        for target_marker, detected_marker in marker_pairs
+    )
+    best_matrix: tuple[tuple[float, float, float], ...] | None = None
+    best_score = math.inf
+    best_indices: tuple[int, ...] | None = None
+    for indices in itertools.combinations(range(len(centre_pairs)), 4):
+        candidate_pairs = tuple(centre_pairs[idx] for idx in indices)
+        if calculate_polygon_area(
+            calculate_convex_hull(tuple(pair[0] for pair in candidate_pairs)),
+        ) <= 1e-9:
+            continue
+        try:
+            candidate_matrix = _solve_four_point_homography(candidate_pairs)
+            errors = tuple(
+                math.dist(project_point(source, candidate_matrix), destination)
+                for source, destination in centre_pairs
+            )
+        except (InvalidHomographyError, ValueError, OverflowError):
+            continue
+        if any(not math.isfinite(error) for error in errors):
+            continue
+        score = sum(error * error for error in errors)
+        candidate_key = (score, indices)
+        best_key = (
+            best_score,
+            best_indices if best_indices is not None else tuple(),
+        )
+        if candidate_key < best_key:
+            best_matrix = candidate_matrix
+            best_score = score
+            best_indices = indices
+
+    if best_matrix is None:
+        raise FiducialDetectionError(
+            'Metric target markers do not provide sufficient two-dimensional spread',
+        )
+    centre_errors = tuple(
+        math.dist(project_point(source, best_matrix), destination)
+        for source, destination in centre_pairs
+    )
+    if max(centre_errors, default=math.inf) > _centre_error_limit(centre_pairs):
+        raise FiducialDetectionError(
+            'Metric target marker centres cannot be fitted reliably',
+        )
+    return best_matrix
+
+
+def _order_detected_corners(
+    target_marker: MetricTargetMarker,
+    detected_corners: tuple[Point2D, ...],
+    provisional_homography: tuple[tuple[float, float, float], ...],
+) -> tuple[Point2D, ...]:
+    predicted_corners = tuple(
+        project_point(corner, provisional_homography)
+        for corner in target_marker.corners
+    )
+    candidates = []
+    for shift in range(4):
+        ordered_corners = detected_corners[shift:] + detected_corners[:shift]
+        error = sum(
+            math.dist(predicted_corner, detected_corner)
+            for predicted_corner, detected_corner in zip(
+                predicted_corners,
+                ordered_corners,
+            )
+        )
+        candidates.append((error, shift, ordered_corners))
+    candidates.sort(key=lambda candidate: (candidate[0], candidate[1]))
+    best_error, _, best_corners = candidates[0]
+    second_error = candidates[1][0]
+    observed_diagonal = math.dist(detected_corners[0], detected_corners[2])
+    if (
+        second_error - best_error <= max(1e-6, observed_diagonal * 0.02)
+        or best_error / 4 > max(3.0, observed_diagonal * 0.25)
+    ):
+        raise FiducialDetectionError(
+            f'Metric target marker {target_marker.marker_id} has unreliable corner order',
+        )
+    return best_corners
+
+
+def _solve_four_point_homography(
+    point_pairs: Sequence[tuple[Point2D, Point2D]],
+) -> tuple[tuple[float, float, float], ...]:
+    equations: list[list[float]] = []
+    for source, destination in point_pairs:
+        equations.append([
+            source.x,
+            source.y,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            -source.x * destination.x,
+            -source.y * destination.x,
+            destination.x,
+        ])
+        equations.append([
+            0.0,
+            0.0,
+            0.0,
+            source.x,
+            source.y,
+            1.0,
+            -source.x * destination.y,
+            -source.y * destination.y,
+            destination.y,
+        ])
+    values = _solve_linear_system(equations)
+    matrix = (
+        (values[0], values[1], values[2]),
+        (values[3], values[4], values[5]),
+        (values[6], values[7], 1.0),
+    )
+    return validate_homography(matrix)
+
+
+def _solve_linear_system(equations: list[list[float]]) -> tuple[float, ...]:
+    matrix = [row[:8] + [row[8]] for row in equations]
+    for column in range(8):
+        pivot_index = max(
+            range(column, 8),
+            key=lambda row_index: abs(matrix[row_index][column]),
+        )
+        pivot = matrix[pivot_index][column]
+        if not math.isfinite(pivot) or abs(pivot) <= 1e-12:
+            raise ValueError('Point pairs are degenerate')
+        matrix[column], matrix[pivot_index] = matrix[pivot_index], matrix[column]
+        pivot_row = matrix[column]
+        pivot_value = pivot_row[column]
+        for row_index in range(8):
+            if row_index == column:
+                continue
+            scale = matrix[row_index][column] / pivot_value
+            if scale == 0:
+                continue
+            for value_index in range(column, 9):
+                matrix[row_index][value_index] -= scale * pivot_row[value_index]
+    values = tuple(matrix[row_index][8] / matrix[row_index][row_index] for row_index in range(8))
+    if any(not math.isfinite(value) for value in values):
+        raise ValueError('Point pairs produced a non-finite homography')
+    return values
+
+
+def _centre_error_limit(
+    centre_pairs: Sequence[tuple[Point2D, Point2D]],
+) -> float:
+    observed_spread = max(
+        math.dist(first, second)
+        for first, second in itertools.combinations(
+            (pair[1] for pair in centre_pairs),
+            2,
+        )
+    )
+    return max(5.0, observed_spread * 0.1)
+
+
+def _marker_centre(corners: Sequence[Point2D]) -> Point2D:
+    return Point2D(
+        sum(corner.x for corner in corners) / len(corners),
+        sum(corner.y for corner in corners) / len(corners),
+    )
+
+
+def _calculate_target_coverage(
+    points: Sequence[Point2D],
+    target: MetricTarget,
+) -> float:
+    hull_area = calculate_polygon_area(calculate_convex_hull(points))
+    page_area = target.page_width_mm * target.page_height_mm
+    coverage = hull_area / page_area
+    if not math.isfinite(coverage):
+        raise FiducialDetectionError('Metric target coverage is not finite')
+    return coverage
+
+
 def _build_detector_parameters(aruco: Any) -> Any:
     parameters_class = getattr(aruco, 'DetectorParameters', None)
     if parameters_class is not None:
@@ -311,7 +761,7 @@ def _normalise_marker(
         if normalised_corner is None:
             return None
         normalised_corners.append(normalised_corner)
-    polygon_area = _polygon_area(normalised_corners)
+    polygon_area = calculate_polygon_area(normalised_corners)
     if (
         len(set(normalised_corners)) != 4
         or not math.isfinite(polygon_area)
@@ -359,17 +809,6 @@ def _normalise_point(point: object) -> Point2D | None:
     return Point2D(x_pos, y_pos)
 
 
-def _polygon_area(corners: Sequence[Point2D]) -> float:
-    return abs(
-        sum(
-            corners[idx].x * corners[(idx + 1) % len(corners)].y
-            - corners[(idx + 1) % len(corners)].x * corners[idx].y
-            for idx in range(len(corners))
-        )
-        / 2
-    )
-
-
 def _is_convex_polygon(corners: Sequence[Point2D]) -> bool:
     cross_products = [
         (
@@ -394,9 +833,14 @@ __all__ = [
     'DetectedMarker',
     'FiducialCorrespondence',
     'FiducialDetector',
+    'MetricTargetCorrespondence',
+    'MetricTargetCorrespondences',
     'OpenCVArucoDetector',
     'assemble_camera_correspondences',
     'assemble_correspondences',
+    'assemble_metric_correspondences',
     'detect_and_assemble_correspondences',
+    'detect_and_assemble_metric_correspondences',
     'detect_fiducials',
+    'detect_metric_fiducials',
 ]

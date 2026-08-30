@@ -13,6 +13,8 @@ import numpy as np
 from multivision.config import (
     CalibrationThresholds,
     Configuration,
+    MetricCalibrationThresholds,
+    ProjectorOutputDescriptor,
     load_configuration,
     save_configuration,
 )
@@ -82,6 +84,8 @@ class PackageTest(unittest.TestCase):
             [],
             {'projector_resolution': {'width': 0}},
             {'calibration_thresholds': {'min_inlier_ratio': True}},
+            {'metric_calibration_thresholds': []},
+            {'projector_output_identity': None},
             {'calibration_version': 0},
         ]
         for malformed_value in malformed_values:
@@ -94,6 +98,76 @@ class PackageTest(unittest.TestCase):
             with self.subTest(invalid_value=invalid_value):
                 with self.assertRaises(ConfigurationError):
                     CalibrationThresholds(max_mean_reprojection_error=invalid_value)
+
+    def test_configuration_keeps_existing_positional_arguments(self) -> None:
+        configuration = Configuration(
+            Resolution(1600, 900),
+            CalibrationThresholds(min_unique_tags=6),
+            3,
+        )
+
+        assert configuration.projector_resolution == Resolution(1600, 900), f'{configuration=}'
+        assert configuration.calibration_thresholds.min_unique_tags == 6, f'{configuration=}'
+        assert configuration.calibration_version == 3, f'{configuration=}'
+
+    def test_metric_configuration_round_trip_and_projector_descriptor(self) -> None:
+        configuration = Configuration(
+            projector_resolution=Resolution(1600, 900),
+            projector_output_identity='table-projector',
+            metric_calibration_thresholds=MetricCalibrationThresholds(
+                ransac_reprojection_threshold_mm=1.5,
+                max_capture_corner_jitter_pixels=1.0,
+                max_mean_fit_error_mm=1.0,
+                max_fit_error_mm=3.0,
+                min_inlier_ratio=0.75,
+                min_unique_target_fiducials=5,
+                min_spatial_coverage=0.6,
+            ),
+        )
+
+        loaded_configuration = Configuration.from_data(configuration.to_data())
+
+        assert loaded_configuration == configuration, f'{loaded_configuration=}'
+        assert configuration.projector_output_descriptor == ProjectorOutputDescriptor(
+            Resolution(1600, 900),
+            'table-projector',
+        )
+
+    def test_metric_configuration_rejects_invalid_values(self) -> None:
+        invalid_values = {
+            'ransac_reprojection_threshold_mm': [0, -1, math.nan, math.inf],
+            'max_capture_corner_jitter_pixels': [0, -1, math.nan, math.inf],
+            'max_mean_fit_error_mm': [-1, math.nan, math.inf],
+            'max_fit_error_mm': [-1, math.nan, math.inf],
+            'min_inlier_ratio': [-1, 1.1, math.nan, math.inf],
+            'min_unique_target_fiducials': [0, -1, True],
+            'min_spatial_coverage': [-1, 1.1, math.nan, math.inf],
+        }
+        for field_name, values in invalid_values.items():
+            for invalid_value in values:
+                with self.subTest(field_name=field_name, invalid_value=invalid_value):
+                    with self.assertRaises(ConfigurationError):
+                        MetricCalibrationThresholds(**{field_name: invalid_value})
+
+        for invalid_identity in ['', None, 1, True]:
+            with self.subTest(invalid_identity=invalid_identity):
+                with self.assertRaises(ConfigurationError):
+                    Configuration(
+                        projector_output_identity=invalid_identity,  # type: ignore[arg-type]
+                    )
+
+    def test_save_preserves_unrelated_configuration_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / 'config.json'
+            path.write_text(
+                json.dumps({'unrelated_setting': {'enabled': True}}),
+                encoding='utf-8',
+            )
+
+            save_configuration(Configuration(), path)
+            saved_data = json.loads(path.read_text(encoding='utf-8'))
+
+        assert saved_data['unrelated_setting'] == {'enabled': True}, f'{saved_data=}'
 
     def test_save_is_valid_json_even_when_replaced(self) -> None:
         configuration = Configuration()

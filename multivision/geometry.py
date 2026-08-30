@@ -122,6 +122,45 @@ def preview_local_to_camera_native(
     )
 
 
+def calculate_convex_hull(points: Sequence[Point2D]) -> tuple[Point2D, ...]:
+    """Return the points on the convex hull in deterministic order."""
+    unique_points = sorted(set(points))
+    if len(unique_points) < 3:
+        return tuple(unique_points)
+
+    def cross(first: Point2D, second: Point2D, third: Point2D) -> float:
+        return (
+            (second.x - first.x) * (third.y - first.y)
+            - (second.y - first.y) * (third.x - first.x)
+        )
+
+    lower: list[Point2D] = []
+    for point in unique_points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+    upper: list[Point2D] = []
+    for point in reversed(unique_points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+    return tuple(lower[:-1] + upper[:-1])
+
+
+def calculate_polygon_area(polygon: Sequence[Point2D]) -> float:
+    """Return the absolute area of an ordered polygon."""
+    if len(polygon) < 3:
+        return 0.0
+    return abs(
+        sum(
+            polygon[idx].x * polygon[(idx + 1) % len(polygon)].y
+            - polygon[(idx + 1) % len(polygon)].x * polygon[idx].y
+            for idx in range(len(polygon))
+        )
+        / 2
+    )
+
+
 def is_finite_point(point: object) -> bool:
     """Return whether a point contains exactly two finite numeric coordinates."""
     coordinates = _get_point_coordinates(point)
@@ -668,6 +707,8 @@ __all__ = [
     'RegionLike',
     'build_preview_transform',
     'calculate_available_projector_area',
+    'calculate_convex_hull',
+    'calculate_polygon_area',
     'camera_to_projector',
     'coerce_point',
     'intersect_polygon_with_bounds',

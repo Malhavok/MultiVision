@@ -11,9 +11,12 @@ from multivision.fiducials import (
     OpenCVArucoDetector,
     assemble_camera_correspondences,
     assemble_correspondences,
+    assemble_metric_correspondences,
     detect_and_assemble_correspondences,
+    detect_metric_fiducials,
 )
 from multivision.geometry import Point2D
+from multivision.metric_target import METRIC_TARGET
 from multivision.pattern import build_calibration_pattern
 from multivision.types import Resolution
 
@@ -69,6 +72,11 @@ class FiducialTest(unittest.TestCase):
 
         with self.assertRaises(FiducialDetectionError):
             detector.detect(object())
+
+    def test_strict_detector_accepts_an_empty_frame(self) -> None:
+        frame = np.full((100, 100), 255, dtype=np.uint8)
+
+        assert OpenCVArucoDetector().detect_strict(frame) == ()
 
     def test_non_finite_polygon_area_is_rejected(self) -> None:
         class FakeDetector:
@@ -189,6 +197,85 @@ class FiducialTest(unittest.TestCase):
         assert len(results['camera-b'].correspondences) == 4, f'{results=}'
         assert results['camera-a'].unique_marker_ids == (0,), f'{results=}'
         assert results['camera-b'].unique_marker_ids == (1,), f'{results=}'
+
+    def test_metric_target_assembly_resolves_rotated_cyclic_corner_order(self) -> None:
+        angle_radians = math.radians(37)
+        cosine = math.cos(angle_radians)
+        sine = math.sin(angle_radians)
+
+        def transform(point: Point2D) -> Point2D:
+            return Point2D(
+                cosine * point.x - sine * point.y + 500,
+                sine * point.x + cosine * point.y + 100,
+            )
+
+        detections = []
+        for marker_id in (0, 3, 16, 19):
+            target_marker = METRIC_TARGET.markers[marker_id]
+            transformed_corners = tuple(
+                transform(point)
+                for point in target_marker.corners
+            )
+            detections.append(
+                DetectedMarker(
+                    marker_id,
+                    transformed_corners[2:] + transformed_corners[:2],
+                ),
+            )
+
+        result = assemble_metric_correspondences(detections, camera_id='camera-0')
+
+        assert result.camera_id == 'camera-0', f'{result=}'
+        assert len(result.correspondences) == 16, f'{result=}'
+        assert result.unique_marker_ids == (0, 3, 16, 19), f'{result=}'
+        for correspondence in result.correspondences:
+            expected_position = transform(correspondence.surface_position)
+            assert math.isclose(
+                correspondence.camera_position.x,
+                expected_position.x,
+                abs_tol=1e-8,
+            ), f'{correspondence=}'
+            assert math.isclose(
+                correspondence.camera_position.y,
+                expected_position.y,
+                abs_tol=1e-8,
+            ), f'{correspondence=}'
+
+    def test_metric_target_assembly_rejects_unknown_duplicate_partial_and_weak_data(self) -> None:
+        valid_detections: list[DetectedMarker] = []
+        for marker_id in (0, 3, 16, 19):
+            marker = METRIC_TARGET.markers[marker_id]
+            valid_detections.append(
+                DetectedMarker(
+                    marker_id,
+                    tuple(Point2D(point.x * 2, point.y * 2) for point in marker.corners),
+                ),
+            )
+        invalid_detections = (
+            valid_detections[:-1] + [DetectedMarker(999, _corners(1, 1))],
+            valid_detections + [valid_detections[0]],
+            valid_detections[:-1] + [DetectedMarker(19, _corners(1, 1)[:3])],
+            [DetectedMarker(marker_id, _corners(marker_id, marker_id)) for marker_id in range(4)],
+        )
+        for detections in invalid_detections:
+            with self.subTest(detections=detections):
+                with self.assertRaises(FiducialDetectionError):
+                    assemble_metric_correspondences(detections)
+
+    def test_metric_detection_does_not_silently_drop_malformed_evidence(self) -> None:
+        class FakeDetector:
+            def detect(self, frame: Any) -> tuple[DetectedMarker, ...]:
+                return (DetectedMarker(0, _corners(1, 1)[:3]),)
+
+        with self.assertRaises(FiducialDetectionError):
+            detect_metric_fiducials(object(), FakeDetector())
+
+        class FailingDetector:
+            def detect(self, frame: Any) -> tuple[DetectedMarker, ...]:
+                raise RuntimeError('detector failed')
+
+        with self.assertRaises(FiducialDetectionError):
+            detect_metric_fiducials(object(), FailingDetector())
 
 
 def _corners(x_pos: float, y_pos: float) -> tuple[Point2D, ...]:

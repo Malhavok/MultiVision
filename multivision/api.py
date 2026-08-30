@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from contextlib import asynccontextmanager
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import (
     FastAPI,
@@ -28,6 +28,7 @@ from multivision.application import (
     MultiVisionService,
     get_camera_area_colour,
 )
+from multivision.config import ProjectorOutputDescriptor
 from multivision.errors import (
     CalibrationError,
     CameraSlotNotFoundError,
@@ -40,11 +41,21 @@ from multivision.errors import (
     MultiVisionError,
     SessionCameraError,
 )
-from multivision.fiducials import FiducialCorrespondence
+from multivision.fiducials import (
+    FiducialCorrespondence,
+    MetricTargetCorrespondence,
+)
 from multivision.geometry import (
     Point2D,
     Polygon,
 )
+from multivision.metric import (
+    MetricCalibrationRecord,
+    MetricCalibrationStatus,
+    MetricRulerOverlay,
+    MetricValidationRecord,
+)
+from multivision.metric_target import METRIC_TARGET
 from multivision.persistence import PersistedCalibration
 from multivision.service import RedCircleOverlay
 from multivision.session import (
@@ -98,6 +109,59 @@ class CalibrationRequest(BaseModel):
 
     camera: str | None = Field(default=None, min_length=1)
     correspondences: list[CorrespondenceRequest] | None = None
+
+
+class MetricCorrespondenceRequest(BaseModel):
+    """One injected metric-target corner for deterministic tests."""
+
+    model_config = ConfigDict(extra='forbid')
+
+    marker_id: StrictInt = Field(ge=0)
+    corner_index: StrictInt = Field(ge=0, le=3)
+    surface: PointPairRequest = Field(
+        validation_alias=AliasChoices('surface', 'surface_position'),
+    )
+    camera: PointPairRequest = Field(
+        validation_alias=AliasChoices('camera', 'camera_position'),
+    )
+
+
+class MetricCalibrationRequest(BaseModel):
+    """The selected camera and optional test-only metric correspondence seam."""
+
+    model_config = ConfigDict(extra='forbid')
+
+    camera: str = Field(min_length=1)
+    correspondences: list[MetricCorrespondenceRequest] | None = None
+
+
+MetricUnitLiteral = Literal['mm', 'cm', 'in']
+
+
+class MetricRulerRequest(BaseModel):
+    """A physical ruler request in surface millimetres."""
+
+    model_config = ConfigDict(extra='forbid')
+
+    surface_start: PointPairRequest = Field(
+        validation_alias=AliasChoices('from', 'surface_start'),
+    )
+    surface_end: PointPairRequest = Field(
+        validation_alias=AliasChoices('to', 'surface_end'),
+    )
+    unit: MetricUnitLiteral = 'mm'
+    observed_length: float | None = None
+    observed_unit: MetricUnitLiteral = 'mm'
+
+    @field_validator('observed_length', mode='before')
+    @classmethod
+    def validate_observed_length(cls, value: Any) -> float | None:
+        if value is None:
+            return None
+        checked_length = _validate_coordinate(value)
+        if checked_length <= 0:
+            raise ValueError('observed_length must be positive')
+        return checked_length
 
 
 class CameraRenameRequest(BaseModel):
@@ -342,6 +406,40 @@ def create_app(
             },
         }
 
+    @app.post('/metric/calibration')
+    def calibrate_metric(request: MetricCalibrationRequest) -> dict[str, Any]:
+        correspondences = _to_metric_correspondences(request)
+        record = owned_service.calibrate_metric(request.camera, correspondences)
+        return _json_safe(_metric_calibration_to_data(record))
+
+    @app.get('/metric/calibration/status')
+    def get_metric_calibration_status() -> dict[str, Any]:
+        status, record = owned_service.get_metric_status_snapshot()
+        return _json_safe(_metric_status_to_data(status, record, owned_service))
+
+    @app.delete('/metric/calibration')
+    def clear_metric_calibration() -> dict[str, Any]:
+        owned_service.clear_metric_calibration()
+        return {'cleared': True}
+
+    @app.post('/metric/ruler')
+    def set_metric_ruler(request: MetricRulerRequest) -> dict[str, Any]:
+        surface_start = _point_from_request(request.surface_start)
+        surface_end = _point_from_request(request.surface_end)
+        ruler, validation = owned_service.set_metric_ruler_with_validation(
+            surface_start,
+            surface_end,
+            request.unit,
+            request.observed_length,
+            request.observed_unit,
+        )
+        return _json_safe(_metric_ruler_to_data(ruler, validation, request))
+
+    @app.delete('/metric/ruler')
+    def clear_metric_ruler() -> dict[str, Any]:
+        owned_service.clear_metric_ruler()
+        return {'cleared': True}
+
     @app.post('/overlay/point')
     def point(request: PointRequest) -> dict[str, Any]:
         overlay = owned_service.point_from_camera(
@@ -401,8 +499,207 @@ def _to_correspondence(request: CorrespondenceRequest) -> FiducialCorrespondence
     )
 
 
+def _to_metric_correspondences(
+    request: MetricCalibrationRequest,
+) -> tuple[MetricTargetCorrespondence, ...] | None:
+    if request.correspondences is None:
+        return None
+    return tuple(
+        MetricTargetCorrespondence(
+            correspondence.marker_id,
+            correspondence.corner_index,
+            _point_from_request(correspondence.surface),
+            _point_from_request(correspondence.camera),
+        )
+        for correspondence in request.correspondences
+    )
+
+
 def _point_from_request(request: PointPairRequest) -> Point2D:
     return Point2D(request.x, request.y)
+
+
+def _metric_point_to_data(point: Point2D) -> list[float]:
+    return [point.x, point.y]
+
+
+def _metric_target_to_data() -> dict[str, Any]:
+    return {
+        'format': METRIC_TARGET.format_name,
+        'format_name': METRIC_TARGET.format_name,
+        'version': METRIC_TARGET.format_version,
+        'format_version': METRIC_TARGET.format_version,
+        'marker_family': METRIC_TARGET.marker_family,
+        'marker_count': METRIC_TARGET.marker_count,
+        'marker_ids': list(METRIC_TARGET.marker_ids),
+        'page_size_mm': list(METRIC_TARGET.page_size_mm),
+        'markers': [
+            {
+                'marker_id': marker.marker_id,
+                'corners': [_metric_point_to_data(point) for point in marker.corners],
+            }
+            for marker in METRIC_TARGET.markers
+        ],
+        'orientation_cue': {
+            'label': METRIC_TARGET.orientation_cue.label,
+            'corners': [
+                _metric_point_to_data(point)
+                for point in METRIC_TARGET.orientation_cue.corners
+            ],
+            'text_position': _metric_point_to_data(
+                METRIC_TARGET.orientation_cue.text_position,
+            ),
+        },
+        'reference_segment': {
+            'start': _metric_point_to_data(METRIC_TARGET.reference_segment.start),
+            'end': _metric_point_to_data(METRIC_TARGET.reference_segment.end),
+            'length_mm': METRIC_TARGET.reference_segment.length_mm,
+            'label': METRIC_TARGET.reference_segment.label,
+        },
+    }
+
+
+def _metric_calibration_to_data(
+    record: MetricCalibrationRecord,
+) -> dict[str, Any]:
+    metrics = record.metrics
+    return {
+        'state': record.state.value,
+        'projector_to_surface': (
+            None
+            if record.projector_to_surface is None
+            else [list(row) for row in record.projector_to_surface]
+        ),
+        'surface_to_projector': (
+            None
+            if record.surface_to_projector is None
+            else [list(row) for row in record.surface_to_projector]
+        ),
+        'projector_output_descriptor': _descriptor_to_data(
+            record.projector_output_descriptor,
+        ),
+        'projector_resolution': _resolution_to_data(record.projector_resolution),
+        'output_identity': record.output_identity,
+        'target': _metric_target_to_data(),
+        'target_format': record.target_format,
+        'target_version': record.target_version,
+        'marker_family': record.marker_family,
+        'observation_camera_slot': record.observation_camera_slot,
+        'observation_camera_id': record.observation_camera_id,
+        'observation_camera_calibration_version': (
+            record.observation_camera_calibration_version
+        ),
+        'observation_camera_calibration_timestamp': (
+            record.observation_camera_calibration_timestamp
+        ),
+        'timestamp': record.timestamp,
+        'metrics': None if metrics is None else {
+            'unique_target_fiducial_count': metrics.unique_target_fiducial_count,
+            'correspondence_corner_count': metrics.correspondence_corner_count,
+            'ransac_inlier_count': metrics.ransac_inlier_count,
+            'inlier_ratio': metrics.inlier_ratio,
+            'mean_fit_error_mm': metrics.mean_fit_error_mm,
+            'max_fit_error_mm': metrics.max_fit_error_mm,
+            'target_page_spatial_coverage': metrics.target_page_spatial_coverage,
+        },
+        'fit_error_mm': record.fit_error_mm,
+        'validation_records': [
+            _metric_validation_to_data(validation)
+            for validation in record.validation_records
+        ],
+        'latest_physical_validation_error_mm': (
+            record.latest_physical_validation_error_mm
+        ),
+    }
+
+
+def _descriptor_to_data(
+    descriptor: ProjectorOutputDescriptor,
+) -> dict[str, Any]:
+    return {
+        'projector_resolution': _resolution_to_data(descriptor.projector_resolution),
+        'output_identity': descriptor.output_identity,
+    }
+
+
+def _metric_validation_to_data(
+    validation: MetricValidationRecord,
+) -> dict[str, Any]:
+    return {
+        'requested_length_mm': validation.requested_length_mm,
+        'observed_length_mm': validation.observed_length_mm,
+        'absolute_error_mm': validation.absolute_error_mm,
+        'timestamp': validation.timestamp,
+    }
+
+
+def _metric_status_to_data(
+    status: MetricCalibrationStatus,
+    record: MetricCalibrationRecord | None,
+    service: MultiVisionService,
+) -> dict[str, Any]:
+    if not isinstance(status, MetricCalibrationStatus):
+        raise GeometryError('Metric service returned an invalid calibration state')
+    descriptor = service.projector_output_descriptor
+    state = status.value
+    error_code = None if status is MetricCalibrationStatus.CALIBRATED else (
+        'METRIC_STALE'
+        if status is MetricCalibrationStatus.STALE
+        else 'METRIC_UNAVAILABLE'
+    )
+    data: dict[str, Any] = {
+        'state': state,
+        'status': state,
+        'applicable': status is MetricCalibrationStatus.CALIBRATED,
+        'error_code': error_code,
+        'projector_output_descriptor': _descriptor_to_data(descriptor),
+        'projector_resolution': _resolution_to_data(descriptor.projector_resolution),
+        'output_identity': descriptor.output_identity,
+        'target': _metric_target_to_data(),
+        'calibration': None,
+    }
+    if record is not None:
+        calibration_data = _metric_calibration_to_data(record)
+        data['calibration'] = calibration_data
+        data.update(
+            {
+                key: value
+                for key, value in calibration_data.items()
+                if key not in {
+                    'state',
+                    'projector_output_descriptor',
+                    'projector_resolution',
+                    'output_identity',
+                }
+            },
+        )
+    return data
+
+
+def _metric_ruler_to_data(
+    ruler: MetricRulerOverlay,
+    validation: MetricValidationRecord | None,
+    request: MetricRulerRequest,
+) -> dict[str, Any]:
+    data = ruler.to_data()
+    data.update(
+        {
+            'observed_length': request.observed_length,
+            'observed_unit': (
+                request.observed_unit if request.observed_length is not None else None
+            ),
+            'observed_length_mm': (
+                None if validation is None else validation.observed_length_mm
+            ),
+            'absolute_error_mm': (
+                None if validation is None else validation.absolute_error_mm
+            ),
+            'validation': (
+                None if validation is None else _metric_validation_to_data(validation)
+            ),
+        },
+    )
+    return data
 
 
 def _device_to_data(device: DeviceInfo) -> dict[str, Any]:
@@ -650,6 +947,9 @@ app = create_app()
 
 __all__ = [
     'CalibrationRequest',
+    'MetricCalibrationRequest',
+    'MetricCorrespondenceRequest',
+    'MetricRulerRequest',
     'CameraAreaRequest',
     'CameraRenameRequest',
     'CorrespondenceRequest',

@@ -79,6 +79,126 @@ class CliTest(unittest.TestCase):
             ('DELETE', 'http://service.test/overlay', None),
         ]
 
+    def test_metric_commands_delegate_to_http_with_expected_payloads(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            return ServiceResponse(200, 'application/json', b'{"ok": true}')
+
+        client = MultiVisionClient('http://service.test', request_sender=request_sender)
+        commands = [
+            ['metric', 'calibrate', '--camera', 'camera-0'],
+            ['metric', 'status'],
+            ['metric', 'clear'],
+            [
+                'metric', 'ruler', '--from-mm', '100,100', '--to-mm', '300,100',
+                '--unit', 'cm', '--observed-length', '20', '--observed-unit', 'cm',
+            ],
+            ['metric', 'ruler', 'clear'],
+        ]
+
+        for command in commands:
+            with self.subTest(command=command):
+                assert main(command, client) == 0
+
+        assert [(method, url, payload) for method, url, payload, _ in requests] == [
+            ('POST', 'http://service.test/metric/calibration', {'camera': 'camera-0'}),
+            ('GET', 'http://service.test/metric/calibration/status', None),
+            ('DELETE', 'http://service.test/metric/calibration', None),
+            (
+                'POST',
+                'http://service.test/metric/ruler',
+                {
+                    'from': {'x': 100.0, 'y': 100.0},
+                    'to': {'x': 300.0, 'y': 100.0},
+                    'unit': 'cm',
+                    'observed_length': 20.0,
+                    'observed_unit': 'cm',
+                },
+            ),
+            ('DELETE', 'http://service.test/metric/ruler', None),
+        ]
+
+    def test_metric_target_generation_writes_locally_without_http(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            return ServiceResponse(500, 'application/json', b'{"error": {}}')
+
+        client = MultiVisionClient('http://service.test', request_sender=request_sender)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_path = pathlib.Path(temporary_directory) / 'metric-target.svg'
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = main(
+                    ['metric', 'target', 'generate', '--output', str(output_path)],
+                    client,
+                )
+
+            assert result == 0
+            assert output_path.read_bytes().startswith(b'<?xml'), f'{output_path=}'
+            assert 'Wrote metric target' in output.getvalue(), f'{output.getvalue()=}'
+
+        assert requests == [], f'{requests=}'
+
+    def test_metric_ruler_rejects_invalid_values_before_http(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            return ServiceResponse(200, 'application/json', b'{"ok": true}')
+
+        client = MultiVisionClient(request_sender=request_sender)
+        invalid_commands = [
+            ['metric', 'ruler', '--from-mm', 'nan,1', '--to-mm', '2,3'],
+            [
+                'metric', 'ruler', '--from-mm', '1,1', '--to-mm', '2,3',
+                '--observed-length', '0',
+            ],
+        ]
+        for command in invalid_commands:
+            with self.subTest(command=command), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    main(command, client)
+
+        error_output = io.StringIO()
+        with redirect_stderr(error_output):
+            assert main(
+                ['metric', 'ruler', '--from-mm', '1,1', '--to-mm', '2,3',
+                 '--observed-unit', 'cm'],
+                client,
+            ) == 1
+        assert '--observed-unit requires --observed-length' in error_output.getvalue()
+
+        for command in [
+            [
+                'metric', 'ruler', '--from-mm', '1,1', '--to-mm', '2,3',
+                '--observed-unit', 'mm',
+            ],
+            ['metric', 'ruler', 'clear', '--unit', 'cm'],
+            ['metric', 'ruler', 'clear', '--observed-unit', 'mm'],
+        ]:
+            with self.subTest(command=command), redirect_stderr(io.StringIO()):
+                assert main(command, client) == 1
+        assert requests == [], f'{requests=}'
+
     def test_area_command_prints_service_schema_and_preserves_structured_failures(self) -> None:
         requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
 
@@ -196,6 +316,56 @@ class CliTest(unittest.TestCase):
         assert result == 1
         assert 'CAMERA_UNAVAILABLE' in error_output.getvalue()
         assert 'Camera is unplugged' in error_output.getvalue()
+
+    def test_metric_service_errors_are_structured_and_fail_closed(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            return ServiceResponse(
+                422,
+                'application/json',
+                json.dumps({
+                    'error': {
+                        'code': 'METRIC_STALE',
+                        'message': 'Metric calibration is stale',
+                    },
+                }).encode('utf-8'),
+            )
+
+        client = MultiVisionClient(
+            'http://service.test',
+            request_sender=request_sender,
+        )
+        error_output = io.StringIO()
+        with redirect_stderr(error_output):
+            result = main(
+                [
+                    'metric', 'ruler', '--from-mm', '10,10', '--to-mm', '110,10',
+                ],
+                client,
+            )
+
+        assert result == 1
+        assert 'METRIC_STALE' in error_output.getvalue()
+        assert 'Metric calibration is stale' in error_output.getvalue()
+        assert requests == [
+            (
+                'POST',
+                'http://service.test/metric/ruler',
+                {
+                    'from': {'x': 10.0, 'y': 10.0},
+                    'to': {'x': 110.0, 'y': 10.0},
+                    'unit': 'mm',
+                },
+                5.0,
+            ),
+        ], f'{requests=}'
 
     def test_transport_failures_and_malformed_responses_are_non_zero(self) -> None:
         def failing_request_sender(

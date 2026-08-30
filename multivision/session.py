@@ -6,6 +6,7 @@ import copy
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 
+from multivision.config import ProjectorOutputDescriptor
 from multivision.errors import (
     ActiveCameraLimitError,
     CameraSlotNotFoundError,
@@ -273,6 +274,32 @@ class SessionCameraRegistry:
         camera.calibration_status = calibration_status
         camera.calibration = copy.deepcopy(calibration)
         return self._snapshot_camera(camera)
+
+    def mark_calibrations_stale(
+        self,
+        projector_output_descriptor: ProjectorOutputDescriptor,
+    ) -> list[SessionCamera]:
+        """Mark camera geometry tied to another projector output as stale."""
+        if not isinstance(projector_output_descriptor, ProjectorOutputDescriptor):
+            raise SessionCameraError(
+                'projector_output_descriptor must be ProjectorOutputDescriptor',
+            )
+        stale_cameras: list[SessionCamera] = []
+        for camera in self._cameras:
+            calibration = camera.calibration
+            if calibration is None:
+                continue
+            recorded_descriptor = getattr(
+                calibration,
+                'projector_output_descriptor',
+                None,
+            )
+            if recorded_descriptor == projector_output_descriptor:
+                continue
+            camera.calibration_status = CalibrationStatus.STALE
+            camera.area_enabled = False
+            stale_cameras.append(self._snapshot_camera(camera))
+        return stale_cameras
 
     def _get(self, slot_id: str) -> SessionCamera:
         for camera in self._cameras:

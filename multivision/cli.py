@@ -127,7 +127,7 @@ def main(
         )
         response = _run_command(service_client, arguments)
         _print_command_response(arguments, response)
-    except (ServiceClientError, OSError, ValueError) as ex:
+    except (ServiceClientError, OSError, RuntimeError, ValueError) as ex:
         print(f'multivision: {ex}', file=sys.stderr)
         return 1
     return 0
@@ -253,6 +253,101 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     clear_parser = overlay_subparsers.add_parser('clear', help='clear the current overlay')
     clear_parser.set_defaults(command_handler='overlay_clear')
+
+    metric_parser = subparsers.add_parser(
+        'metric',
+        help='manage metric surface calibration and rulers',
+    )
+    metric_subparsers = metric_parser.add_subparsers(
+        dest='metric_command',
+        required=True,
+    )
+    metric_target_parser = metric_subparsers.add_parser(
+        'target',
+        help='generate metric calibration artifacts',
+    )
+    metric_target_subparsers = metric_target_parser.add_subparsers(
+        dest='metric_target_command',
+        required=True,
+    )
+    metric_target_generate_parser = metric_target_subparsers.add_parser(
+        'generate',
+        help='write the printable metric target SVG',
+    )
+    metric_target_generate_parser.add_argument(
+        '--output',
+        required=True,
+        type=_parse_output_path,
+        help='write the generated SVG to this path',
+    )
+    metric_target_generate_parser.set_defaults(
+        command_handler='metric_target_generate',
+    )
+
+    metric_calibrate_parser = metric_subparsers.add_parser(
+        'calibrate',
+        help='calibrate the shared metric surface',
+    )
+    metric_calibrate_parser.add_argument(
+        '--camera',
+        required=True,
+        type=_parse_non_empty_argument,
+        help='camera session slot used to observe the target',
+    )
+    metric_calibrate_parser.set_defaults(command_handler='metric_calibrate')
+
+    metric_status_parser = metric_subparsers.add_parser(
+        'status',
+        help='show metric calibration status',
+    )
+    metric_status_parser.set_defaults(command_handler='metric_status')
+
+    metric_clear_parser = metric_subparsers.add_parser(
+        'clear',
+        help='clear metric calibration',
+    )
+    metric_clear_parser.set_defaults(command_handler='metric_clear')
+
+    metric_ruler_parser = metric_subparsers.add_parser(
+        'ruler',
+        help='create or clear the metric ruler',
+    )
+    metric_ruler_parser.add_argument(
+        '--from-mm',
+        type=_parse_metric_point,
+        dest='from_mm',
+        help='surface start point as x,y in millimetres',
+    )
+    metric_ruler_parser.add_argument(
+        '--to-mm',
+        type=_parse_metric_point,
+        dest='to_mm',
+        help='surface end point as x,y in millimetres',
+    )
+    metric_ruler_parser.add_argument(
+        '--unit',
+        choices=('mm', 'cm', 'in'),
+        default=None,
+        help='unit used for the displayed length (default: mm)',
+    )
+    metric_ruler_parser.add_argument(
+        '--observed-length',
+        type=_parse_positive_finite_float,
+        default=None,
+        help='optional physically measured length',
+    )
+    metric_ruler_parser.add_argument(
+        '--observed-unit',
+        choices=('mm', 'cm', 'in'),
+        default=None,
+        help='unit of --observed-length (default: mm)',
+    )
+    metric_ruler_parser.add_argument(
+        'ruler_action',
+        nargs='?',
+        choices=('clear',),
+    )
+    metric_ruler_parser.set_defaults(command_handler='metric_ruler')
     return parser
 
 
@@ -276,6 +371,11 @@ def _run_command(
         'snapshot': _snapshot,
         'point': _point,
         'overlay_clear': _overlay_clear,
+        'metric_target_generate': _metric_target_generate,
+        'metric_calibrate': _metric_calibrate,
+        'metric_status': _metric_status,
+        'metric_clear': _metric_clear,
+        'metric_ruler': _metric_ruler,
     }
     try:
         handler = command_handlers[arguments.command_handler]
@@ -372,7 +472,75 @@ def _overlay_clear(
     return client.delete('/overlay')
 
 
+def _metric_target_generate(
+    _client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    _write_metric_target_svg(arguments.output)
+    return ServiceResponse(204, '', b'')
+
+
+def _metric_calibrate(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.post('/metric/calibration', {'camera': arguments.camera})
+
+
+def _metric_status(
+    client: MultiVisionClient,
+    _arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.get('/metric/calibration/status')
+
+
+def _metric_clear(
+    client: MultiVisionClient,
+    _arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.delete('/metric/calibration')
+
+
+def _metric_ruler(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    if arguments.ruler_action == 'clear':
+        if (
+            arguments.from_mm is not None
+            or arguments.to_mm is not None
+            or arguments.unit is not None
+            or arguments.observed_length is not None
+            or arguments.observed_unit is not None
+        ):
+            raise ValueError('ruler clear cannot include ruler options')
+        return client.delete('/metric/ruler')
+    if arguments.from_mm is None or arguments.to_mm is None:
+        raise ValueError('--from-mm and --to-mm are required unless clearing the ruler')
+    if arguments.observed_length is None and arguments.observed_unit is not None:
+        raise ValueError('--observed-unit requires --observed-length')
+
+    payload: dict[str, Any] = {
+        'from': {'x': arguments.from_mm[0], 'y': arguments.from_mm[1]},
+        'to': {'x': arguments.to_mm[0], 'y': arguments.to_mm[1]},
+        'unit': arguments.unit or 'mm',
+    }
+    if arguments.observed_length is not None:
+        payload['observed_length'] = arguments.observed_length
+        payload['observed_unit'] = arguments.observed_unit or 'mm'
+    return client.post('/metric/ruler', payload)
+
+
+def _write_metric_target_svg(output_path: pathlib.Path) -> None:
+    from multivision.metric_target import write_metric_target_svg
+
+    write_metric_target_svg(output_path)
+
+
 def _print_command_response(arguments: argparse.Namespace, response: ServiceResponse) -> None:
+    if arguments.command_handler == 'metric_target_generate':
+        print(f'Wrote metric target to {arguments.output}')
+        return
     output_path = getattr(arguments, 'output', None)
     if arguments.command == 'snapshot' and output_path is not None:
         output_path.write_bytes(response.body)
@@ -443,6 +611,42 @@ def _parse_finite_float(value: str) -> float:
     if not math.isfinite(parsed_value):
         raise argparse.ArgumentTypeError('must be a finite number')
     return parsed_value
+
+
+def _parse_positive_finite_float(value: str) -> float:
+    parsed_value = _parse_finite_float(value)
+    if parsed_value <= 0:
+        raise argparse.ArgumentTypeError('must be positive')
+    return parsed_value
+
+
+def _parse_metric_point(value: str) -> tuple[float, float]:
+    if not isinstance(value, str):
+        raise argparse.ArgumentTypeError('must be two comma-separated numbers')
+    coordinates = value.split(',')
+    if len(coordinates) != 2:
+        raise argparse.ArgumentTypeError('must be two comma-separated numbers')
+    try:
+        return (
+            _parse_finite_float(coordinates[0].strip()),
+            _parse_finite_float(coordinates[1].strip()),
+        )
+    except argparse.ArgumentTypeError as ex:
+        raise argparse.ArgumentTypeError(
+            'must be two comma-separated finite numbers',
+        ) from ex
+
+
+def _parse_non_empty_argument(value: str) -> str:
+    if not isinstance(value, str) or len(value.strip()) == 0:
+        raise argparse.ArgumentTypeError('must be a non-empty value')
+    return value.strip()
+
+
+def _parse_output_path(value: str) -> pathlib.Path:
+    if not isinstance(value, str) or len(value.strip()) == 0:
+        raise argparse.ArgumentTypeError('must be a non-empty path')
+    return pathlib.Path(value)
 
 
 def _quote_path_component(value: str) -> str:
