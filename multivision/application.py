@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import pathlib
+import statistics
 import threading
 import time
 from collections.abc import Sequence
@@ -75,6 +76,7 @@ from multivision.persistence import (
 from multivision.service import PointOverlayService, RedCircleOverlay
 from multivision.session import SessionCamera
 from multivision.types import (
+    CalibrationStage,
     CalibrationStatus,
     CameraStatus,
     DeviceInfo,
@@ -214,6 +216,7 @@ class MultiVisionService:
         self._calibration_capture_count = 0
         self._calibration_capture_lock = threading.RLock()
         self._calibration_pattern_presented = threading.Event()
+        self._calibration_pattern_hold = False
         self._metric_capture_count = 0
         self._metric_capture_lock = threading.RLock()
         # Camera-pattern and metric-blank handshakes must never overlap.
@@ -366,7 +369,17 @@ class MultiVisionService:
     @property
     def calibration_pattern_visible(self) -> bool:
         with self._calibration_capture_lock:
-            return self._calibration_capture_count > 0
+            return self._calibration_pattern_hold or self._calibration_capture_count > 0
+
+    def show_calibration_pattern(self) -> None:
+        """Keep the calibration pattern projected for manual camera adjustment."""
+        with self._calibration_capture_lock:
+            self._calibration_pattern_hold = True
+
+    def hide_calibration_pattern(self) -> None:
+        """Stop the manual calibration-pattern display without changing calibration."""
+        with self._calibration_capture_lock:
+            self._calibration_pattern_hold = False
 
     def mark_calibration_pattern_presented(self) -> None:
         """Acknowledge a successful main-thread pattern presentation."""
@@ -457,6 +470,43 @@ class MultiVisionService:
                 calibration_status = self._get_calibration_status(status)
                 checked_statuses.append(status._replace(calibration_status=calibration_status))
             return checked_statuses
+
+    def get_calibration_status_snapshot(
+        self,
+    ) -> tuple[CalibrationStage, MetricCalibrationStatus, list[CameraStatus]]:
+        """Return one consistent aggregate, metric and camera status snapshot."""
+        with self._camera_management_lock:
+            metric_status = self.metric_calibration_registry.get_status(
+                self._projector_output_descriptor,
+            )
+            camera_statuses = self.get_camera_statuses()
+            if metric_status is MetricCalibrationStatus.CALIBRATED:
+                stage = CalibrationStage.METRIC_CALIBRATED
+            elif metric_status is MetricCalibrationStatus.STALE:
+                stage = CalibrationStage.STALE
+            elif any(
+                status.calibration_status is CalibrationStatus.CALIBRATED
+                for status in camera_statuses
+            ):
+                stage = CalibrationStage.CALIBRATED
+            elif any(
+                status.calibration_status is CalibrationStatus.STALE
+                for status in camera_statuses
+            ):
+                stage = CalibrationStage.STALE
+            elif any(
+                status.calibration_status is CalibrationStatus.UNVERIFIED
+                for status in camera_statuses
+            ):
+                stage = CalibrationStage.UNVERIFIED
+            else:
+                stage = CalibrationStage.UNCALIBRATED
+            return stage, metric_status, camera_statuses
+
+    def get_calibration_stage(self) -> CalibrationStage:
+        """Return the highest complete calibration stage for the session."""
+        stage, _metric_status, _camera_statuses = self.get_calibration_status_snapshot()
+        return stage
 
     def snapshot(self, logical_name: str) -> Frame:
         """Return the latest frame retained by the persistent camera runtime."""
@@ -640,6 +690,8 @@ class MultiVisionService:
                     frames,
                     self.configuration.metric_calibration_thresholds
                     .max_capture_corner_jitter_pixels,
+                    self.configuration.metric_calibration_thresholds
+                    .min_capture_marker_ratio,
                     camera.slot_id,
                 )
                 result = calibrate_metric_homography(
@@ -1450,6 +1502,7 @@ def _replace_metric_camera_id(
 def _average_metric_correspondences(
     frames: Sequence[MetricTargetCorrespondences],
     maximum_corner_jitter_pixels: float,
+    minimum_marker_ratio: float,
     camera_id: str,
 ) -> MetricTargetCorrespondences:
     if len(frames) != METRIC_CAPTURE_FRAME_COUNT:
@@ -1458,70 +1511,91 @@ def _average_metric_correspondences(
         )
     if not math.isfinite(maximum_corner_jitter_pixels) or maximum_corner_jitter_pixels <= 0:
         raise CalibrationError('Metric corner jitter tolerance is invalid')
+    if (
+        not math.isfinite(minimum_marker_ratio)
+        or not 0 < minimum_marker_ratio <= 1
+    ):
+        raise CalibrationError('Metric capture marker ratio is invalid')
 
-    first_frame = validate_metric_correspondences(
-        _replace_metric_camera_id(frames[0], camera_id),
-        target=METRIC_TARGET,
-    )
-    first_by_corner = _metric_correspondences_by_corner(first_frame)
-    first_marker_ids = first_frame.unique_marker_ids
-    averaged: list[MetricTargetCorrespondence] = []
-    frame_corner_maps = [first_by_corner]
-    for frame in frames[1:]:
-        checked_frame = validate_metric_correspondences(
+    checked_frames = tuple(
+        validate_metric_correspondences(
             _replace_metric_camera_id(frame, camera_id),
             target=METRIC_TARGET,
         )
-        frame_by_corner = _metric_correspondences_by_corner(checked_frame)
-        if set(checked_frame.unique_marker_ids) != set(first_marker_ids):
-            raise CalibrationError(
-                'Metric capture frames do not contain the same target marker IDs',
-            )
-        if set(frame_by_corner) != set(first_by_corner):
-            raise CalibrationError(
-                'Metric capture frames do not contain the same target corners',
-            )
-        frame_corner_maps.append(frame_by_corner)
-        for corner_key, first_correspondence in first_by_corner.items():
-            correspondence = frame_by_corner[corner_key]
-            if correspondence.surface_position != first_correspondence.surface_position:
-                raise CalibrationError(
-                    'Metric capture frames disagree about target corner positions',
-                )
-            try:
-                corner_jitter = math.dist(
-                    first_correspondence.camera_position,
-                    correspondence.camera_position,
-                )
-            except (TypeError, ValueError) as ex:
-                raise CalibrationError(
-                    'Metric capture contains an invalid camera corner',
-                ) from ex
-            if not math.isfinite(corner_jitter) or corner_jitter > maximum_corner_jitter_pixels:
-                raise CalibrationError(
-                    'Metric capture detected movement beyond the stability tolerance',
-                )
+        for frame in frames
+    )
+    frame_corner_maps = tuple(
+        _metric_correspondences_by_corner(frame)
+        for frame in checked_frames
+    )
+    common_marker_ids = set(checked_frames[0].unique_marker_ids)
+    for frame in checked_frames[1:]:
+        common_marker_ids.intersection_update(frame.unique_marker_ids)
+    stable_marker_ratio = len(common_marker_ids) / len(METRIC_TARGET.markers)
+    if stable_marker_ratio < minimum_marker_ratio:
+        raise CalibrationError(
+            'Metric capture does not contain enough stable target markers',
+        )
 
-    for corner_key, first_correspondence in first_by_corner.items():
+    common_corner_keys = tuple(
+        sorted(
+            corner_key
+            for corner_key in frame_corner_maps[0]
+            if corner_key[0] in common_marker_ids
+            and all(corner_key in corner_map for corner_map in frame_corner_maps)
+        ),
+    )
+    if len(common_corner_keys) < 4:
+        raise CalibrationError(
+            'Metric capture does not contain enough stable target corners',
+        )
+
+    first_by_corner = frame_corner_maps[0]
+    averaged: list[MetricTargetCorrespondence] = []
+    for corner_key in common_corner_keys:
+        first_correspondence = first_by_corner[corner_key]
         frame_correspondences = [
             corner_map[corner_key]
             for corner_map in frame_corner_maps
         ]
         try:
-            averaged_camera_position = Point2D(
-                math.fsum(
+            median_camera_position = Point2D(
+                statistics.median(
                     correspondence.camera_position.x
                     for correspondence in frame_correspondences
-                ) / METRIC_CAPTURE_FRAME_COUNT,
-                math.fsum(
+                ),
+                statistics.median(
                     correspondence.camera_position.y
                     for correspondence in frame_correspondences
-                ) / METRIC_CAPTURE_FRAME_COUNT,
+                ),
+            )
+            corner_deviations = tuple(
+                math.dist(
+                    correspondence.camera_position,
+                    median_camera_position,
+                )
+                for correspondence in frame_correspondences
             )
         except (AttributeError, TypeError, ValueError) as ex:
             raise CalibrationError(
                 'Metric capture contains an invalid camera corner',
             ) from ex
+        if (
+            not math.isfinite(statistics.median(corner_deviations))
+            or statistics.median(corner_deviations) > maximum_corner_jitter_pixels
+        ):
+            raise CalibrationError(
+                'Metric capture detected movement beyond the stability tolerance',
+            )
+        median_surface_position = first_correspondence.surface_position
+        if any(
+            correspondence.surface_position != median_surface_position
+            for correspondence in frame_correspondences
+        ):
+            raise CalibrationError(
+                'Metric capture frames disagree about target corner positions',
+            )
+        averaged_camera_position = median_camera_position
         averaged.append(
             MetricTargetCorrespondence(
                 first_correspondence.marker_id,

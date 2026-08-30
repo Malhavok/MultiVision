@@ -229,6 +229,18 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_parser.set_defaults(command_handler='calibration_verify')
     status_parser = calibration_subparsers.add_parser('status', help='show calibration status')
     status_parser.set_defaults(command_handler='calibration_status')
+    pattern_parser = calibration_subparsers.add_parser(
+        'pattern',
+        help='show or hide the calibration pattern',
+    )
+    pattern_subparsers = pattern_parser.add_subparsers(
+        dest='pattern_command',
+        required=True,
+    )
+    pattern_show_parser = pattern_subparsers.add_parser('show', help='keep tags projected')
+    pattern_show_parser.set_defaults(command_handler='calibration_pattern_show')
+    pattern_hide_parser = pattern_subparsers.add_parser('hide', help='hide projected tags')
+    pattern_hide_parser.set_defaults(command_handler='calibration_pattern_hide')
 
     snapshot_parser = subparsers.add_parser('snapshot', help='request a retained camera frame')
     snapshot_parser.add_argument('logical_name')
@@ -368,6 +380,8 @@ def _run_command(
         'calibrate': _calibrate,
         'calibration_verify': _calibration_verify,
         'calibration_status': _calibration_status,
+        'calibration_pattern_show': _calibration_pattern_show,
+        'calibration_pattern_hide': _calibration_pattern_hide,
         'snapshot': _snapshot,
         'point': _point,
         'overlay_clear': _overlay_clear,
@@ -451,6 +465,20 @@ def _calibration_status(
     _arguments: argparse.Namespace,
 ) -> ServiceResponse:
     return client.get('/calibration/status')
+
+
+def _calibration_pattern_show(
+    client: MultiVisionClient,
+    _arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.post('/calibration/pattern')
+
+
+def _calibration_pattern_hide(
+    client: MultiVisionClient,
+    _arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.delete('/calibration/pattern')
 
 
 def _snapshot(client: MultiVisionClient, arguments: argparse.Namespace) -> ServiceResponse:

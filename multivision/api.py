@@ -349,6 +349,16 @@ def create_app(
         frame = owned_service.snapshot(logical_name)
         return _frame_response(frame, logical_name)
 
+    @app.post('/calibration/pattern')
+    def show_calibration_pattern() -> dict[str, bool]:
+        owned_service.show_calibration_pattern()
+        return {'visible': True}
+
+    @app.delete('/calibration/pattern')
+    def hide_calibration_pattern() -> dict[str, bool]:
+        owned_service.hide_calibration_pattern()
+        return {'visible': False}
+
     @app.post('/calibration')
     def calibrate(request: CalibrationRequest | None = None) -> dict[str, Any]:
         request = CalibrationRequest() if request is None else request
@@ -394,8 +404,10 @@ def create_app(
 
     @app.get('/calibration/status')
     def get_calibration_status() -> dict[str, Any]:
-        statuses = owned_service.get_camera_statuses()
+        stage, metric_status, statuses = owned_service.get_calibration_status_snapshot()
         return {
+            'calibration': stage.value,
+            'metric_calibration': metric_status.value,
             'cameras': {
                 status.logical_name: status.calibration_status.value
                 for status in statuses

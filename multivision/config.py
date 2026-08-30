@@ -53,6 +53,7 @@ class MetricCalibrationThresholds:
     max_fit_error_mm: float = 5.0
     min_inlier_ratio: float = 0.5
     min_unique_target_fiducials: int = 4
+    min_capture_marker_ratio: float = 0.8
     min_spatial_coverage: float = 0.5
 
     def __post_init__(self) -> None:
@@ -160,6 +161,9 @@ class Configuration:
                 'min_inlier_ratio': self.metric_calibration_thresholds.min_inlier_ratio,
                 'min_unique_target_fiducials': (
                     self.metric_calibration_thresholds.min_unique_target_fiducials
+                ),
+                'min_capture_marker_ratio': (
+                    self.metric_calibration_thresholds.min_capture_marker_ratio
                 ),
                 'min_spatial_coverage': self.metric_calibration_thresholds.min_spatial_coverage,
             },
@@ -281,6 +285,10 @@ def _parse_metric_thresholds(data: Any) -> MetricCalibrationThresholds:
             'min_unique_target_fiducials',
             defaults.min_unique_target_fiducials,
         ),
+        'min_capture_marker_ratio': data.get(
+            'min_capture_marker_ratio',
+            defaults.min_capture_marker_ratio,
+        ),
         'min_spatial_coverage': data.get(
             'min_spatial_coverage',
             defaults.min_spatial_coverage,
@@ -367,6 +375,7 @@ def _validate_metric_thresholds(value: MetricCalibrationThresholds) -> None:
             'max_mean_fit_error_mm',
             'max_fit_error_mm',
             'min_inlier_ratio',
+            'min_capture_marker_ratio',
             'min_spatial_coverage',
         ),
     )
@@ -383,7 +392,13 @@ def _validate_metric_thresholds(value: MetricCalibrationThresholds) -> None:
         value.min_unique_target_fiducials,
         'min_unique_target_fiducials',
     )
-    if value.min_inlier_ratio > 1 or value.min_spatial_coverage > 1:
+    if value.min_capture_marker_ratio <= 0:
+        raise ConfigurationError('min_capture_marker_ratio must be positive')
+    if (
+        value.min_inlier_ratio > 1
+        or value.min_capture_marker_ratio > 1
+        or value.min_spatial_coverage > 1
+    ):
         raise ConfigurationError('ratio and coverage thresholds must be between 0 and 1')
 
 

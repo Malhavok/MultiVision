@@ -141,6 +141,7 @@ class PackageTest(unittest.TestCase):
             'max_fit_error_mm': [-1, math.nan, math.inf],
             'min_inlier_ratio': [-1, 1.1, math.nan, math.inf],
             'min_unique_target_fiducials': [0, -1, True],
+            'min_capture_marker_ratio': [-1, 0, 1.1, math.nan, math.inf],
             'min_spatial_coverage': [-1, 1.1, math.nan, math.inf],
         }
         for field_name, values in invalid_values.items():

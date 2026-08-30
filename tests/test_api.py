@@ -75,6 +75,28 @@ class MalformedStatusRuntime:
 
 
 class ApiTest(unittest.TestCase):
+    def test_calibration_pattern_can_be_held_without_changing_calibration(self) -> None:
+        runtime = CameraRuntime(
+            FakeDiscovery(
+                [DeviceInfo('device-a', 'Camera A', 0, Resolution(1000, 700))],
+            ),
+            FakeCaptureFactory(FakeCapture()),
+        )
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,
+        )
+
+        with TestClient(create_app(service)) as client:
+            show_response = client.post('/calibration/pattern')
+            hide_response = client.delete('/calibration/pattern')
+
+        assert show_response.status_code == 200
+        assert show_response.json() == {'visible': True}
+        assert hide_response.status_code == 200
+        assert hide_response.json() == {'visible': False}
+        assert service.calibration_pattern_visible is False
+
     def test_service_start_uses_session_slots_instead_of_persisted_bindings(self) -> None:
         capture = FakeCapture()
         service = MultiVisionService(
@@ -195,6 +217,7 @@ class ApiTest(unittest.TestCase):
                     valid_region=((0, 0), (1000, 0), (1000, 700), (0, 700)),
                 ),
             )
+            calibration_status_response = client.get('/calibration/status')
             enabled_response = client.post(
                 '/cameras/camera-0/area',
                 json={'enabled': True},
@@ -250,6 +273,9 @@ class ApiTest(unittest.TestCase):
         assert malformed_response.json()['error']['code'] == 'REQUEST_VALIDATION_ERROR'
         assert uncalibrated_response.status_code == 422
         assert uncalibrated_response.json()['error']['code'] == 'CALIBRATION_UNCALIBRATED'
+        assert calibration_status_response.status_code == 200
+        assert calibration_status_response.json()['calibration'] == 'CALIBRATED'
+        assert calibration_status_response.json()['metric_calibration'] == 'UNCALIBRATED'
         assert unknown_response.status_code == 404
         assert unknown_response.json()['error']['code'] == 'CAMERA_SLOT_NOT_FOUND'
         assert enabled_response.status_code == 200

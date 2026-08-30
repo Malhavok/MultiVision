@@ -502,33 +502,60 @@ class MetricTest(unittest.TestCase):
             for offset_x in (0.0, 0.5, 1.0)
         )
 
-        averaged = _average_metric_correspondences(frames, 1.1, 'camera-0')
+        averaged = _average_metric_correspondences(frames, 1.1, 0.8, 'camera-0')
 
         assert averaged.camera_id == 'camera-0', f'{averaged=}'
         assert averaged.correspondences[0].camera_position == Point2D(8.5, 40.0), (
             f'{averaged.correspondences[0]=}'
         )
-        with self.assertRaises(CalibrationError):
-            _average_metric_correspondences(
-                (
-                    MetricTargetCorrespondences(
-                        tuple(
-                            correspondence._replace(
-                                camera_position=Point2D(
-                                    correspondence.camera_position.x + 1.2,
-                                    correspondence.camera_position.y,
-                                ),
-                            )
-                            for correspondence in base_correspondences
+        moving_frames = tuple(
+            MetricTargetCorrespondences(
+                tuple(
+                    correspondence._replace(
+                        camera_position=Point2D(
+                            correspondence.camera_position.x + offset_x,
+                            correspondence.camera_position.y,
                         ),
-                        'camera-0',
-                    ),
-                    frames[0],
-                    frames[0],
+                    )
+                    for correspondence in base_correspondences
                 ),
-                1.1,
                 'camera-0',
             )
+            for offset_x in (0.0, 2.4, 4.8)
+        )
+        with self.assertRaises(CalibrationError):
+            _average_metric_correspondences(
+                moving_frames,
+                1.1,
+                0.8,
+                'camera-0',
+            )
+
+        def without_markers(
+            frame: MetricTargetCorrespondences,
+            marker_ids: set[int],
+        ) -> MetricTargetCorrespondences:
+            return frame._replace(
+                correspondences=tuple(
+                    correspondence
+                    for correspondence in frame.correspondences
+                    if correspondence.marker_id not in marker_ids
+                ),
+            )
+
+        base_frame = MetricTargetCorrespondences(base_correspondences, 'camera-0')
+        stable_subset = _average_metric_correspondences(
+            (
+                without_markers(base_frame, {0}),
+                base_frame,
+                without_markers(base_frame, {1}),
+            ),
+            1.1,
+            0.8,
+            'camera-0',
+        )
+        assert len(stable_subset.unique_marker_ids) == 18, f'{stable_subset=}'
+        assert len(stable_subset.correspondences) == 72, f'{stable_subset=}'
 
     def test_fit_error_does_not_become_physical_validation_error(self) -> None:
         projector_resolution = Resolution(800, 700)

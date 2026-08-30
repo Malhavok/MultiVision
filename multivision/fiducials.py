@@ -711,6 +711,7 @@ def _build_detector_parameters(aruco: Any) -> Any:
         'adaptiveThreshWinSizeMax': 101,
         'adaptiveThreshWinSizeStep': 10,
         'aprilTagMinWhiteBlackDiff': 2,
+        'cornerRefinementMethod': getattr(aruco, 'CORNER_REFINE_SUBPIX', 1),
         'perspectiveRemovePixelPerCell': 8,
     }
     for setting_name, setting_value in detector_settings.items():

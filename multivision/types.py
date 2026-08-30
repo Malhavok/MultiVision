@@ -29,6 +29,14 @@ class CalibrationStatus(str, Enum):
     STALE = 'STALE'
 
 
+class CalibrationStage(str, Enum):
+    UNCALIBRATED = 'UNCALIBRATED'
+    UNVERIFIED = 'UNVERIFIED'
+    CALIBRATED = 'CALIBRATED'
+    METRIC_CALIBRATED = 'METRIC_CALIBRATED'
+    STALE = 'STALE'
+
+
 class Resolution(NamedTuple):
     width: int
     height: int

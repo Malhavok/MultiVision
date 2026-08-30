@@ -52,9 +52,12 @@ when it is finite, structurally valid, applicable to the current projector
 descriptor and in the configured quality state. Unidentified or unreliable
 target detections, invalid correspondences, insufficient coverage, bad fit,
 invalid inverses, horizon crossings and out-of-bounds projector geometry are
-rejected rather than approximated. The observable states are `UNCALIBRATED`,
-`CALIBRATED` and `STALE`; unavailable or stale state never supplies a ruler
-transform.
+rejected rather than approximated. The metric observable states are `UNCALIBRATED`, `CALIBRATED` and `STALE`;
+unavailable or stale state never supplies a ruler transform. The calibration
+status endpoint additionally reports an aggregate workflow stage. It remains
+`CALIBRATED` after camera verification and becomes `METRIC_CALIBRATED` only
+when the shared metric transform is currently usable. Per-camera statuses are
+not relabelled, so a stale unrelated camera remains visibly `STALE`.
 
 Plan4 includes only the minimal validation ruler: two finite surface-mm
 endpoints, `mm`/`cm`/`in` output units, the requested physical length,

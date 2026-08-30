@@ -40,6 +40,8 @@ class CliTest(unittest.TestCase):
             ['calibrate', '--camera', 'overhead'],
             ['calibration', 'verify', '--camera', 'overhead'],
             ['calibration', 'status'],
+            ['calibration', 'pattern', 'show'],
+            ['calibration', 'pattern', 'hide'],
             ['point', '--camera', 'overhead', '--x', '12', '--y', '34'],
             ['overlay', 'clear'],
         ]
@@ -71,6 +73,8 @@ class CliTest(unittest.TestCase):
             ('POST', 'http://service.test/calibration', {'camera': 'overhead'}),
             ('POST', 'http://service.test/calibration/verify', {'camera': 'overhead'}),
             ('GET', 'http://service.test/calibration/status', None),
+            ('POST', 'http://service.test/calibration/pattern', None),
+            ('DELETE', 'http://service.test/calibration/pattern', None),
             ('POST', 'http://service.test/overlay/point', {
                 'camera': 'overhead',
                 'x': 12.0,

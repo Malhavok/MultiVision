@@ -78,6 +78,23 @@ class MetricApplicationTest(unittest.TestCase):
             for camera in runtime.registry.get_cameras()
         ), f'{runtime.registry.get_cameras()=}'
 
+    def test_calibration_stage_reports_metric_completion_separately(self) -> None:
+        runtime = MetricSessionRuntime()
+        configuration = Configuration(projector_resolution=Resolution(640, 480))
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            _camera_calibration(configuration),
+        )
+        service = MultiVisionService(configuration, camera_runtime=runtime)
+
+        assert service.get_calibration_stage().value == 'CALIBRATED'
+        with patch('multivision.application.calibrate_metric_homography') as estimator:
+            estimator.return_value = _metric_result(configuration.projector_resolution)
+            service.calibrate_metric('camera-0', _build_correspondences(0.0))
+
+        assert service.get_calibration_stage().value == 'METRIC_CALIBRATED'
+
     def test_metric_capture_requires_a_calibration_for_the_current_output(self) -> None:
         runtime = MetricSessionRuntime()
         configuration = Configuration(
@@ -326,7 +343,7 @@ class MetricApplicationTest(unittest.TestCase):
                 (
                     _build_correspondences(0.0),
                     _build_correspondences(3.0),
-                    _build_correspondences(0.0),
+                    _build_correspondences(6.0),
                 ),
             )
 
@@ -608,6 +625,12 @@ class MetricSessionRuntime:
 
     def get_session_cameras(self) -> list[object]:
         return self.registry.get_cameras()
+
+    def get_statuses(self) -> list[CameraStatus]:
+        return [
+            self.get_status(camera.slot_id)
+            for camera in self.registry.get_cameras()
+        ]
 
     def get_status(self, slot_id: str) -> CameraStatus:
         camera = self.registry.get(slot_id)

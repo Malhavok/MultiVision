@@ -44,6 +44,7 @@ class FiducialTest(unittest.TestCase):
             adaptiveThreshWinSizeMax = 23
             adaptiveThreshWinSizeStep = 10
             aprilTagMinWhiteBlackDiff = 5
+            cornerRefinementMethod = 0
             perspectiveRemovePixelPerCell = 4
 
         class FakeAruco:
@@ -69,6 +70,7 @@ class FiducialTest(unittest.TestCase):
         assert parameters.adaptiveThreshWinSizeMax == 101, f'{parameters=}'
         assert parameters.adaptiveThreshWinSizeStep == 10, f'{parameters=}'
         assert parameters.aprilTagMinWhiteBlackDiff == 2, f'{parameters=}'
+        assert parameters.cornerRefinementMethod == 1, f'{parameters=}'
         assert parameters.perspectiveRemovePixelPerCell == 8, f'{parameters=}'
 
     def test_assembly_rejects_non_iterable_detections_and_frames(self) -> None:

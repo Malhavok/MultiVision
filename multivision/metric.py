@@ -780,17 +780,7 @@ def calibrate_metric_homography(
         raise CalibrationError('Metric homography estimation failed') from ex
 
     try:
-        raw_homography = MetricHomographyPair.from_projector_to_surface(matrix)
-        homography = MetricHomographyPair(
-            tuple(
-                tuple(float(value) for value in row)
-                for row in raw_homography.projector_to_surface
-            ),
-            tuple(
-                tuple(float(value) for value in row)
-                for row in raw_homography.surface_to_projector
-            ),
-        )
+        homography = MetricHomographyPair.from_projector_to_surface(matrix)
     except (OverflowError, TypeError, ValueError, InvalidHomographyError) as ex:
         raise CalibrationError('OpenCV returned an invalid metric homography') from ex
     inlier_mask = _normalise_metric_inlier_mask(raw_mask, len(checked_correspondences))
