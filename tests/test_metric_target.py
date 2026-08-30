@@ -218,8 +218,10 @@ class MetricTargetTest(unittest.TestCase):
         marker_images = root.findall('.//svg:image', namespaces)
         assert len(marker_images) == METRIC_TARGET_MARKER_COUNT, f'{marker_images=}'
         for marker, image in zip(METRIC_TARGET.markers, marker_images):
-            assert image.attrib['width'] == '22mm', f'{image.attrib=}'
-            assert image.attrib['height'] == '22mm', f'{image.attrib=}'
+            assert image.attrib['width'] == '22', f'{image.attrib=}'
+            assert image.attrib['height'] == '22', f'{image.attrib=}'
+            assert image.attrib['data-display-width-mm'] == '22', f'{image.attrib=}'
+            assert image.attrib['data-display-height-mm'] == '22', f'{image.attrib=}'
             assert float(image.attrib['x']) == marker.corners[0].x, f'{image.attrib=}'
             assert float(image.attrib['y']) == marker.corners[0].y, f'{image.attrib=}'
             encoded_image = image.attrib['href'].split(',', maxsplit=1)[1]

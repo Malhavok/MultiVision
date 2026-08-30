@@ -38,3 +38,4 @@ htmlcov/
 .idea/
 
 plans/*.md.state.json
+metric-target.svg

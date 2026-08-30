@@ -453,8 +453,8 @@ def generate_metric_target_svg(
                 f'data-display-height-mm="{formatted_marker_size_mm}" '
                 f'x="{_format_mm(marker.corners[0].x)}" '
                 f'y="{_format_mm(marker.corners[0].y)}" '
-                f'width="{formatted_marker_size_mm}mm" '
-                f'height="{formatted_marker_size_mm}mm" '
+                f'width="{formatted_marker_size_mm}" '
+                f'height="{formatted_marker_size_mm}" '
                 'preserveAspectRatio="none" image-rendering="pixelated" '
                 f'href="data:image/png;base64,{encoded_marker}"/>'
             )
