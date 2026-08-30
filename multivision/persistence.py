@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import pathlib
+import statistics
 import tempfile
 import threading
 import time
@@ -724,15 +725,11 @@ def _passes_verification(
     # A single bad tag detection must not invalidate an otherwise coherent frame.
     # The transform still has to explain enough complete tags to remain trusted.
     accepted_errors = [
-        error
+        statistics.median(marker_errors)
         for marker_errors in errors_by_marker.values()
-        if max(marker_errors) <= thresholds.max_reprojection_error
-        for error in marker_errors
+        if statistics.median(marker_errors) <= thresholds.max_reprojection_error
     ]
-    accepted_marker_count = sum(
-        max(marker_errors) <= thresholds.max_reprojection_error
-        for marker_errors in errors_by_marker.values()
-    )
+    accepted_marker_count = len(accepted_errors)
     if accepted_marker_count < minimum_common_marker_count or not accepted_errors:
         return False
     return (

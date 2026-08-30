@@ -36,6 +36,7 @@ from multivision.geometry import (
     Polygon,
     PreviewTransform,
     calculate_available_projector_area,
+    project_point,
     validate_homography,
 )
 from multivision.fiducials import (
@@ -1235,6 +1236,7 @@ class MultiVisionService:
             checked_correspondences = self._get_correspondences_for_operation(
                 status,
                 correspondences,
+                calibration,
             )
         except Exception:
             # A failed verification attempt must not leave a previously trusted
@@ -1297,6 +1299,7 @@ class MultiVisionService:
         self,
         status: CameraStatus,
         correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None,
+        expected_calibration: PersistedCalibration | None = None,
     ) -> CameraCorrespondences:
         self._last_camera_capture_noise = None
         if correspondences is not None:
@@ -1344,7 +1347,14 @@ class MultiVisionService:
                     self._get_correspondences_from_frame(status, frame)
                     for frame in stable_frames
                 )
-                aggregated, noise = _aggregate_camera_correspondences(detected_frames)
+                selected_frames = _select_camera_frame_window(
+                    detected_frames,
+                    self.calibration_pattern,
+                    self.configuration.calibration_thresholds,
+                    status.native_resolution,
+                    expected_calibration,
+                )
+                aggregated, noise = _aggregate_camera_correspondences(selected_frames)
                 _validate_camera_capture_noise(
                     noise,
                     self.configuration.calibration_thresholds,
@@ -1517,6 +1527,113 @@ class _CameraCaptureNoise(NamedTuple):
     max_sigma_pixels: float
 
 
+def _select_camera_frame_window(
+    frames: Sequence[CameraCorrespondences],
+    pattern: CalibrationPattern,
+    thresholds: CalibrationThresholds,
+    camera_resolution: Resolution | None,
+    expected_calibration: PersistedCalibration | None = None,
+) -> tuple[CameraCorrespondences, ...]:
+    if camera_resolution is None:
+        raise CalibrationError('Camera resolution is unavailable for calibration capture')
+    if len(frames) <= 3:
+        return tuple(frames)
+    best_window: tuple[CameraCorrespondences, ...] | None = None
+    best_score: tuple[float, ...] | None = None
+    fallback_window: tuple[CameraCorrespondences, ...] | None = None
+    fallback_score: tuple[int, float, float, int] | None = None
+    for start_index in range(len(frames) - 2):
+        window = tuple(frames[start_index:start_index + 3])
+        common_marker_ids = set(window[0].unique_marker_ids)
+        for frame in window[1:]:
+            common_marker_ids.intersection_update(frame.unique_marker_ids)
+        try:
+            aggregated, window_noise = _aggregate_camera_correspondences(window)
+        except CalibrationError:
+            continue
+        noise_score = window_noise.p95_sigma_pixels if window_noise is not None else 0.0
+        fallback_score_value = (
+            len(common_marker_ids),
+            -noise_score,
+            -window_noise.max_sigma_pixels if window_noise is not None else 0.0,
+            sum(len(frame.correspondences) for frame in window),
+        )
+        if fallback_score is None or fallback_score_value > fallback_score:
+            fallback_window = window
+            fallback_score = fallback_score_value
+        try:
+            _validate_camera_capture_noise(window_noise, thresholds)
+            result = calibrate_homography(
+                aggregated,
+                pattern,
+                thresholds,
+                camera_resolution=camera_resolution,
+            )
+        except CalibrationError:
+            continue
+        metrics = result.metrics
+        if expected_calibration is None:
+            score = (
+                len(common_marker_ids),
+                metrics.inlier_ratio,
+                metrics.spatial_coverage,
+                -metrics.mean_reprojection_error,
+                -noise_score,
+                sum(len(frame.correspondences) for frame in window),
+            )
+        else:
+            verification_thresholds = _derive_verification_thresholds(
+                expected_calibration,
+                thresholds,
+                window_noise,
+            )
+            errors_by_marker: dict[int, list[float]] = {}
+            for correspondence in aggregated.correspondences:
+                predicted = project_point(
+                    correspondence.projector_position,
+                    expected_calibration.projector_to_camera,
+                )
+                errors_by_marker.setdefault(correspondence.marker_id, []).append(
+                    math.dist(predicted, correspondence.camera_position),
+                )
+            accepted_errors = [
+                statistics.median(marker_errors)
+                for marker_errors in errors_by_marker.values()
+                if statistics.median(marker_errors)
+                <= verification_thresholds.max_reprojection_error
+            ]
+            accepted_marker_count = len(accepted_errors)
+            mean_error = (
+                sum(accepted_errors) / len(accepted_errors)
+                if accepted_errors
+                else float('inf')
+            )
+            minimum_accepted_marker_count = max(
+                thresholds.min_unique_tags,
+                math.ceil(0.5 * len(common_marker_ids)),
+            )
+            score = (
+                int(
+                    accepted_marker_count >= minimum_accepted_marker_count
+                    and mean_error <= verification_thresholds.max_mean_reprojection_error
+                ),
+                accepted_marker_count,
+                len(common_marker_ids),
+                -mean_error,
+                -max(accepted_errors) if accepted_errors else float('-inf'),
+                -noise_score,
+                sum(len(frame.correspondences) for frame in window),
+            )
+        if best_score is None or score > best_score:
+            best_window = window
+            best_score = score
+    if best_window is not None:
+        return best_window
+    if fallback_window is not None:
+        return fallback_window
+    raise CalibrationError('No calibration frame window was selected')
+
+
 def _aggregate_camera_correspondences(
     frames: Sequence[CameraCorrespondences],
 ) -> tuple[CameraCorrespondences, _CameraCaptureNoise | None]:
@@ -1558,6 +1675,13 @@ def _aggregate_camera_correspondences(
             'Calibration frames do not contain enough common target corners',
         )
 
+    noise_corner_maps = tuple(
+        {
+            (correspondence.marker_id, correspondence.corner_index): correspondence
+            for correspondence in frame.correspondences
+        }
+        for frame in frames
+    )
     averaged: list[FiducialCorrespondence] = []
     sigmas: list[float] = []
     first_map = frame_corner_maps[0]
@@ -1581,14 +1705,30 @@ def _aggregate_camera_correspondences(
                 for correspondence in correspondences
             ),
         )
-        deviations = tuple(
-            math.dist(correspondence.camera_position, median_position)
-            for correspondence in correspondences
+        noise_correspondences = tuple(
+            corner_map[corner_key]
+            for corner_map in noise_corner_maps
+            if corner_key in corner_map
         )
-        sigma = 1.4826 * statistics.median(deviations)
-        if not math.isfinite(sigma):
-            raise CalibrationError('Calibration produced invalid camera noise metrics')
-        sigmas.append(sigma)
+        if len(noise_correspondences) >= 3:
+            noise_median_position = Point2D(
+                statistics.median(
+                    correspondence.camera_position.x
+                    for correspondence in noise_correspondences
+                ),
+                statistics.median(
+                    correspondence.camera_position.y
+                    for correspondence in noise_correspondences
+                ),
+            )
+            deviations = tuple(
+                math.dist(correspondence.camera_position, noise_median_position)
+                for correspondence in noise_correspondences
+            )
+            sigma = 1.4826 * statistics.median(deviations)
+            if not math.isfinite(sigma):
+                raise CalibrationError('Calibration produced invalid camera noise metrics')
+            sigmas.append(sigma)
         averaged.append(
             FiducialCorrespondence(
                 first_correspondence.marker_id,
@@ -1598,6 +1738,8 @@ def _aggregate_camera_correspondences(
             ),
         )
 
+    if not sigmas:
+        return CameraCorrespondences(tuple(averaged), frames[0].camera_id), None
     sorted_sigmas = sorted(sigmas)
     p95_index = min(
         len(sorted_sigmas) - 1,
@@ -1636,7 +1778,7 @@ def _derive_verification_thresholds(
         ),
         max_reprojection_error=(
             calibration.metrics.max_reprojection_error
-            + 3.0 * noise.p95_sigma_pixels
+            + 3.0 * noise.median_sigma_pixels
         ),
     )
 
