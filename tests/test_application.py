@@ -6,6 +6,7 @@ from unittest.mock import patch
 from multivision.application import (
     AREA_COLOURS,
     MultiVisionService,
+    _aggregate_camera_correspondences,
 )
 from multivision.calibration import CalibrationMetrics, CalibrationResult
 from multivision.errors import (
@@ -31,6 +32,43 @@ from multivision.types import (
     RuntimeStatus,
     SessionCameraState,
 )
+
+
+class CameraCaptureAggregationTest(unittest.TestCase):
+    def test_common_tags_are_relative_to_median_frame_count(self) -> None:
+        def make_frame(extra_ids: tuple[int, ...], offset: float) -> CameraCorrespondences:
+            values = []
+            for marker_id in extra_ids:
+                for corner_index in range(4):
+                    projector_position = Point2D(
+                        marker_id * 30 + (corner_index % 2) * 10,
+                        (corner_index // 2) * 10,
+                    )
+                    values.append(
+                        FiducialCorrespondence(
+                            marker_id,
+                            corner_index,
+                            projector_position,
+                            Point2D(
+                                projector_position.x + offset,
+                                projector_position.y + offset,
+                            ),
+                        ),
+                    )
+            return CameraCorrespondences(tuple(values), 'camera-0')
+
+        aggregated, noise = _aggregate_camera_correspondences(
+            (
+                make_frame((0, 1, 2, 3), 0.0),
+                make_frame((0, 1, 4, 5), 0.5),
+                make_frame((0, 1, 6, 7), 1.0),
+            ),
+        )
+
+        assert aggregated.unique_marker_ids == (0, 1)
+        assert len(aggregated.correspondences) == 8
+        assert noise is not None
+        assert noise.median_sigma_pixels > 0
 
 
 class FakeSessionRuntime:

@@ -36,6 +36,8 @@ _CONFIG_FILE_LOCKS_GUARD = threading.Lock()
 class CalibrationThresholds:
     max_mean_reprojection_error: float = 5.0
     max_reprojection_error: float = 10.0
+    max_capture_white_balance_delta: float = 0.01
+    max_capture_p95_sigma_pixels: float = 5.0
     min_inlier_ratio: float = 0.5
     min_unique_tags: int = 2
     min_spatial_coverage: float = 0.1
@@ -145,6 +147,12 @@ class Configuration:
                     self.calibration_thresholds.max_mean_reprojection_error
                 ),
                 'max_reprojection_error': self.calibration_thresholds.max_reprojection_error,
+                'max_capture_white_balance_delta': (
+                    self.calibration_thresholds.max_capture_white_balance_delta
+                ),
+                'max_capture_p95_sigma_pixels': (
+                    self.calibration_thresholds.max_capture_p95_sigma_pixels
+                ),
                 'min_inlier_ratio': self.calibration_thresholds.min_inlier_ratio,
                 'min_unique_tags': self.calibration_thresholds.min_unique_tags,
                 'min_spatial_coverage': self.calibration_thresholds.min_spatial_coverage,
@@ -319,6 +327,14 @@ def _parse_thresholds(data: Any) -> CalibrationThresholds:
             'max_reprojection_error',
             defaults.max_reprojection_error,
         ),
+        'max_capture_white_balance_delta': data.get(
+            'max_capture_white_balance_delta',
+            defaults.max_capture_white_balance_delta,
+        ),
+        'max_capture_p95_sigma_pixels': data.get(
+            'max_capture_p95_sigma_pixels',
+            defaults.max_capture_p95_sigma_pixels,
+        ),
         'min_inlier_ratio': data.get('min_inlier_ratio', defaults.min_inlier_ratio),
         'min_unique_tags': data.get('min_unique_tags', defaults.min_unique_tags),
         'min_spatial_coverage': data.get(
@@ -361,6 +377,8 @@ def _validate_thresholds(value: Any) -> None:
         (
             'max_mean_reprojection_error',
             'max_reprojection_error',
+            'max_capture_white_balance_delta',
+            'max_capture_p95_sigma_pixels',
             'min_inlier_ratio',
             'min_spatial_coverage',
             'valid_region_margin',
@@ -368,6 +386,15 @@ def _validate_thresholds(value: Any) -> None:
     )
 
     _validate_positive_integer(value.min_unique_tags, 'min_unique_tags')
+    if value.max_capture_p95_sigma_pixels <= 0:
+        raise ConfigurationError('max_capture_p95_sigma_pixels must be positive')
+    if (
+        value.max_capture_white_balance_delta <= 0
+        or value.max_capture_white_balance_delta > 1
+    ):
+        raise ConfigurationError(
+            'max_capture_white_balance_delta must be between 0 and 1',
+        )
     if value.min_inlier_ratio > 1 or value.min_spatial_coverage > 1:
         raise ConfigurationError('ratio and coverage thresholds must be between 0 and 1')
     if value.valid_region_margin > 1:

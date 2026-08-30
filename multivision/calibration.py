@@ -50,6 +50,9 @@ class CalibrationMetrics(NamedTuple):
     mean_reprojection_error: float
     max_reprojection_error: float
     spatial_coverage: float
+    capture_median_sigma_pixels: float | None = None
+    capture_p95_sigma_pixels: float | None = None
+    capture_max_sigma_pixels: float | None = None
 
 
 class CalibrationResult(NamedTuple):

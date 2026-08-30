@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from multivision.application import (
     MultiVisionService,
-    _select_stable_metric_frames,
+    _select_stable_frame_window,
 )
 from multivision.config import Configuration, ProjectorOutputDescriptor
 from multivision.errors import (
@@ -119,7 +119,7 @@ class MetricApplicationTest(unittest.TestCase):
             )
         )
 
-        selected = _select_stable_metric_frames(frames, 0.01)
+        selected = _select_stable_frame_window(frames, 0.01)
 
         assert [frame.frame_counter for frame in selected] == [3, 4, 5], (
             f'{selected=}'

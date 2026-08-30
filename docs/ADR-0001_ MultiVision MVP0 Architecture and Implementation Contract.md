@@ -669,12 +669,16 @@ Calibration verification is separate from full calibration.
 Verification:
 
 1. displays known fiducials;
-2. captures camera frames;
-3. detects marker positions;
-4. predicts their positions using stored calibration;
-5. measures current reprojection error.
+2. captures a consecutive burst after exposure and white-balance settling;
+3. detects marker positions in the burst;
+4. requires complete common tags numbering at least half the median per-frame tag count, with the existing two-tag minimum;
+5. uses per-corner median positions and measures temporal corner noise with a robust MAD-derived sigma;
+6. predicts their positions using stored calibration;
+7. measures current reprojection error in camera pixels and rejects incoherent individual tags while requiring the same relative common-tag coverage.
 
-If error remains below configured thresholds:
+The verification limits are derived from the stored calibration residuals plus a three-sigma allowance for the measured capture noise; a fixed universal pixel tolerance is not the authority. A configured p95 capture-noise ceiling rejects an unstable burst before it can inflate those limits. The measured median, 95th-percentile and maximum capture sigmas are retained in calibration metrics for diagnostics. A failed verification capture explicitly stales an existing record.
+
+If the retained coherent errors remain below the derived thresholds:
 
 ```text
 CALIBRATED

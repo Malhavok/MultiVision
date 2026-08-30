@@ -14,6 +14,7 @@ from typing import NamedTuple
 from multivision.calibration import CalibrationMetrics, calibrate_homography
 from multivision.camera import CameraRuntime
 from multivision.config import (
+    CalibrationThresholds,
     Configuration,
     ProjectorOutputDescriptor,
     load_configuration,
@@ -91,6 +92,7 @@ from multivision.types import (
 CALIBRATION_PATTERN_WAIT_TIMEOUT_SECONDS = 5.0
 CALIBRATION_PATTERN_SETTLE_SECONDS = 3.0
 CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS = 5.0
+CALIBRATION_CAPTURE_CANDIDATE_FRAME_COUNT = 15
 METRIC_CAPTURE_WAIT_TIMEOUT_SECONDS = 5.0
 METRIC_CAPTURE_SETTLE_SECONDS = 3.0
 METRIC_CAPTURE_FRAME_COUNT = 3
@@ -217,6 +219,7 @@ class MultiVisionService:
         self._camera_management_lock = threading.RLock()
         self._calibration_capture_count = 0
         self._calibration_capture_lock = threading.RLock()
+        self._last_camera_capture_noise: _CameraCaptureNoise | None = None
         self._calibration_pattern_presented = threading.Event()
         self._calibration_pattern_hold = False
         self._metric_capture_count = 0
@@ -864,7 +867,7 @@ class MultiVisionService:
                 raise CalibrationError(
                     'Camera runtime returned invalid consecutive metric frames',
                 )
-            captured_frames = _select_stable_metric_frames(
+            captured_frames = _select_stable_frame_window(
                 captured_frames,
                 self.configuration.metric_calibration_thresholds
                 .max_capture_white_balance_delta,
@@ -1178,6 +1181,20 @@ class MultiVisionService:
                 self.configuration.calibration_thresholds,
                 camera_resolution=current_status.native_resolution,
             )
+            if self._last_camera_capture_noise is not None:
+                result = result._replace(
+                    metrics=result.metrics._replace(
+                        capture_median_sigma_pixels=(
+                            self._last_camera_capture_noise.median_sigma_pixels
+                        ),
+                        capture_p95_sigma_pixels=(
+                            self._last_camera_capture_noise.p95_sigma_pixels
+                        ),
+                        capture_max_sigma_pixels=(
+                            self._last_camera_capture_noise.max_sigma_pixels
+                        ),
+                    ),
+                )
             record = PersistedCalibration.from_result(
                 result,
                 current_status.native_resolution,
@@ -1214,22 +1231,37 @@ class MultiVisionService:
         calibration = session_camera.calibration
         if not isinstance(calibration, PersistedCalibration):
             return CalibrationStatus.UNCALIBRATED
-        checked_correspondences = self._get_correspondences_for_operation(
-            status,
-            correspondences,
-        )
+        try:
+            checked_correspondences = self._get_correspondences_for_operation(
+                status,
+                correspondences,
+            )
+        except Exception:
+            # A failed verification attempt must not leave a previously trusted
+            # transform usable after its fresh evidence failed to arrive.
+            self._set_session_calibration(
+                session_camera.slot_id,
+                CalibrationStatus.STALE,
+                calibration,
+            )
+            raise
         session_registry = CalibrationRegistry(
             {session_camera.slot_id: calibration},
             calibration_version=self.configuration.calibration_version,
             projector_resolution=self._projector_output_descriptor.projector_resolution,
             projector_output_descriptor=self._projector_output_descriptor,
         )
+        verification_thresholds = _derive_verification_thresholds(
+            calibration,
+            self.configuration.calibration_thresholds,
+            self._last_camera_capture_noise,
+        )
         calibration_status = session_registry.verify(
             session_camera.slot_id,
             checked_correspondences,
             camera_resolution=status.native_resolution,
             projector_resolution=self._projector_output_descriptor.projector_resolution,
-            thresholds=self.configuration.calibration_thresholds,
+            thresholds=verification_thresholds,
             projector_output_descriptor=self._projector_output_descriptor,
             pattern=self.calibration_pattern,
         )
@@ -1266,6 +1298,7 @@ class MultiVisionService:
         status: CameraStatus,
         correspondences: CameraCorrespondences | Sequence[FiducialCorrespondence] | None,
     ) -> CameraCorrespondences:
+        self._last_camera_capture_noise = None
         if correspondences is not None:
             return self._get_correspondences(status, correspondences)
         with self._calibration_capture_lock:
@@ -1280,28 +1313,65 @@ class MultiVisionService:
                 )
             # Allow the projector and camera exposure pipeline to settle after presentation.
             time.sleep(CALIBRATION_PATTERN_SETTLE_SECONDS)
+            get_consecutive_frames = getattr(
+                self.camera_runtime,
+                'get_consecutive_frames',
+                None,
+            )
+            if callable(get_consecutive_frames) and (
+                CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS > 0
+            ):
+                captured_frames = get_consecutive_frames(
+                    status.logical_name,
+                    CALIBRATION_CAPTURE_CANDIDATE_FRAME_COUNT,
+                    CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS,
+                )
+                if not isinstance(captured_frames, Sequence) or len(captured_frames) < 3:
+                    raise CalibrationError(
+                        'Camera runtime returned invalid consecutive calibration frames',
+                    )
+                if any(not isinstance(frame, Frame) for frame in captured_frames):
+                    raise CalibrationError(
+                        'Camera runtime returned invalid consecutive calibration frames',
+                    )
+                stable_frames = _select_stable_frame_window(
+                    captured_frames,
+                    self.configuration.calibration_thresholds
+                    .max_capture_white_balance_delta,
+                    window_size=CALIBRATION_CAPTURE_CANDIDATE_FRAME_COUNT,
+                )
+                detected_frames = tuple(
+                    self._get_correspondences_from_frame(status, frame)
+                    for frame in stable_frames
+                )
+                aggregated, noise = _aggregate_camera_correspondences(detected_frames)
+                _validate_camera_capture_noise(
+                    noise,
+                    self.configuration.calibration_thresholds,
+                )
+                self._last_camera_capture_noise = noise
+                return aggregated
+
             deadline = time.monotonic() + CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS
-            best_correspondences: CameraCorrespondences | None = None
+            candidates: list[CameraCorrespondences] = []
             last_error: CalibrationError | None = None
             while True:
                 try:
-                    candidate = self._get_correspondences(status, None)
+                    candidates.append(self._get_correspondences(status, None))
                 except CalibrationError as ex:
                     last_error = ex
-                else:
-                    if best_correspondences is None or (
-                        len(candidate.unique_marker_ids),
-                        len(candidate.correspondences),
-                    ) > (
-                        len(best_correspondences.unique_marker_ids),
-                        len(best_correspondences.correspondences),
-                    ):
-                        best_correspondences = candidate
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(0.25)
-            if best_correspondences is not None:
-                return best_correspondences
+            if candidates:
+                selected_candidates = candidates[-3:]
+                aggregated, noise = _aggregate_camera_correspondences(selected_candidates)
+                _validate_camera_capture_noise(
+                    noise,
+                    self.configuration.calibration_thresholds,
+                )
+                self._last_camera_capture_noise = noise
+                return aggregated
             if last_error is not None:
                 raise last_error
             raise CalibrationError('No calibration correspondences were detected')
@@ -1333,7 +1403,18 @@ class MultiVisionService:
                 raise CalibrationError('correspondences must be iterable') from ex
             return CameraCorrespondences(values, camera_id)
 
-        frame = self.snapshot(status.logical_name)
+        return self._get_correspondences_from_frame(status, self.snapshot(status.logical_name))
+
+    def _get_correspondences_from_frame(
+        self,
+        status: CameraStatus,
+        frame: Frame,
+    ) -> CameraCorrespondences:
+        session_camera = self._get_session_camera(status.logical_name)
+        if session_camera is None:
+            raise CameraUnavailableError(
+                f'Camera {status.logical_name!r} has no session identity',
+            )
         detector = self.detector
         if detector is None:
             detector = OpenCVArucoDetector()
@@ -1341,7 +1422,7 @@ class MultiVisionService:
         return assemble_correspondences(
             detected_markers,
             self.calibration_pattern,
-            camera_id=camera_id,
+            camera_id=session_camera.slot_id,
         )
 
     def _get_calibration_status(self, status: CameraStatus) -> CalibrationStatus:
@@ -1430,26 +1511,156 @@ class MultiVisionService:
             )
 
 
-def _select_stable_metric_frames(
+class _CameraCaptureNoise(NamedTuple):
+    median_sigma_pixels: float
+    p95_sigma_pixels: float
+    max_sigma_pixels: float
+
+
+def _aggregate_camera_correspondences(
+    frames: Sequence[CameraCorrespondences],
+) -> tuple[CameraCorrespondences, _CameraCaptureNoise | None]:
+    if len(frames) == 0:
+        raise CalibrationError('No calibration correspondences were detected')
+    if len(frames) == 1:
+        return frames[0], None
+
+    marker_counts = tuple(len(frame.unique_marker_ids) for frame in frames)
+    minimum_common_marker_count = max(
+        2,
+        math.ceil(0.5 * statistics.median(marker_counts)),
+    )
+    common_marker_ids = set(frames[0].unique_marker_ids)
+    frame_corner_maps = tuple(
+        {
+            (correspondence.marker_id, correspondence.corner_index): correspondence
+            for correspondence in frame.correspondences
+        }
+        for frame in frames
+    )
+    for frame in frames[1:]:
+        common_marker_ids.intersection_update(frame.unique_marker_ids)
+    if len(common_marker_ids) < minimum_common_marker_count:
+        raise CalibrationError(
+            'Calibration frames do not contain enough common target tags',
+        )
+
+    common_corner_keys = tuple(
+        sorted(
+            corner_key
+            for corner_key in frame_corner_maps[0]
+            if corner_key[0] in common_marker_ids
+            and all(corner_key in corner_map for corner_map in frame_corner_maps)
+        ),
+    )
+    if len(common_corner_keys) < 8:
+        raise CalibrationError(
+            'Calibration frames do not contain enough common target corners',
+        )
+
+    averaged: list[FiducialCorrespondence] = []
+    sigmas: list[float] = []
+    first_map = frame_corner_maps[0]
+    for corner_key in common_corner_keys:
+        correspondences = [corner_map[corner_key] for corner_map in frame_corner_maps]
+        first_correspondence = first_map[corner_key]
+        if any(
+            correspondence.projector_position != first_correspondence.projector_position
+            for correspondence in correspondences
+        ):
+            raise CalibrationError(
+                'Calibration frames disagree about projector corner positions',
+            )
+        median_position = Point2D(
+            statistics.median(
+                correspondence.camera_position.x
+                for correspondence in correspondences
+            ),
+            statistics.median(
+                correspondence.camera_position.y
+                for correspondence in correspondences
+            ),
+        )
+        deviations = tuple(
+            math.dist(correspondence.camera_position, median_position)
+            for correspondence in correspondences
+        )
+        sigma = 1.4826 * statistics.median(deviations)
+        if not math.isfinite(sigma):
+            raise CalibrationError('Calibration produced invalid camera noise metrics')
+        sigmas.append(sigma)
+        averaged.append(
+            FiducialCorrespondence(
+                first_correspondence.marker_id,
+                first_correspondence.corner_index,
+                first_correspondence.projector_position,
+                median_position,
+            ),
+        )
+
+    sorted_sigmas = sorted(sigmas)
+    p95_index = min(
+        len(sorted_sigmas) - 1,
+        max(0, math.ceil(0.95 * len(sorted_sigmas)) - 1),
+    )
+    noise = _CameraCaptureNoise(
+        statistics.median(sorted_sigmas),
+        sorted_sigmas[p95_index],
+        max(sorted_sigmas),
+    )
+    return CameraCorrespondences(tuple(averaged), frames[0].camera_id), noise
+
+
+def _validate_camera_capture_noise(
+    noise: _CameraCaptureNoise | None,
+    thresholds: CalibrationThresholds,
+) -> None:
+    if noise is not None and noise.p95_sigma_pixels > thresholds.max_capture_p95_sigma_pixels:
+        raise CalibrationError(
+            'Camera capture noise is too large for reliable calibration verification',
+        )
+
+
+def _derive_verification_thresholds(
+    calibration: PersistedCalibration,
+    thresholds: CalibrationThresholds,
+    noise: _CameraCaptureNoise | None,
+) -> CalibrationThresholds:
+    if noise is None:
+        return thresholds
+    return replace(
+        thresholds,
+        max_mean_reprojection_error=(
+            calibration.metrics.mean_reprojection_error
+            + 3.0 * noise.median_sigma_pixels
+        ),
+        max_reprojection_error=(
+            calibration.metrics.max_reprojection_error
+            + 3.0 * noise.p95_sigma_pixels
+        ),
+    )
+
+
+def _select_stable_frame_window(
     frames: Sequence[Frame],
     maximum_white_balance_delta: float,
+    *,
+    window_size: int = METRIC_CAPTURE_FRAME_COUNT,
 ) -> tuple[Frame, ...]:
     if not math.isfinite(maximum_white_balance_delta) or maximum_white_balance_delta <= 0:
-        raise CalibrationError('Metric white-balance tolerance is invalid')
+        raise CalibrationError('White-balance tolerance is invalid')
+    if window_size <= 0 or len(frames) < window_size:
+        raise CalibrationError('Capture did not contain enough consecutive frames')
     signatures = tuple(_white_balance_signature(frame.data) for frame in frames)
-    for start_index in range(len(frames) - METRIC_CAPTURE_FRAME_COUNT + 1):
-        window_signatures = signatures[
-            start_index:start_index + METRIC_CAPTURE_FRAME_COUNT
-        ]
+    for start_index in range(len(frames) - window_size + 1):
+        window_signatures = signatures[start_index:start_index + window_size]
         if _white_balance_window_is_stable(
             window_signatures,
             maximum_white_balance_delta,
         ):
-            return tuple(
-                frames[start_index:start_index + METRIC_CAPTURE_FRAME_COUNT]
-            )
+            return tuple(frames[start_index:start_index + window_size])
     raise CalibrationError(
-        'Metric capture did not find three consecutive white-balance-stable frames',
+        f'Capture did not find {window_size} consecutive white-balance-stable frames',
     )
 
 

@@ -690,7 +690,11 @@ def _passes_verification(
         seen_corners.add(corner_key)
 
     marker_ids = {value.marker_id for value in checked_values}
-    if len(marker_ids) < thresholds.min_unique_tags:
+    minimum_common_marker_count = max(
+        thresholds.min_unique_tags,
+        math.ceil(0.5 * len(marker_ids)),
+    )
+    if len(marker_ids) < minimum_common_marker_count:
         return False
     if pattern is not None:
         if not isinstance(pattern, CalibrationPattern):
@@ -700,7 +704,7 @@ def _passes_verification(
         except (CalibrationError, ValueError):
             return False
 
-    errors: list[float] = []
+    errors_by_marker: dict[int, list[float]] = {}
     for correspondence in checked_values:
         try:
             predicted_camera = project_point(
@@ -715,11 +719,26 @@ def _passes_verification(
         )
         if not math.isfinite(error):
             return False
-        errors.append(error)
+        errors_by_marker.setdefault(correspondence.marker_id, []).append(error)
+
+    # A single bad tag detection must not invalidate an otherwise coherent frame.
+    # The transform still has to explain enough complete tags to remain trusted.
+    accepted_errors = [
+        error
+        for marker_errors in errors_by_marker.values()
+        if max(marker_errors) <= thresholds.max_reprojection_error
+        for error in marker_errors
+    ]
+    accepted_marker_count = sum(
+        max(marker_errors) <= thresholds.max_reprojection_error
+        for marker_errors in errors_by_marker.values()
+    )
+    if accepted_marker_count < minimum_common_marker_count or not accepted_errors:
+        return False
     return (
-        len(errors) > 0
-        and sum(errors) / len(errors) <= thresholds.max_mean_reprojection_error
-        and max(errors) <= thresholds.max_reprojection_error
+        sum(accepted_errors) / len(accepted_errors)
+        <= thresholds.max_mean_reprojection_error
+        and max(accepted_errors) <= thresholds.max_reprojection_error
     )
 
 
@@ -930,6 +949,14 @@ def _validate_metrics(metrics: object) -> None:
                 metrics.spatial_coverage,
             )
         )
+        or not all(
+            value is None or is_finite_real(value) and value >= 0
+            for value in (
+                metrics.capture_median_sigma_pixels,
+                metrics.capture_p95_sigma_pixels,
+                metrics.capture_max_sigma_pixels,
+            )
+        )
         or metrics.unique_tag_count == 0
         or metrics.correspondence_corner_count < 4
         or metrics.ransac_inlier_count < 4
@@ -976,13 +1003,16 @@ def _parse_metrics(data: Any) -> CalibrationMetrics:
             data['mean_reprojection_error'],
             data['max_reprojection_error'],
             data['spatial_coverage'],
+            data.get('capture_median_sigma_pixels'),
+            data.get('capture_p95_sigma_pixels'),
+            data.get('capture_max_sigma_pixels'),
         )
     except (KeyError, TypeError, ValueError):
         raise CalibrationError('Calibration metrics are malformed') from None
 
 
 def _metrics_to_data(metrics: CalibrationMetrics) -> dict[str, int | float]:
-    return {
+    data: dict[str, int | float] = {
         'unique_tag_count': metrics.unique_tag_count,
         'correspondence_corner_count': metrics.correspondence_corner_count,
         'ransac_inlier_count': metrics.ransac_inlier_count,
@@ -991,6 +1021,15 @@ def _metrics_to_data(metrics: CalibrationMetrics) -> dict[str, int | float]:
         'max_reprojection_error': metrics.max_reprojection_error,
         'spatial_coverage': metrics.spatial_coverage,
     }
+    for field_name in (
+        'capture_median_sigma_pixels',
+        'capture_p95_sigma_pixels',
+        'capture_max_sigma_pixels',
+    ):
+        value = getattr(metrics, field_name)
+        if value is not None:
+            data[field_name] = value
+    return data
 
 
 def _point_to_data(point: Point2D) -> list[float]:

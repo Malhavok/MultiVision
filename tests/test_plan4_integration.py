@@ -11,13 +11,16 @@ from urllib.parse import urlsplit
 from fastapi.testclient import TestClient
 
 from multivision.api import create_app
-from multivision.application import MultiVisionService
+from multivision.application import (
+    CALIBRATION_PATTERN_EDGE_MARGIN_PIXELS,
+    MultiVisionService,
+)
 from multivision.camera import CameraRuntime
 from multivision.cli import MultiVisionClient, ServiceResponse, main as cli_main
 from multivision.config import Configuration, ProjectorOutputDescriptor
 from multivision.display import BLACK, WHITE, DisplayConfiguration, PygameDisplayRuntime
 from multivision.fiducials import DetectedMarker
-from multivision.geometry import Point2D, project_point
+from multivision.geometry import CoordinateBounds, Point2D, project_point
 from multivision.metric_target import METRIC_TARGET
 from multivision.pattern import CalibrationPattern, build_calibration_pattern
 from multivision.types import DeviceInfo, Resolution
@@ -545,7 +548,16 @@ class Plan4IntegrationTest(unittest.TestCase):
 
 
 def _build_pattern(projector_resolution: Resolution) -> CalibrationPattern:
-    return build_calibration_pattern(projector_resolution)
+    margin = CALIBRATION_PATTERN_EDGE_MARGIN_PIXELS
+    return build_calibration_pattern(
+        projector_resolution,
+        usable_area=CoordinateBounds(
+            margin,
+            margin,
+            projector_resolution.width - margin,
+            projector_resolution.height - margin,
+        ),
+    )
 
 
 def _camera_correspondence_payload(
