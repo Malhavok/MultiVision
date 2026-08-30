@@ -2,6 +2,32 @@
 
 This sidecar defines the implementation observables for [plans/plan5.md](plan5.md). ADR-0003 remains the generic-overlay source decision, Plan4 remains authoritative for metric calibration, and ADR-0001/Plans 2–4 remain authoritative for camera ownership, projector geometry, session lifecycle and display threading. Do not modify ADRs or `harness.toml`.
 
+## Intent of the reduction
+
+Plan5 deliberately implements a small geometry layer, not a general graphics framework.
+
+The useful new capability is:
+
+```text
+camera says where
+physical/projector geometry says what and how large
+```
+
+For example, a caller may identify a miniature centre in camera pixels and request a true physical 6-inch circle around that point. The implementation must convert the camera point through the existing calibration chain and construct the circle in the canonical metric frame. It must never approximate a physical radius from camera pixels.
+
+The following ideas are intentionally deferred from Plan5:
+
+- `surface_edge_mm` or any second physical coordinate frame;
+- `camera_px` as a shape-size space;
+- `camera_px` as a ruler measurement space;
+- implicit or automatic infinite-grid extent derived through inverse-projector geometry;
+- generic z-index/scene graph/plugin rendering;
+- alpha/compositing systems;
+- update/replace semantics for existing overlays;
+- game rules, piece identity, movement legality, LOS legality, AI state or multiplayer state.
+
+These can be added later if a concrete use case justifies them without changing the core authority chain below.
+
 ## Scope and authority
 
 Plan5 adds five generic overlay kinds:
@@ -14,36 +40,44 @@ line
 ruler
 ```
 
-The service is the only owner of coordinate resolution, calibration checks, shape construction, clipping and overlay state. The display only consumes already-resolved projector-native draw primitives. The API and CLI are thin boundaries.
+The service is the only owner of coordinate resolution, calibration checks, source-space shape construction, clipping, dependency tracking and overlay state. The display consumes already-resolved projector-native primitives. API and CLI remain thin boundaries.
 
 The final authority chain is:
 
 ```text
-request quantities and anchors
-  ↓ explicit coordinate-space resolution
-camera/projector/metric calibration authorities
-  ↓ pure shape construction in declared shape/measurement space
-projector-native geometry
-  ↓ output clipping and raster-safe draw primitives
+request point references + declared geometry/measurement space
+  ↓
+existing camera/projector/metric calibration authorities
+  ↓
+source-space geometry construction
+  ↓
+projector-native materialisation and clipping
+  ↓
 session-local overlay registry
-  ↓ main-thread renderer
-Pygame projector output
+  ↓
+main-thread renderer
 ```
 
-No overlay may calculate `pixels_per_cm`, DPI, a camera-local physical scale or a second homography. No overlay owns game semantics, piece identity, movement, grenade rules, line-of-sight legality, AI state or multiplayer state.
+No overlay may calculate `pixels_per_cm`, DPI, a local camera physical scale or a second homography.
 
-The existing `/overlay/point` path and Plan4 `/metric/ruler` path remain supported. They must coexist with generic objects without silently becoming a second geometry authority. The generic registry owns new objects; compatibility adapters may map old requests into the same builders where practical.
+The existing `/overlay/point` and Plan4 metric-ruler paths remain supported. They may reuse shared pure helpers where practical but must not create a second geometry authority.
 
-## Coordinate spaces and typed quantities
+## Coordinate model
 
-Supported coordinate spaces are exactly:
+There are exactly three public point-reference spaces:
 
-- `projector_px`: projector-native pixel coordinates; direct final-output space; no calibration required for geometry resolution, though output bounds still apply;
-- `camera_px`: native pixel coordinates from one named/selected camera before any transform; requires that camera to be open, available and currently camera/projector-calibrated;
-- `surface_mm`: ADR-0002's canonical metric surface frame; coordinates may be supplied in `mm`, `cm` or `in` and are normalised to millimetres; requires a current usable shared metric calibration;
-- `surface_edge_mm`: a point-reference-only derived physical frame; coordinates may be supplied in `mm`, `cm` or `in`; requires a current usable metric calibration and a usable mapping of projector output corners; it is not valid as a shape or measurement space.
+- `projector_px` — projector-native pixel position; no camera or metric calibration required;
+- `camera_px` — native pixel position from one explicit camera; requires that camera to be open/available and currently camera→projector calibrated;
+- `surface_mm` — canonical ADR-0002/Plan4 physical surface frame; accepts `mm`, `cm` or `in`, normalized to millimetres; requires usable shared metric calibration.
 
-A point reference has this conceptual shape:
+There are exactly two public geometry/measurement spaces:
+
+- `projector_px` — dimensions or distances are pixels;
+- `surface_mm` — dimensions or distances are physical values normalized to millimetres.
+
+`camera_px` is intentionally **point-only**. A camera pixel can locate a centre/origin/endpoint, but Plan5 does not define a circle radius, rectangle size, grid spacing or ruler measurement in camera pixels.
+
+A point reference is conceptually:
 
 ```json
 {
@@ -54,7 +88,7 @@ A point reference has this conceptual shape:
 }
 ```
 
-A physical point may include one unit for both coordinates:
+A physical point may include a unit shared by both coordinates:
 
 ```json
 {
@@ -65,75 +99,37 @@ A physical point may include one unit for both coordinates:
 }
 ```
 
-Pixel-space points use pixel values and must not silently accept physical units. Camera-space points always name the camera; projector-space points must not name one. All values must be finite and booleans are not numbers.
+Pixel-space points use pixel values and reject physical units. Camera points require a camera identity. Projector points must not carry a camera identity. All numeric values must be finite; booleans are not numeric values.
 
-A primitive has an anchor/endpoint space and, where it constructs dimensions around an anchor, a declared `shape_space` of `camera_px`, `projector_px` or canonical `surface_mm`. This permits mixed requests without implicit guesses:
+## Mixed anchor conversion
 
-```json
-{
-  "kind": "circle",
-  "centre": {
-    "space": "camera_px",
-    "camera": "camera-1",
-    "x": 812,
-    "y": 443
-  },
-  "shape_space": "surface_mm",
-  "radius": {"value": 10, "unit": "cm"}
-}
-```
+A circle, rect or grid declares a geometry space of `projector_px` or `surface_mm`. Its centre/origin may be in any supported point space.
 
-The camera point is resolved to a projector point, then to the corresponding canonical metric point, and the true physical circle is constructed there before being projected. This requires both camera and metric calibration. It must never use a local pixel-to-mm approximation.
+The service converts the point into the declared geometry space using existing transforms only.
 
-For a pixel shape, dimensions are in `px` and refer to the declared pixel shape space. Thus a `projector_px` radius is projector pixels and a `camera_px` radius is camera pixels. A `surface_edge_mm` anchor is first converted to canonical `surface_mm`; it cannot define physical shape dimensions or measurements directly. If the anchor and shape spaces differ, the anchor is converted into the declared shape space using an applicable inverse transform; missing inverse calibration is an explicit failure.
-
-The same principle applies to rotated rects and grids. A line's two endpoints may independently use any supported point space; a ruler additionally declares the space in which its distance is measured.
-
-## Transform and dependency rules
-
-Resolution is explicit and fail-closed:
+Supported conversion logic is conceptually:
 
 ```text
-projector_px point
-  → direct projector-native point
+projector_px -> projector_px
+camera_px    -> projector_px
+surface_mm   -> projector_px
 
-camera_px point
-  → selected camera's camera-native → projector-native transform
-
-surface_mm point
-  → shared metric surface-mm → projector-native transform
-
-surface_edge_mm point
-  → derived edge frame → canonical surface-mm
-  → shared metric surface-mm → projector-native transform
+projector_px -> surface_mm   (requires usable inverse metric transform)
+camera_px    -> projector_px -> surface_mm
+surface_mm   -> surface_mm
 ```
 
-A camera-space request requires only the selected camera's current camera/projector calibration and camera lifecycle availability. A physical request requires a current `CALIBRATED` shared metric record whose projector descriptor matches the running output. A mixed camera-anchor/physical-shape request requires both. A projector-space request requires neither calibration. Camera and metric records remain owned by their existing registries.
+A mixed camera-anchor/physical-circle request therefore requires:
 
-When a source calibration changes:
+1. the selected camera's valid camera→projector calibration;
+2. Plan4's current metric projector↔surface transform;
+3. successful finite conversion of the anchor into canonical `surface_mm`;
+4. circle construction in `surface_mm`;
+5. surface→projector projection of the sampled result.
 
-- camera-dependent generic overlays are removed or made non-renderable before the changed state is visible;
-- metric-dependent generic overlays are removed before metric recalibration/reset and after metric staling;
-- projector-dependent geometry is removed when the projector resolution or output identity changes;
-- unrelated overlays remain intact where their dependencies are still valid.
+It must not use local pixel scale, DPI or a camera-space radius approximation.
 
-No stale materialised projector geometry may remain visible after invalidation.
-
-## `surface_edge_mm` frame
-
-The edge frame is a point-reference convenience, not a replacement for ADR-0002's canonical frame and not a shape/measurement space.
-
-Its contract is:
-
-- `(0, 0)` is the canonical physical surface point obtained by inverse-projecting projector-native `(0, 0)`;
-- its positive x direction is the physical direction of the projector's top output edge at that origin;
-- its positive y direction is the physical direction of the projector's left output edge at that origin;
-- the two axes may be oblique in the physical plane because perspective does not generally preserve right angles;
-- coordinates along those axes are physical millimetres, not projector pixels or normalised UV values;
-- every edge-frame anchor or endpoint is converted into ADR-0002's canonical Euclidean metric frame before constructing physical shapes, calculating physical distances or applying physical rotation; the conversion uses unit-length canonical basis vectors from the inverse-mapped projector top-left point towards the top-right and bottom-left points, so an x or y coordinate denotes physical millimetres along that oblique basis;
-- the frame is unavailable if the projector output corners cannot be inverse-mapped to finite, consistent surface points.
-
-This means direct projector alignment is available through `projector_px`, while physical values remain honest physical values. A perspective rectangle in projector pixels is not treated as a physical rectangle. Physical angle zero is the positive canonical surface x direction, and positive `angle_deg` rotates counter-clockwise in the physical plane (towards decreasing canonical surface y, whose stored coordinates increase downwards). Pixel-space angles use the same physical-screen convention: positive x right and positive y up for angle arithmetic.
+Dependencies are exactly those implied by conversions actually required by the request. A pure `projector_px` overlay requires no camera or metric calibration.
 
 ## Primitive contracts
 
@@ -141,41 +137,44 @@ This means direct projector alignment is available through `projector_px`, while
 
 ```text
 centre: point reference
-shape_space: projector_px | camera_px | surface_mm
-radius: positive quantity in shape-space units
-angle_deg: optional metadata, normally irrelevant to a circle
+geometry_space: projector_px | surface_mm
+radius: positive quantity in geometry-space units
 style
 ```
 
-A metric circle is sampled in canonical physical surface space before projection. Pixel circles are sampled in their declared pixel space before projection. Sampling is deterministic, uses a configured/default bounded tessellation tolerance and preserves the requested radius in its source space.
+A physical circle is sampled deterministically in canonical `surface_mm` before projection. A projector circle is sampled in projector pixels. Circle tessellation must be deterministic and bounded by configured error/budget limits.
 
 ### Rotated rect
 
 ```text
 centre: point reference
-shape_space: projector_px | camera_px | surface_mm
-width: positive quantity in shape-space units
-height: positive quantity in shape-space units
-angle_deg: finite angle, counter-clockwise, around centre, in declared shape-space orientation
+geometry_space: projector_px | surface_mm
+width: positive quantity in geometry-space units
+height: positive quantity in geometry-space units
+angle_deg: finite angle
 style
 ```
 
-The four source-space corners are generated around the centre, rotated counter-clockwise by `angle_deg` using the documented positive-x/right, positive-y/up angle convention, then transformed. Width/height are not altered to fit the projector. Filled rects render a clipped polygon; outline rects render each clipped source edge independently so clipping cannot invent a screen-boundary closing stroke.
+The four corners are constructed in the declared geometry space around the converted centre, then rotated and projected if required.
+
+Angle convention is explicit and shared across primitives: zero points along positive x; positive angle is counter-clockwise in a conventional x-right/y-up interpretation. Where stored coordinates increase downward, implementation must compensate consistently rather than silently reversing the public convention.
 
 ### Grid
 
 ```text
-origin: point reference, representing one grid intersection
-shape_space: projector_px | camera_px | surface_mm
-spacing: positive quantity in shape-space units
-angle_deg: finite counter-clockwise rotation
-extent: {width, height} in shape-space units, or omitted for automatic finite extent
+origin: point reference representing one grid intersection
+geometry_space: projector_px | surface_mm
+spacing: positive quantity in geometry-space units
+extent: {width, height} positive finite quantities in geometry-space units
+angle_deg: finite angle
 style
 ```
 
-The grid is square in its declared source space. Its local extent is finite. When extent is omitted, the service derives a sufficiently large finite source rectangle to cover the relevant projector output after transformation, then clips all generated lines; it never creates an infinite line collection. The origin/phase is stable in source coordinates and never aligned to rounded projector pixels.
+**Extent is required in Plan5.** There is no automatic/infinite extent mode.
 
-For physical grids, spacing is exact in canonical metric space before projection. For camera/projector grids, spacing is in the declared pixel space.
+The grid is square in its declared source space. `origin` is one deterministic grid intersection. Spacing and extent are applied before rotation and projection. The generated segment collection must be finite before projection and must respect configured budgets.
+
+A physical 1-inch grid means exactly 25.4 mm source spacing before projection.
 
 ### Line
 
@@ -186,27 +185,36 @@ label: optional string
 style
 ```
 
-Endpoints can use different spaces if both can be resolved. A line is literal geometry and does not determine visibility, terrain or legality. It is clipped in projector space while retaining endpoint/request semantics in the response.
+Endpoints may independently use any of the three point spaces. Each is resolved to projector-native coordinates using existing authorities, then the projector-native segment is clipped.
+
+A line is literal geometry only. It does not decide LOS legality, path legality or obstruction.
 
 ### Ruler
 
 ```text
 start: point reference
 end: point reference
-measure_space: projector_px | camera_px | surface_mm
-measurement_camera: required when measure_space == camera_px
-unit: px for pixel measurement, mm|cm|in for physical measurement
-label: optional override or default calculated label
+measurement_space: projector_px | surface_mm
+unit: px when projector_px; mm|cm|in when surface_mm
+label: optional override
 style
 ```
 
-A ruler is a specialised line with deterministic tick marks and a calculated distance. Physical measurement is computed in canonical metric space; projector measurement uses Euclidean distance in projector pixels; camera measurement uses Euclidean distance in the specifically named `measurement_camera`'s native pixels and records that camera as a dependency. Existing Plan4 physical ruler validation remains available and its observed physical errors remain independent operator observations.
+For `projector_px`, both endpoints are converted to projector coordinates and Euclidean pixel distance is measured there.
 
-Rulers use bounded tick generation in source measurement space. Tick decoration never changes the requested endpoints or measured length. Labels are decorative and may be clamped to the output surface.
+For `surface_mm`, both endpoints are converted to canonical metric surface coordinates and physical Euclidean distance is measured there. This may require camera calibration, metric calibration or both depending on endpoint point spaces.
 
-## Style contract
+Ticks are deterministic and bounded. Existing Plan4 physical ruler calculations should be reused or factored into a shared pure physical-distance/tick path rather than duplicated.
 
-The minimal public style is intentionally Pygame-friendly:
+There is no camera-pixel ruler measurement in Plan5.
+
+## Strict quantity and style model
+
+Physical quantities accept only `mm`, `cm` or `in` and normalize to millimetres. Projector quantities accept only `px`.
+
+Unknown units, unit/space mismatches, non-finite values, booleans, zero/negative dimensions and unsupported fields fail closed.
+
+Minimal style:
 
 ```json
 {
@@ -216,13 +224,21 @@ The minimal public style is intentionally Pygame-friendly:
 }
 ```
 
-`colour` is a strict six-digit HEX string and is normalised to an RGB tuple. `fill` controls filled versus outline rendering for circles and rects; lines and grid lines are outline-only and reject a supplied `fill: true`. `line_width_px` is a positive integer projector-raster width. Defaults are deterministic by primitive kind.
+Requirements:
 
-Alpha is not part of the initial public contract. The implementation should not invent translucent compositing that the current Pygame path cannot render reliably. Stroke/fill colour separation is also deferred; one colour keeps the first API small and direct.
+- `colour` is strict six-digit HEX and normalizes to RGB;
+- `line_width_px` is a positive integer in final projector pixels;
+- `fill` applies to circle/rect only;
+- line, grid and ruler reject `fill: true`;
+- defaults are deterministic by primitive kind;
+- style never changes physical/source geometry;
+- alpha and separate stroke/fill colours are out of scope.
 
-## Generation budgets
+## Bounded generation
 
-Every request is validated against bounded configuration before it is inserted into the registry. Initial defaults are:
+Configuration must bound work before registry mutation.
+
+Initial implementation should expose bounded defaults equivalent in spirit to:
 
 ```text
 max_overlay_vertices = 10000
@@ -231,53 +247,125 @@ max_overlay_ticks = 200
 max_overlay_label_characters = 256
 ```
 
-The values must be positive, finite where applicable and preserved through configuration round trips. Circle tessellation, grid auto-extent, tick generation and label handling fail closed when a budget would be exceeded; they must not allocate an unbounded intermediate collection or partially mutate registry state. Tests may use smaller injected budgets to exercise the boundaries.
+Exact names may follow existing config conventions, but they must be positive, test-injectable and round-trip safely.
 
-## Clipping and raster safety
+Circle sampling, grid generation, tick generation and labels must reject over-budget requests before allocating an unsafe collection or partially mutating registry state.
 
-Source geometry is generated at the requested size and transformed before output clipping. Projector clipping may remove invisible portions but must never shrink, re-centre or otherwise reinterpret requested physical/pixel geometry.
+## Projector materialisation and clipping
 
-All final draw primitives must be finite. Lines are clipped to projector bounds; closed polygonal geometry is polygon-clipped; sampled curves are clipped after transformation. A valid entirely off-screen object may remain in registry state but produces no draw calls. Horizon crossings, non-finite transforms, degenerate geometry and unsafe projected primitives fail the request rather than producing plausible output.
+All source geometry is constructed at requested size before projector clipping.
 
-Rounding to raster pixels occurs only after source geometry, projective transformation and clipping. The renderer must not recompute positions, dimensions or scales.
+Requirements:
 
-## Overlay registry and lifecycle
+- all transformed coordinates must be finite;
+- horizon-crossing or non-finite projective results fail the request;
+- line segments are clipped independently to output bounds;
+- filled polygons are polygon-clipped;
+- outline closed shapes clip their source edges independently so clipping does not invent a screen-edge closing stroke;
+- an entirely off-screen but otherwise valid overlay may remain registered and produce zero draw calls;
+- clipping never shrinks, re-centres or otherwise reinterprets the requested geometry;
+- raster rounding happens only after source construction, transformation and clipping;
+- renderer code must not recompute geometry.
 
-Each new object receives a UUID4 ID unless a test seam supplies an ID. A name is optional. Names are unique within the session and duplicate names are rejected; IDs remain the unambiguous machine reference. There is no implicit replacement. To change geometry, remove the object and create another.
+## Registry model
 
-The registry stores:
+One `OverlayRegistry` is owned by `MultiVisionService` for new generic overlays.
+
+Each entry stores at minimum:
 
 ```text
 id
-optional name (no slash, not canonical UUID syntax)
+optional unique name
 kind
 visible
-immutable request/specification
-materialised projector-native draw primitives
-calibration/output dependencies
+immutable normalized request
+immutable materialised projector primitives
+camera dependencies
+metric dependency flag
+projector-output dependency
 insertion sequence
 ```
 
-ID and name selectors are never ambiguous: lifecycle routes use an explicit `id` or `name` path segment, and the service never guesses between them.
+IDs are UUID4 unless a deterministic test seam injects one. Names are optional, session-local and unique; names containing `/` or canonical UUID syntax are rejected so selectors remain unambiguous.
 
-Supported state operations are:
+Supported operations:
 
 ```text
 create
 list
-show(id-or-name)
-hide(id-or-name)
-remove(id-or-name)
-clear(all)
+show
+hide
+remove
+clear
 ```
 
-Show/hide of an already-visible/already-hidden object is idempotent. Listing and rendering use deterministic insertion order, not UUID lexical order. Layer order is explicit by primitive category, then insertion order. Names are not required for operation; IDs returned by creation are sufficient.
+There is no implicit replace/update in Plan5. To change geometry, remove and recreate the object.
 
-The existing point overlay remains independently addressable through its current compatibility API and remains visually usable alongside generic objects. The existing metric-ruler API remains a compatibility adapter for one Plan4 physical ruler; generic ruler creation supports multiple named/UUID objects without duplicating calculation logic.
+Show/hide is idempotent. Listing and rendering use insertion order within the explicit primitive layer order, never UUID lexical order.
+
+## Dependency invalidation
+
+No stale materialised projector geometry may remain visible.
+
+The simple Plan5 rule is to **remove affected generic overlays** when an authority they depend on becomes invalid.
+
+Examples:
+
+- camera-dependent overlay: remove before/when that camera calibration becomes stale/reset/changed or camera lifecycle makes the dependency unusable;
+- metric-dependent overlay: remove before metric recalibration/reset and when metric calibration becomes stale;
+- all generic overlays: remove when projector output identity/resolution changes because their final projector primitives are tied to that descriptor;
+- unrelated projector-only overlays remain when only a camera or metric calibration changes.
+
+A mixed camera-anchor/physical shape depends on both that camera and metric calibration.
+
+Invalidation must be atomic relative to visible service state: stale materialised geometry must not survive one frame after the dependency transition becomes observable.
+
+## Compatibility boundaries
+
+Plan3 diagnostic camera areas remain diagnostics, not generic overlays and not physical gameplay regions.
+
+The legacy point overlay remains independently addressable and must coexist with generic overlays.
+
+Plan4's existing metric-ruler endpoint remains supported. Its physical mathematics should reuse the same pure ruler/metric helpers where practical, but legacy compatibility must not create a second registry or second transform/scale authority.
+
+Normal generic overlays are suppressed during camera calibration patterns and metric blank capture.
+
+## Display contract
+
+The display/runtime receives immutable service-produced projector-native primitives only.
+
+It may:
+
+- draw polygons, circles/polylines, segments, ticks and labels;
+- apply already-normalized RGB/style values;
+- obey visibility and deterministic layer ordering;
+- round/clamp raster-safe final values as specified by the primitive snapshot.
+
+It must not:
+
+- resolve camera points;
+- call homographies;
+- convert units;
+- derive physical scale;
+- choose source-space dimensions;
+- rebuild a grid/circle/rect/ruler.
+
+Normal order should preserve current semantics while adding generic layers approximately as:
+
+```text
+grid/background
+diagnostic areas
+rects/circles
+lines/rulers
+labels
+legacy point emphasis
+```
+
+Exact placement may adapt to the current renderer, but it must be deterministic and keep the legacy point visible as emphasis.
 
 ## API contract
 
-The primary generic routes are:
+Primary routes:
 
 ```text
 POST   /overlays/grid
@@ -295,46 +383,147 @@ DELETE /overlays/name/{name}
 DELETE /overlays
 ```
 
-Request schemas reject unknown fields, malformed nested references, invalid units/spaces, duplicate names, missing calibration dependencies, non-finite values, non-positive dimensions, invalid HEX colours and invalid angle/width values. Responses include ID, optional name, kind, visibility, original normalised request, style and service-produced projector draw primitives. JSON output contains no NaN or infinity.
+Schemas reject unknown fields and malformed nested references.
 
-Existing `/metric/ruler`, `/metric/calibration/*`, `/overlay/point` and camera/area APIs retain their established schemas and semantics. Generic endpoints delegate all geometry and state changes to `MultiVisionService`; API code must not open cameras, invoke Pygame or calculate homographies.
+Responses expose normalized public overlay state:
 
-The CLI mirrors generic creation and lifecycle operations while remaining a thin HTTP client. The canonical creation form is `overlay <kind> --spec-json '<json>'`; lifecycle commands require exactly one of `--id` or `--name`. JSON specs are the compact way to express mixed coordinate references and styles; any later convenience flags must compile to the same request schema and must not implement geometry locally.
+```text
+id
+name
+kind
+visible
+normalized request/style
+dependency/status information where useful
+```
 
-## Deterministic scenario matrix
+**Do not return the full materialised projector primitive collection as the normal API representation.** That is an internal service→display contract and may be very large for grids/curves.
 
-Automated coverage must include:
+API code performs no homography, camera, Pygame, unit conversion, clipping or shape mathematics; it delegates to the service.
 
-- direct projector-pixel circle/rect/grid/line/ruler requests without calibration;
-- camera-pixel requests using selected calibrated cameras and rejection for closed, unavailable, stale or wrong cameras;
-- canonical physical requests using Plan4 metric calibration and rejection when uncalibrated/stale;
-- camera-pixel anchor plus physical radius/width/height and rejection when either dependency is missing;
-- projector-pixel anchor plus physical geometry;
-- surface-edge point-anchor conversion under skewed perspective, with physical shapes constructed only after canonical conversion;
-- circles sampled before transformation, proving physical radius and perspective distortion;
-- rotated rects and grids with positive/negative angles and deterministic counter-clockwise convention;
-- arbitrary grid origin/phase, exact source spacing, finite explicit extent and automatic finite extent;
-- filled and outline-only closed shapes, HEX colours and projector-pixel line widths;
-- output-bound clipping with requested dimensions preserved, independently clipped outline segments without synthetic boundary strokes, and entirely off-screen valid geometry producing no calls;
-- mixed-space line endpoints and ruler measurement spaces, including required camera identity for camera-pixel measurement;
-- named/unnamed UUID4 objects, duplicate names, insertion ordering, show/hide/remove/clear and no replacement;
-- camera, metric and output-descriptor invalidation with unrelated-object preservation;
-- calibration-pattern and metric-blank suppression, legacy point/ruler coexistence and display main-thread enforcement;
-- API/CLI delegation, strict schemas, JSON-safe serialisation and no hardware ownership.
+Existing point/metric/calibration/camera/area routes retain their established behaviour.
 
-Synthetic and fake-Pygame tests prove software and mathematical behaviour only. They do not prove printer scale, tabletop flatness, projector placement, camera quality or physical dimensions.
+## CLI contract
 
-## Manual acceptance boundary
+Creation uses the canonical thin form:
 
-The updated smoke procedure must record:
+```text
+multivision overlay <kind> --spec-json '<json>'
+```
 
-1. a rotated physical grid measured at separated tabletop positions;
-2. filled and outline-only physical circles and rects, including a known physical radius/size;
-3. physical lines and rulers at multiple locations/orientations;
-4. a camera-pixel anchor overlaid with a physical radius, after both relevant calibrations;
-5. direct projector-pixel geometry and its intentionally pixel-based semantics;
-6. screen-edge clipping without shrinking the requested geometry;
-7. named overlay show/hide/remove and coexistence of several objects;
-8. explicit invalidation behaviour after camera, metric or projector changes.
+Lifecycle operations:
 
-No automated response, SVG, screenshot or fake projector output is evidence of physical accuracy.
+```text
+multivision overlays list
+multivision overlay show --id ... | --name ...
+multivision overlay hide --id ... | --name ...
+multivision overlay remove --id ... | --name ...
+multivision overlays clear
+```
+
+Exactly one selector is accepted for lifecycle commands. CLI prints returned IDs/names and structured errors but performs no geometry/calibration work locally.
+
+## Deterministic test matrix
+
+Tests should be consolidated around behaviours rather than one near-duplicate suite per layer.
+
+### Pure geometry tests
+
+Cover:
+
+- unit conversion and strict unit/space matching;
+- point validation and camera identity rules;
+- projector/camera/surface point resolution;
+- projector→surface inverse conversion for mixed anchors;
+- mixed `camera_px` centre + `surface_mm` circle/rect/grid;
+- mixed line endpoints;
+- physical and projector-pixel rulers;
+- deliberate rejection of camera-pixel shape sizes/measurement;
+- circle sampling before projective transformation;
+- rotated rect geometry;
+- finite explicit grid extent and deterministic ordering;
+- angle convention positive/negative cases;
+- style normalization;
+- generation budgets;
+- clipping without size mutation or synthetic screen-edge strokes;
+- off-screen valid geometry producing zero primitives/draws;
+- skewed homographies proving that physical geometry cannot pass via constant pixel scale.
+
+### Service/registry tests
+
+Cover:
+
+- one registry owner;
+- UUID/name behaviour and duplicate rejection;
+- insertion ordering;
+- show/hide idempotence;
+- remove/clear;
+- atomic failed create;
+- camera/metric/projector dependency recording;
+- invalidation removing affected overlays only;
+- camera-anchor + physical-shape dependence on both authorities;
+- projector-only overlays without calibration;
+- coexistence with point, area and legacy metric ruler;
+- calibration-pattern/blank-frame suppression.
+
+### Boundary/display/integration tests
+
+Cover:
+
+- strict API schemas and JSON-safe normalized responses;
+- absence of full projector primitive dumps from normal API responses;
+- thin CLI delegation;
+- no camera/homography/Pygame work in API/CLI;
+- fake-Pygame deterministic layer order, visibility, fills, colours, widths and labels;
+- running-service create/list/show/hide/remove/clear flow;
+- invalidation leaves no stale draw calls;
+- projector-only and physical overlays can coexist;
+- existing endpoint regressions remain green.
+
+Synthetic tests prove software/mathematical behaviour only and must not claim physical accuracy.
+
+## Manual hardware acceptance
+
+Update `docs/mvp0-manual-smoke-check.md` to record at minimum:
+
+1. a rotated physical grid with explicit extent and known spacing, measured at separated tabletop positions;
+2. a known-size physical circle and rectangle, both outline and filled where useful;
+3. physical line/ruler checks at several positions/orientations;
+4. a camera-pixel centre used to place a physical circle/rect after both calibrations;
+5. direct projector-pixel geometry demonstrating intentionally pixel-based sizing;
+6. clipping at projector edges without changing requested physical size;
+7. several named/unnamed overlays coexisting, including show/hide/remove;
+8. camera invalidation removing camera-dependent geometry while unrelated geometry remains;
+9. metric invalidation removing physical geometry;
+10. projector descriptor change clearing materialised generic overlays.
+
+Hardware evidence, not mocks, screenshots or synthetic projector commands, establishes physical accuracy.
+
+## pi-harness completion expectations
+
+The implementation agent should treat the numbered Plan5 lines as execution steps and this sidecar as their shared acceptance contract.
+
+Before Plan5 is complete it must:
+
+- run the full deterministic repository suite from a clean root;
+- keep changes inside the stated scope;
+- remove duplicate scale/transform/unit logic discovered during integration;
+- preserve ADR-0001/0002/0003 and `harness.toml` unchanged;
+- report which manual physical checks remain unperformed rather than claiming them from automated tests;
+- explicitly flag any necessary deviation from this sidecar instead of silently generalising the architecture.
+
+## Adversarial guardrails
+
+The implementation should be rejected or corrected if it introduces any of these:
+
+1. camera pixels as physical shape size or ruler distance;
+2. a second metric frame such as `surface_edge_mm` without a new approved decision;
+3. local `pixels_per_cm`, DPI or constant pixel-scale approximation;
+4. auto/infinite grid generation when explicit extent suffices;
+5. generic scene graph, z-index or plugin renderer architecture;
+6. a second homography/metric authority in overlay, API, CLI or display code;
+7. API responses coupling clients to thousands of renderer primitives;
+8. stale materialised geometry after calibration/output invalidation;
+9. clipping that changes requested physical dimensions;
+10. game/AI/piece/LOS/movement semantics in the generic geometry layer.
+
+The intended result is intentionally modest: a reliable generic tabletop geometry API with camera-addressable points and honest physical/projector sizing, suitable as a foundation for later piece tracking without prematurely becoming a graphics engine.
