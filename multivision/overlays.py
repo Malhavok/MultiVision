@@ -1007,11 +1007,12 @@ def build_projector_coverage_grid_request(
     """Build a finite surface grid covering the complete projector output."""
     if not isinstance(request, ProjectorCoverageGridRequest):
         raise ValueError('request must be ProjectorCoverageGridRequest')
-    from multivision.metric import calculate_projector_surface_bounds
+    from multivision.metric import calculate_projector_surface_grid_layout
 
-    surface_bounds = calculate_projector_surface_bounds(
+    layout = calculate_projector_surface_grid_layout(
         metric_calibration,
         projector_resolution,
+        request.spacing.value,
     )
     return GridRequest(
         id=request.id,
@@ -1020,23 +1021,23 @@ def build_projector_coverage_grid_request(
         style=request.style,
         origin={
             'space': GeometrySpace.SURFACE_MM.value,
-            'x': surface_bounds.left,
-            'y': surface_bounds.top,
+            'x': layout.origin.x,
+            'y': layout.origin.y,
             'unit': 'mm',
         },
         geometry_space=GeometrySpace.SURFACE_MM.value,
         spacing=request.spacing,
         extent={
             'width': {
-                'value': surface_bounds.right - surface_bounds.left,
+                'value': layout.width,
                 'unit': 'mm',
             },
             'height': {
-                'value': surface_bounds.bottom - surface_bounds.top,
+                'value': layout.height,
                 'unit': 'mm',
             },
         },
-        angle_deg=request.angle_deg,
+        angle_deg=layout.angle_deg + request.angle_deg,
     )
 
 

@@ -18,10 +18,12 @@ multivision overlay grid --fill-projector --spacing 35mm
 ```
 
 This capability inverse-projects the four projector-output corners through the
-current metric homography, derives a finite surface-mm bounding box, builds an
-ordinary physical `GridRequest`, and relies on the existing projector-native
-clipping path. It preserves the current grid spacing in physical millimetres
-while covering the complete projector output. The mode intentionally assumes
+current metric homography, derives a finite surface-mm footprint, and uses the
+local projector X/Y directions at the projector centre as the grid anchor and
+orientation. It then builds an ordinary physical `GridRequest` and relies on
+the existing projector-native clipping path. It preserves the current grid
+spacing in physical millimetres while covering the complete projector output.
+The mode intentionally assumes
 that the calibrated A4 sheet and the full projected surface share one flat
 plane, as requested by the operator.
 

@@ -29,6 +29,7 @@ from multivision.metric import (
     MetricHomographyPair,
     build_metric_ruler,
     calculate_projector_surface_bounds,
+    calculate_projector_surface_grid_layout,
     calibrate_metric_homography,
     calculate_surface_distance_mm,
     normalise_length_to_mm,
@@ -170,6 +171,25 @@ class MetricTest(unittest.TestCase):
                 bounds.left <= surface_point.x <= bounds.right
                 and bounds.top <= surface_point.y <= bounds.bottom
             ), f'{projector_point=}, {bounds=}'
+
+    def test_projector_grid_alignment_uses_the_local_projector_rotation(self) -> None:
+        angle_radians = math.radians(30.0)
+        surface_to_projector = (
+            (math.cos(angle_radians), math.sin(angle_radians), 0.0),
+            (-math.sin(angle_radians), math.cos(angle_radians), 0.0),
+            (0.0, 0.0, 1.0),
+        )
+        transform = MetricHomographyPair.from_surface_to_projector(
+            surface_to_projector,
+        )
+
+        layout = calculate_projector_surface_grid_layout(
+            transform,
+            Resolution(640, 480),
+            35.0,
+        )
+
+        assert math.isclose(layout.angle_deg, -30.0, abs_tol=1e-9), f'{layout=}'
 
     def test_projector_surface_bounds_reject_a_bbox_crossing_the_horizon(self) -> None:
         surface_to_projector = (

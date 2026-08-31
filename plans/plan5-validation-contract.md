@@ -172,7 +172,7 @@ style
 
 **Extent is required for a normal `GridRequest`.** The named projector-footprint grid capability derives one finite surface-mm extent by inverse-projecting the four projector-output corners; it is not an automatic/infinite extent mode.
 
-The grid is square in its declared source space. `origin` is one deterministic grid intersection. Spacing and extent are applied before rotation and projection. The generated segment collection must be finite before projection and must respect configured budgets. The derived footprint bounding box must be finite and must not cross the homography horizon; projector-native clipping remains authoritative.
+The grid is square in its declared source space. `origin` is one deterministic grid intersection. Spacing and extent are applied before rotation and projection. The generated segment collection must be finite before projection and must respect configured budgets. The derived footprint bounding box must be finite and must not cross the homography horizon; projector-native clipping remains authoritative. The projector-footprint mode anchors the grid at the projector centre and derives its physical rotation from the local inverse-homography directions there.
 
 A physical 1-inch grid means exactly 25.4 mm source spacing before projection.
 

@@ -85,6 +85,15 @@ class MetricValidationRecord(NamedTuple):
     timestamp: float
 
 
+class ProjectorSurfaceGridLayout(NamedTuple):
+    """A finite grid layout centred and oriented from the projector frame."""
+
+    origin: Point2D
+    width: float
+    height: float
+    angle_deg: float
+
+
 class MetricCalibrationRecord(NamedTuple):
     """The single shared metric calibration record for one service session."""
 
@@ -1010,6 +1019,82 @@ def calculate_projector_surface_bounds(
     return surface_bounds
 
 
+def calculate_projector_surface_grid_layout(
+    projector_to_surface_matrix: (
+        MatrixLike | MetricHomographyPair | MetricCalibrationRecord
+    ),
+    projector_bounds: MetricBounds,
+    spacing_mm: object,
+) -> ProjectorSurfaceGridLayout:
+    """Build a centred physical grid layout aligned to the projector centre."""
+    if not is_finite_real(spacing_mm) or float(spacing_mm) <= 0:
+        raise ValueError('spacing_mm must be a positive finite number')
+    checked_spacing_mm = float(spacing_mm)
+    checked_projector_bounds = _coerce_metric_bounds(projector_bounds)
+    source_bounds = calculate_projector_surface_bounds(
+        projector_to_surface_matrix,
+        checked_projector_bounds,
+    )
+    transform = getattr(
+        projector_to_surface_matrix,
+        'projector_to_surface',
+        projector_to_surface_matrix,
+    )
+    checked_transform = _projector_to_surface_matrix(transform)
+    projector_centre = Point2D(
+        (checked_projector_bounds.left + checked_projector_bounds.right) / 2.0,
+        (checked_projector_bounds.top + checked_projector_bounds.bottom) / 2.0,
+    )
+    surface_centre = project_point(projector_centre, checked_transform)
+    jacobian = _calculate_homography_jacobian(surface_centre, checked_transform)
+    angle_deg = math.degrees(
+        math.atan2(jacobian[1].x - jacobian[0].y, jacobian[0].x + jacobian[1].y),
+    )
+    angle_radians = math.radians(angle_deg)
+    cosine = math.cos(angle_radians)
+    sine = math.sin(angle_radians)
+    centre_relative_corners = (
+        Point2D(
+            source_bounds.left - surface_centre.x,
+            source_bounds.top - surface_centre.y,
+        ),
+        Point2D(
+            source_bounds.right - surface_centre.x,
+            source_bounds.top - surface_centre.y,
+        ),
+        Point2D(
+            source_bounds.right - surface_centre.x,
+            source_bounds.bottom - surface_centre.y,
+        ),
+        Point2D(
+            source_bounds.left - surface_centre.x,
+            source_bounds.bottom - surface_centre.y,
+        ),
+    )
+    half_width = max(
+        abs(cosine * point.x + sine * point.y)
+        for point in centre_relative_corners
+    )
+    half_height = max(
+        abs(-sine * point.x + cosine * point.y)
+        for point in centre_relative_corners
+    )
+    half_width = math.ceil(half_width / checked_spacing_mm) * checked_spacing_mm
+    half_height = math.ceil(half_height / checked_spacing_mm) * checked_spacing_mm
+    half_width = max(checked_spacing_mm, half_width)
+    half_height = max(checked_spacing_mm, half_height)
+    origin = Point2D(
+        surface_centre.x - cosine * half_width - sine * half_height,
+        surface_centre.y + sine * half_width - cosine * half_height,
+    )
+    return ProjectorSurfaceGridLayout(
+        origin,
+        2.0 * half_width,
+        2.0 * half_height,
+        angle_deg,
+    )
+
+
 def project_surface_points(
     surface_points: Iterable[PointLike],
     surface_to_projector_matrix: MatrixLike | MetricHomographyPair,
@@ -1539,6 +1624,53 @@ def _calculate_metric_spatial_coverage(
     return coverage
 
 
+def _calculate_homography_jacobian(
+    point: Point2D,
+    matrix: MatrixLike,
+) -> tuple[Point2D, Point2D]:
+    checked_matrix = validate_homography(matrix)
+    denominator = (
+        checked_matrix[2][0] * point.x
+        + checked_matrix[2][1] * point.y
+        + checked_matrix[2][2]
+    )
+    if abs(denominator) <= 1e-12:
+        raise InvalidHomographyError('Homography derivative lies on the horizon')
+    numerator_x = (
+        checked_matrix[0][0] * point.x
+        + checked_matrix[0][1] * point.y
+        + checked_matrix[0][2]
+    )
+    numerator_y = (
+        checked_matrix[1][0] * point.x
+        + checked_matrix[1][1] * point.y
+        + checked_matrix[1][2]
+    )
+    denominator_squared = denominator * denominator
+    return (
+        Point2D(
+            (
+                checked_matrix[0][0] * denominator
+                - numerator_x * checked_matrix[2][0]
+            ) / denominator_squared,
+            (
+                checked_matrix[1][0] * denominator
+                - numerator_y * checked_matrix[2][0]
+            ) / denominator_squared,
+        ),
+        Point2D(
+            (
+                checked_matrix[0][1] * denominator
+                - numerator_x * checked_matrix[2][1]
+            ) / denominator_squared,
+            (
+                checked_matrix[1][1] * denominator
+                - numerator_y * checked_matrix[2][1]
+            ) / denominator_squared,
+        ),
+    )
+
+
 def _surface_to_projector_matrix(
     transform: MatrixLike | MetricHomographyPair,
 ) -> MatrixLike:
@@ -1611,6 +1743,7 @@ def _coerce_metric_bounds(bounds: MetricBounds) -> CoordinateBounds:
 __all__ = [
     'MetricBounds',
     'MetricCalibrationRecord',
+    'ProjectorSurfaceGridLayout',
     'MetricCalibrationRegistry',
     'MetricCalibrationStatus',
     'MetricValidationRecord',
@@ -1626,6 +1759,7 @@ __all__ = [
     'RULER_TICK_SPACING_SOURCE_UNITS',
     'METRIC_RULER_RASTER_MARGIN_PIXELS',
     'calculate_projector_surface_bounds',
+    'calculate_projector_surface_grid_layout',
     'calculate_ruler_tick_layout',
     'build_metric_ruler',
     'calibrate_metric_homography',

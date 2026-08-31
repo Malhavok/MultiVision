@@ -316,10 +316,10 @@ def test_projector_coverage_grid_derives_a_finite_surface_extent() -> None:
         Resolution(100, 80),
     )
 
-    assert grid_request.origin.x == 0.0, f'{grid_request=}'
-    assert grid_request.origin.y == 0.0, f'{grid_request=}'
-    assert grid_request.extent.width.value == 100.0, f'{grid_request=}'
-    assert grid_request.extent.height.value == 80.0, f'{grid_request=}'
+    assert grid_request.origin.x == -20.0, f'{grid_request=}'
+    assert grid_request.origin.y == -30.0, f'{grid_request=}'
+    assert grid_request.extent.width.value == 140.0, f'{grid_request=}'
+    assert grid_request.extent.height.value == 140.0, f'{grid_request=}'
     assert grid_request.spacing.value == 35.0, f'{grid_request=}'
 
 

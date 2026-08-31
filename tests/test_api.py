@@ -148,9 +148,11 @@ class ApiTest(unittest.TestCase):
 
         assert response.status_code == 200, f'{response.json()=}'
         data = response.json()
+        assert data['request']['origin']['x'] == -20.0, f'{data=}'
+        assert data['request']['origin']['y'] == -30.0, f'{data=}'
         assert data['request']['extent'] == {
-            'width': {'value': 100.0, 'unit': 'mm'},
-            'height': {'value': 80.0, 'unit': 'mm'},
+            'width': {'value': 140.0, 'unit': 'mm'},
+            'height': {'value': 140.0, 'unit': 'mm'},
         }, f'{data=}'
 
     def test_calibration_pattern_can_be_held_without_changing_calibration(self) -> None:

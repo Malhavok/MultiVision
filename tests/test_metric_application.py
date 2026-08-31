@@ -125,8 +125,10 @@ class MetricApplicationTest(unittest.TestCase):
             ),
         )
 
-        assert entry.request.extent.width.value == 640.0, f'{entry=}'
-        assert entry.request.extent.height.value == 480.0, f'{entry=}'
+        assert entry.request.origin.x == -30.0, f'{entry=}'
+        assert entry.request.origin.y == -5.0, f'{entry=}'
+        assert entry.request.extent.width.value == 700.0, f'{entry=}'
+        assert entry.request.extent.height.value == 490.0, f'{entry=}'
         assert entry.request.spacing.value == 35.0, f'{entry=}'
         assert len(service.list_overlays()) == 1, f'{service.list_overlays()=}'
 
