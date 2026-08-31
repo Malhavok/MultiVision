@@ -153,6 +153,29 @@ class MetricTargetCorrespondences(NamedTuple):
         )
 
 
+class _SynchronizedTagDetector:
+    """Serialise calls into one detector instance."""
+
+    def __init__(self, detector: FiducialDetector) -> None:
+        self._detector = detector
+        self._detect_lock = threading.Lock()
+
+    def detect(self, frame: Any) -> Iterable[DetectedMarker]:
+        with self._detect_lock:
+            return self._detector.detect(frame)
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._detector, name)
+        if name != 'detect_strict' or not callable(attribute):
+            return attribute
+
+        def detect_strict(frame: Any) -> Iterable[DetectedMarker]:
+            with self._detect_lock:
+                return attribute(frame)
+
+        return detect_strict
+
+
 class CachedTagDetectorFactory:
     """Create and cache independent OpenCV detectors by dictionary name."""
 
@@ -177,7 +200,9 @@ class CachedTagDetectorFactory:
             detector = self._detectors.get(checked_dictionary_name)
             if detector is not None:
                 return detector
-            detector = self._detector_factory(checked_dictionary_name)
+            detector = _SynchronizedTagDetector(
+                self._detector_factory(checked_dictionary_name),
+            )
             self._detectors[checked_dictionary_name] = detector
             return detector
 

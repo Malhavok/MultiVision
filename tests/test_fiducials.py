@@ -1,4 +1,5 @@
 import math
+import threading
 import unittest
 from typing import Any
 
@@ -136,6 +137,130 @@ class FiducialTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             factory('DICT_UNKNOWN')
         assert created_dictionary_names == [DICT_5X5_1000], f'{created_dictionary_names=}'
+
+    def test_cached_detector_preserves_optional_detector_behaviour(self) -> None:
+        class StrictDetector:
+            dictionary_name = DICT_5X5_1000
+
+            def __init__(self) -> None:
+                self.strict_call_count = 0
+
+            def detect(self, _frame: object) -> tuple[DetectedMarker, ...]:
+                raise AssertionError('permissive detection should not be selected')
+
+            def detect_strict(self, _frame: object) -> tuple[DetectedMarker, ...]:
+                self.strict_call_count += 1
+                return (DetectedMarker(23, _corners(10, 10)),)
+
+        underlying_detector = StrictDetector()
+        detector = CachedTagDetectorFactory(
+            lambda _dictionary: underlying_detector,
+        )(DICT_5X5_1000)
+
+        assert detector.dictionary_name == DICT_5X5_1000
+        assert detect_metric_fiducials(object(), detector) == (
+            DetectedMarker(23, _corners(10, 10)),
+        )
+        assert underlying_detector.strict_call_count == 1, f'{underlying_detector=}'
+
+    def test_cached_detector_serialises_concurrent_detection_calls(self) -> None:
+        class BlockingDetector:
+            def __init__(self) -> None:
+                self.active_count = 0
+                self.maximum_active_count = 0
+                self.call_count = 0
+                self.first_started = threading.Event()
+                self.release_first = threading.Event()
+                self._state_lock = threading.Lock()
+
+            def detect(self, _frame: object) -> tuple[DetectedMarker, ...]:
+                with self._state_lock:
+                    self.call_count += 1
+                    call_number = self.call_count
+                    self.active_count += 1
+                    self.maximum_active_count = max(
+                        self.maximum_active_count,
+                        self.active_count,
+                    )
+                    if call_number == 1:
+                        self.first_started.set()
+                try:
+                    if call_number == 1:
+                        self.release_first.wait(timeout=1)
+                    return ()
+                finally:
+                    with self._state_lock:
+                        self.active_count -= 1
+
+        underlying_detector = BlockingDetector()
+        factory = CachedTagDetectorFactory(lambda _dictionary: underlying_detector)
+        first_detector = factory(DICT_5X5_1000)
+        second_detector = factory(DICT_5X5_1000)
+        second_started = threading.Event()
+        second_finished = threading.Event()
+
+        def run_first_detection() -> None:
+            first_detector.detect(object())
+
+        def run_second_detection() -> None:
+            second_started.set()
+            second_detector.detect(object())
+            second_finished.set()
+
+        first_thread = threading.Thread(target=run_first_detection)
+        second_thread = threading.Thread(target=run_second_detection)
+        first_thread.start()
+        assert underlying_detector.first_started.wait(timeout=1)
+        second_thread.start()
+        assert second_started.wait(timeout=1)
+        assert not second_finished.wait(timeout=0.1)
+
+        underlying_detector.release_first.set()
+        first_thread.join(timeout=1)
+        second_thread.join(timeout=1)
+
+        assert not first_thread.is_alive(), f'{first_thread=}'
+        assert not second_thread.is_alive(), f'{second_thread=}'
+        assert underlying_detector.maximum_active_count == 1, f'{underlying_detector=}'
+        assert underlying_detector.call_count == 2, f'{underlying_detector=}'
+
+    def test_cached_detector_locks_are_independent_by_dictionary(self) -> None:
+        class BlockingDetector:
+            def __init__(self) -> None:
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def detect(self, _frame: object) -> tuple[DetectedMarker, ...]:
+                self.started.set()
+                self.release.wait(timeout=1)
+                return ()
+
+        detectors: dict[str, BlockingDetector] = {}
+
+        def make_detector(dictionary_name: str) -> BlockingDetector:
+            detector = BlockingDetector()
+            detectors[dictionary_name] = detector
+            return detector
+
+        factory = CachedTagDetectorFactory(make_detector)
+        first_detector = factory(DICT_5X5_1000)
+        second_detector = factory('DICT_APRILTAG_36h11')
+        first_thread = threading.Thread(target=first_detector.detect, args=(object(),))
+        second_thread = threading.Thread(target=second_detector.detect, args=(object(),))
+
+        first_thread.start()
+        second_thread.start()
+        assert detectors[DICT_5X5_1000].started.wait(timeout=1)
+        assert detectors['DICT_APRILTAG_36h11'].started.wait(timeout=1)
+
+        detectors[DICT_5X5_1000].release.set()
+        detectors['DICT_APRILTAG_36h11'].release.set()
+        first_thread.join(timeout=1)
+        second_thread.join(timeout=1)
+
+        assert not first_thread.is_alive(), f'{first_thread=}'
+        assert not second_thread.is_alive(), f'{second_thread=}'
+        assert first_detector is not second_detector
 
     def test_detector_uses_projection_safe_parameters(self) -> None:
         class FakeParameters:
