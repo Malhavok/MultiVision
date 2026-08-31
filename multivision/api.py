@@ -9,11 +9,13 @@ from typing import Annotated, Any, Literal
 from fastapi import (
     FastAPI,
     Path,
+    Query,
     Request,
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import (
+    AfterValidator,
     AliasChoices,
     BaseModel,
     ConfigDict,
@@ -69,6 +71,7 @@ from multivision.overlays import (
     TextRequest,
 )
 from multivision.persistence import PersistedCalibration
+from multivision.pattern import validate_tag_dictionary
 from multivision.service import RedCircleOverlay
 from multivision.session import (
     FrameMetadata,
@@ -205,6 +208,19 @@ class PointRequest(BaseModel):
     @classmethod
     def validate_finite_coordinate(cls, value: Any) -> float:
         return _validate_coordinate(value)
+
+
+def _validate_tag_dictionary_query(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return validate_tag_dictionary(value)
+
+
+TagDictionaryQuery = Annotated[
+    str | None,
+    Query(min_length=1),
+    AfterValidator(_validate_tag_dictionary_query),
+]
 
 
 def create_app(
@@ -353,6 +369,14 @@ def create_app(
         if camera is not None:
             return _session_camera_to_data(owned_service, camera)
         return _camera_to_data(owned_service.get_camera_status(logical_name))
+
+    @app.get('/cameras/{camera}/tags')
+    def get_camera_tags(
+        camera: Annotated[str, Path(min_length=1)],
+        dictionary: TagDictionaryQuery = None,
+    ) -> dict[str, Any]:
+        result = owned_service.inspect_tags(camera, dictionary)
+        return _json_safe(result.to_data())
 
     @app.get('/cameras/{logical_name}/snapshot')
     def get_camera_snapshot(

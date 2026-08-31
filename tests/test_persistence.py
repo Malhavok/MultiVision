@@ -8,7 +8,11 @@ from typing import Any
 
 from multivision.calibration import CalibrationMetrics, CalibrationResult
 from multivision.config import Configuration, load_configuration, save_configuration
-from multivision.errors import CalibrationError, GeometryError
+from multivision.errors import (
+    CalibrationError,
+    GeometryError,
+    PointOutsideCalibratedRegionError,
+)
 from multivision.fiducials import FiducialCorrespondence
 from multivision.geometry import HomographyPair, Point2D
 from multivision.persistence import (
@@ -184,6 +188,18 @@ class CalibrationPersistenceTest(unittest.TestCase):
             Point2D(20, 20),
             camera_resolution=Resolution(1280, 720),
         ) == Point2D(20, 20)
+        assert registry.project_camera_points_to_projector(
+            'camera-a',
+            (Point2D(20, 20), Point2D(30, 30)),
+            camera_resolution=Resolution(1280, 720),
+        ) == (Point2D(20, 20), Point2D(30, 30))
+        with self.assertRaises(PointOutsideCalibratedRegionError) as context:
+            registry.project_camera_to_projector(
+                'camera-a',
+                Point2D(200, 200),
+                camera_resolution=Resolution(1280, 720),
+            )
+        assert context.exception.code == 'POINT_OUTSIDE_CALIBRATED_REGION'
 
     def test_falsey_projector_resolution_cannot_bypass_stale_state(self) -> None:
         registry = CalibrationRegistry(

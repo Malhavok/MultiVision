@@ -14,9 +14,11 @@ from multivision.errors import (
     CameraUnavailableError,
     InvalidAvailableAreaError,
     InvalidCalibrationStateError,
+    PointOutsideCalibratedRegionError,
 )
 from multivision.fiducials import (
     CameraCorrespondences,
+    DetectedMarker,
     FiducialCorrespondence,
 )
 from multivision.config import Configuration
@@ -32,6 +34,7 @@ from multivision.types import (
     CalibrationStatus,
     CameraStatus,
     DeviceInfo,
+    Frame,
     Resolution,
     RuntimeStatus,
     SessionCameraState,
@@ -139,6 +142,68 @@ class CalibrationSessionRuntime(FakeSessionRuntime):
         return self.registry.set_area_enabled(slot_id, area_enabled)
 
 
+class TagInspectionRuntime(CalibrationSessionRuntime):
+    def __init__(self) -> None:
+        super().__init__((0,))
+        self.snapshot_count = 0
+
+    def snapshot(self, _slot_id: str) -> Frame:
+        self.snapshot_count += 1
+        return Frame(object(), 7, 123.5)
+
+
+class TagInspectionServiceTest(unittest.TestCase):
+    def test_inspection_uses_one_latest_frame_and_keeps_raw_tags_without_calibration(
+        self,
+    ) -> None:
+        runtime = TagInspectionRuntime()
+
+        class FakeDetector:
+            def detect(self, _frame: object) -> tuple[DetectedMarker, ...]:
+                return (
+                    DetectedMarker(
+                        8,
+                        (
+                            Point2D(30, 20),
+                            Point2D(40, 20),
+                            Point2D(40, 30),
+                            Point2D(30, 30),
+                        ),
+                    ),
+                    DetectedMarker(
+                        8,
+                        (
+                            Point2D(0, 0),
+                            Point2D(10, 0),
+                            Point2D(10, 10),
+                            Point2D(0, 10),
+                        ),
+                    ),
+                )
+
+        service = MultiVisionService(
+            Configuration(),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+            tag_detector_factory=lambda _dictionary: FakeDetector(),
+        )
+
+        result = service.inspect_tags('camera-0')
+
+        assert runtime.snapshot_count == 1, f'{runtime.snapshot_count=}'
+        assert result.camera_id == 'camera-0', f'{result=}'
+        assert result.frame_counter == 7, f'{result=}'
+        assert result.captured_at_seconds == 123.5, f'{result=}'
+        assert [tag.marker_id for tag in result.tags] == [8, 8], f'{result=}'
+        assert result.projection_status is not None, f'{result=}'
+        assert result.projection_status.code == 'CALIBRATION_UNCALIBRATED'
+        assert all(
+            tag.projector is None
+            and tag.projection_status == result.projection_status
+            for tag in result.tags
+        ), f'{result=}'
+        assert service.overlay is None
+
+
 class FakePointService:
     def __init__(self) -> None:
         self.renamed: list[tuple[str, str]] = []
@@ -192,8 +257,11 @@ class MultiVisionServiceAreaTest(unittest.TestCase):
         assert enabled_area.area_enabled is True, f'{enabled_area=}'
         assert enabled_area.available_area == calculated_area, f'{enabled_area=}'
         assert runtime.registry.get('camera-0').calibration == calibration
-        overlay = service.point_from_camera('camera-0', (600, 450))
-        assert overlay.camera_point == Point2D(600, 450), f'{overlay=}'
+        overlay = service.point_from_camera('camera-0', (400, 300))
+        assert overlay.camera_point == Point2D(400, 300), f'{overlay=}'
+        with self.assertRaises(PointOutsideCalibratedRegionError) as context:
+            service.point_from_camera('camera-0', (600, 450))
+        assert context.exception.code == 'POINT_OUTSIDE_CALIBRATED_REGION'
 
         disabled_area = service.set_area_enabled('camera-0', False)
         assert disabled_area.area_enabled is False, f'{disabled_area=}'

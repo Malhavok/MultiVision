@@ -7,21 +7,88 @@ import numpy as np
 
 from multivision.errors import FiducialDetectionError
 from multivision.fiducials import (
+    CachedTagDetectorFactory,
     DetectedMarker,
     OpenCVArucoDetector,
     assemble_camera_correspondences,
     assemble_correspondences,
     assemble_metric_correspondences,
+    build_planar_tag_observations,
     detect_and_assemble_correspondences,
     detect_metric_fiducials,
+    detect_tag_observations,
 )
 from multivision.geometry import Point2D
 from multivision.metric_target import METRIC_TARGET
-from multivision.pattern import build_calibration_pattern
+from multivision.pattern import (
+    DICT_5X5_1000,
+    build_calibration_pattern,
+)
 from multivision.types import Resolution
 
 
 class FiducialTest(unittest.TestCase):
+    def test_planar_observations_retain_unknown_duplicates_and_sort_by_centre(self) -> None:
+        detections = [
+            DetectedMarker(8, _corners(50, 50)),
+            DetectedMarker(3, _corners(80, 10)),
+            DetectedMarker(3, _corners(10, 10)),
+            DetectedMarker(3, _corners(40, 0)),
+            DetectedMarker(999, _corners(20, 20)),
+            DetectedMarker(4, _corners(0, 0)[:3]),
+        ]
+
+        observations = build_planar_tag_observations(detections)
+
+        assert [observation.marker_id for observation in observations] == [
+            3,
+            3,
+            3,
+            8,
+            999,
+        ], f'{observations=}'
+        assert [
+            observation.camera.centre
+            for observation in observations[:3]
+        ] == [
+            Point2D(45, 5),
+            Point2D(15, 15),
+            Point2D(85, 15),
+        ], f'{observations=}'
+        assert observations[1].camera.corners == tuple(_corners(10, 10))
+        assert observations[0].projector is None
+
+    def test_planar_observation_projection_rejects_horizon_crossing(self) -> None:
+        observations = build_planar_tag_observations([DetectedMarker(1, _corners(0, 0))])
+
+        with self.assertRaises(ValueError):
+            build_planar_tag_observations(
+                [DetectedMarker(1, _corners(0, 0))],
+                ((1, 0, 0), (0, 1, 0), (0.2, 0, -1)),
+            )
+        assert observations[0].projector is None
+
+    def test_detection_preserves_camera_geometry_with_injected_detector(self) -> None:
+        class FakeDetector:
+            def detect(self, _frame: object) -> tuple[DetectedMarker, ...]:
+                return (DetectedMarker(23, _corners(10, 20)),)
+
+        observations = detect_tag_observations(object(), FakeDetector())
+
+        assert len(observations) == 1, f'{observations=}'
+        assert observations[0].marker_id == 23, f'{observations=}'
+        assert observations[0].projector is None
+
+    def test_planar_observation_detection_rejects_structural_evidence_failure(
+        self,
+    ) -> None:
+        class BrokenDetector:
+            def detect(self, _frame: object) -> None:
+                return None
+
+        with self.assertRaises(FiducialDetectionError):
+            detect_tag_observations(object(), BrokenDetector())
+
     def test_opencv_detector_identifies_apriltags_in_a_synthetic_frame(self) -> None:
         dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
         frame = np.full((360, 520), 255, dtype=np.uint8)
@@ -38,6 +105,37 @@ class FiducialTest(unittest.TestCase):
             for marker in detections
             for point in marker.corners
         ), f'{detections=}'
+
+    def test_opencv_detector_identifies_a_5x5_tag(self) -> None:
+        dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_1000)
+        frame = np.full((180, 180), 255, dtype=np.uint8)
+        marker_image = cv2.aruco.generateImageMarker(dictionary, 23, 100)
+        frame[30:130, 40:140] = marker_image
+
+        detections = OpenCVArucoDetector(DICT_5X5_1000).detect(frame)
+
+        assert [marker.marker_id for marker in detections] == [23], f'{detections=}'
+
+    def test_tag_detector_factory_validates_and_caches_by_dictionary(self) -> None:
+        class FakeDetector:
+            def detect(self, _frame: object) -> tuple[DetectedMarker, ...]:
+                return ()
+
+        created_dictionary_names: list[str] = []
+
+        def make_detector(dictionary_name: str) -> FakeDetector:
+            created_dictionary_names.append(dictionary_name)
+            return FakeDetector()
+
+        factory = CachedTagDetectorFactory(make_detector)
+        first_detector = factory(DICT_5X5_1000)
+        second_detector = factory(DICT_5X5_1000)
+
+        assert first_detector is second_detector, f'{first_detector=}, {second_detector=}'
+        assert created_dictionary_names == [DICT_5X5_1000], f'{created_dictionary_names=}'
+        with self.assertRaises(ValueError):
+            factory('DICT_UNKNOWN')
+        assert created_dictionary_names == [DICT_5X5_1000], f'{created_dictionary_names=}'
 
     def test_detector_uses_projection_safe_parameters(self) -> None:
         class FakeParameters:
@@ -99,6 +197,32 @@ class FiducialTest(unittest.TestCase):
                 parameters: Any,
             ) -> tuple[list[Any], list[Any], list[Any]]:
                 return [], [[0]], []
+
+        detector = OpenCVArucoDetector(
+            cv2_module=type('FakeCV2', (), {'aruco': FakeAruco()})(),
+        )
+
+        with self.assertRaises(FiducialDetectionError):
+            detector.detect(object())
+
+    def test_detector_rejects_one_sided_marker_evidence(self) -> None:
+        class FakeParameters:
+            pass
+
+        class FakeAruco:
+            DICT_APRILTAG_36h11 = object()
+            DetectorParameters = FakeParameters
+
+            def getPredefinedDictionary(self, dictionary_constant: object) -> object:
+                return dictionary_constant
+
+            def detectMarkers(
+                self,
+                frame: Any,
+                dictionary: object,
+                parameters: Any,
+            ) -> tuple[None, list[Any], list[Any]]:
+                return None, [[0]], []
 
         detector = OpenCVArucoDetector(
             cv2_module=type('FakeCV2', (), {'aruco': FakeAruco()})(),

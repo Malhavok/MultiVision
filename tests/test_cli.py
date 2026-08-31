@@ -83,6 +83,75 @@ class CliTest(unittest.TestCase):
             ('DELETE', 'http://service.test/overlay', None),
         ]
 
+    def test_tag_list_delegates_to_http_and_url_encodes_request_values(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            return ServiceResponse(
+                200,
+                'application/json',
+                b'{"camera": "camera name/1", "tags": []}',
+            )
+
+        client = MultiVisionClient('http://service.test', request_sender=request_sender)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    'tags',
+                    'list',
+                    '--camera',
+                    'camera name/1',
+                    '--dictionary',
+                    'DICT 5/5',
+                ],
+                client,
+            )
+
+        assert result == 0
+        assert json.loads(output.getvalue()) == {
+            'camera': 'camera name/1',
+            'tags': [],
+        }
+        assert requests == [
+            (
+                'GET',
+                'http://service.test/cameras/camera%20name%2F1/tags?dictionary=DICT+5%2F5',
+                None,
+                30.0,
+            ),
+        ], f'{requests=}'
+
+    def test_tag_list_prints_structured_service_failures(self) -> None:
+        client = MultiVisionClient(
+            request_sender=lambda method, url, payload, timeout: ServiceResponse(
+                422,
+                'application/json',
+                json.dumps({
+                    'error': {
+                        'code': 'REQUEST_VALIDATION_ERROR',
+                        'message': 'Unsupported tag dictionary',
+                    },
+                }).encode('utf-8'),
+            ),
+        )
+        error_output = io.StringIO()
+        with redirect_stderr(error_output):
+            result = main(
+                ['tags', 'list', '--camera', 'overhead', '--dictionary', 'bad'],
+                client,
+            )
+
+        assert result == 1
+        assert 'REQUEST_VALIDATION_ERROR' in error_output.getvalue()
+        assert 'Unsupported tag dictionary' in error_output.getvalue()
+
     def test_generic_overlay_commands_delegate_to_http(self) -> None:
         requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
 

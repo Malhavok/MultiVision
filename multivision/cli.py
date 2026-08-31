@@ -215,6 +215,30 @@ def _build_parser() -> argparse.ArgumentParser:
         command_handler='cameras_area',
         desired_area_enabled=False,
     )
+    tags_parser = subparsers.add_parser(
+        'tags',
+        help='inspect camera tag detections',
+    )
+    tags_subparsers = tags_parser.add_subparsers(
+        dest='tags_command',
+        required=True,
+    )
+    tags_list_parser = tags_subparsers.add_parser(
+        'list',
+        help='list tags detected in one camera frame',
+    )
+    tags_list_parser.add_argument(
+        '--camera',
+        required=True,
+        type=_parse_non_empty_argument,
+    )
+    tags_list_parser.add_argument(
+        '--dictionary',
+        default=None,
+        type=_parse_non_empty_argument,
+    )
+    tags_list_parser.set_defaults(command_handler='tags_list')
+
     calibrate_parser = subparsers.add_parser('calibrate', help='calibrate one or all cameras')
     calibrate_parser.add_argument('--camera', dest='camera', default=None)
     calibrate_parser.set_defaults(command_handler='calibrate')
@@ -478,6 +502,7 @@ def _run_command(
         'cameras_close': _cameras_close,
         'cameras_open': _cameras_open,
         'cameras_area': _cameras_area,
+        'tags_list': _tags_list,
         'calibrate': _calibrate,
         'calibration_verify': _calibration_verify,
         'calibration_status': _calibration_status,
@@ -551,6 +576,17 @@ def _cameras_area(
         f'/cameras/{slot_id}/area',
         {'enabled': arguments.desired_area_enabled},
     )
+
+
+def _tags_list(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    camera = _quote_path_component(arguments.camera)
+    query = ''
+    if arguments.dictionary is not None:
+        query = '?' + urllib.parse.urlencode({'dictionary': arguments.dictionary})
+    return client.get(f'/cameras/{camera}/tags{query}')
 
 
 def _calibrate(client: MultiVisionClient, arguments: argparse.Namespace) -> ServiceResponse:

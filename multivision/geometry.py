@@ -64,6 +64,15 @@ BoundsLike: TypeAlias = CoordinateBounds | Resolution | Sequence[int]
 Polygon: TypeAlias = tuple[Point2D, ...]
 
 
+class TagGeometry(NamedTuple):
+    """Immutable geometry for one planar tag in one pixel coordinate space."""
+
+    corners: tuple[Point2D, ...]
+    centre: Point2D
+    orientation_degrees: float
+    area_px: float
+
+
 class PreviewTransform(NamedTuple):
     """Aspect-preserving preview layout and its native-coordinate conversion."""
 
@@ -159,6 +168,166 @@ def calculate_polygon_area(polygon: Sequence[Point2D]) -> float:
         )
         / 2
     )
+
+
+def calculate_diagonal_intersection(
+    polygon: Sequence[PointLike],
+) -> Point2D:
+    """Return the intersection of the diagonals of an ordered quadrilateral."""
+    return _calculate_diagonal_intersection(validate_planar_corners(polygon))
+
+
+def _calculate_diagonal_intersection(corners: tuple[Point2D, ...]) -> Point2D:
+    first_vector = Point2D(
+        corners[2].x - corners[0].x,
+        corners[2].y - corners[0].y,
+    )
+    second_vector = Point2D(
+        corners[3].x - corners[1].x,
+        corners[3].y - corners[1].y,
+    )
+    start_delta = Point2D(
+        corners[1].x - corners[0].x,
+        corners[1].y - corners[0].y,
+    )
+    denominator = _cross_product(first_vector, second_vector)
+    if not math.isfinite(denominator) or denominator == 0:
+        raise ValueError('Quadrilateral diagonals do not have a finite intersection')
+    first_fraction = _cross_product(start_delta, second_vector) / denominator
+    second_fraction = _cross_product(start_delta, first_vector) / denominator
+    if (
+        not math.isfinite(first_fraction)
+        or not math.isfinite(second_fraction)
+        or not 0 <= first_fraction <= 1
+        or not 0 <= second_fraction <= 1
+    ):
+        raise ValueError('Quadrilateral diagonals do not intersect safely')
+    intersection = Point2D(
+        corners[0].x + first_fraction * first_vector.x,
+        corners[0].y + first_fraction * first_vector.y,
+    )
+    if not is_finite_point(intersection):
+        raise ValueError('Quadrilateral diagonal intersection is not finite')
+    return intersection
+
+
+def calculate_edge_orientation_degrees(
+    edge_start: PointLike,
+    edge_end: PointLike,
+) -> float:
+    """Return the +X-right/+Y-down angle of an ordered edge."""
+    start = coerce_point(edge_start)
+    end = coerce_point(edge_end)
+    if start == end:
+        raise ValueError('Orientation requires a finite, non-zero edge')
+    orientation = math.degrees(math.atan2(end.y - start.y, end.x - start.x))
+    if not math.isfinite(orientation):
+        raise ValueError('Orientation requires a finite, non-zero edge')
+    return ((orientation + 180.0) % 360.0) - 180.0
+
+
+def calculate_polygon_orientation_degrees(
+    polygon: Sequence[PointLike],
+) -> float:
+    """Return the ordered corner-0-to-1 orientation of a quadrilateral."""
+    corners = validate_planar_corners(polygon)
+    return calculate_edge_orientation_degrees(corners[0], corners[1])
+
+
+def validate_planar_corners(
+    corners: Sequence[PointLike],
+) -> tuple[Point2D, ...]:
+    """Validate and retain four finite corners in their supplied order."""
+    if isinstance(corners, (Mapping, Set, str, bytes, bytearray)):
+        raise ValueError('Planar tag corners must be an ordered quadrilateral')
+    try:
+        checked_corners = tuple(coerce_point(corner) for corner in corners)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('Planar tag corners must be an ordered quadrilateral') from None
+    if len(checked_corners) != 4 or len(set(checked_corners)) != 4:
+        raise ValueError('Planar tag corners must contain four distinct points')
+    area = calculate_polygon_area(checked_corners)
+    if not math.isfinite(area) or not _has_nonzero_polygon_area(
+        list(checked_corners),
+    ):
+        raise ValueError('Planar tag corners must have finite, non-zero area')
+    if not _is_convex_ordered_polygon(checked_corners):
+        raise ValueError('Planar tag corners must form a convex quadrilateral')
+    return checked_corners
+
+
+def build_tag_geometry(
+    corners: Sequence[PointLike],
+    centre: PointLike | None = None,
+) -> TagGeometry:
+    """Build immutable geometry from ordered planar tag corners."""
+    checked_corners = validate_planar_corners(corners)
+    checked_centre = (
+        _calculate_diagonal_intersection(checked_corners)
+        if centre is None
+        else coerce_point(centre)
+    )
+    orientation = calculate_edge_orientation_degrees(
+        checked_corners[0],
+        checked_corners[1],
+    )
+    area = calculate_polygon_area(checked_corners)
+    return TagGeometry(checked_corners, checked_centre, orientation, area)
+
+
+def project_points_through_homography(
+    points: Sequence[PointLike],
+    homography: MatrixLike | HomographyPair,
+) -> tuple[Point2D, ...]:
+    """Transform finite points while rejecting a horizon-crossing homography."""
+    checked_points = tuple(coerce_point(point) for point in points)
+    matrix = (
+        homography.camera_to_projector
+        if isinstance(homography, HomographyPair)
+        else homography
+    )
+    normalised_matrix = validate_homography(matrix)
+    if len(checked_points) == 0:
+        return ()
+    denominators = tuple(
+        normalised_matrix[2][0] * point.x
+        + normalised_matrix[2][1] * point.y
+        + normalised_matrix[2][2]
+        for point in checked_points
+    )
+    if any(
+        not math.isfinite(denominator)
+        or abs(denominator) <= 1e-12
+        for denominator in denominators
+    ) or len({denominator > 0 for denominator in denominators}) != 1:
+        raise InvalidHomographyError(
+            'Homography has a horizon crossing in the requested points',
+        )
+    return tuple(project_point(point, normalised_matrix) for point in checked_points)
+
+
+def project_tag_geometry(
+    geometry: TagGeometry,
+    homography: MatrixLike | HomographyPair,
+) -> TagGeometry:
+    """Project tag corners and its diagonal centre as one atomic geometry."""
+    if not isinstance(geometry, TagGeometry):
+        raise ValueError('geometry must be TagGeometry')
+    checked_corners = validate_planar_corners(geometry.corners)
+    checked_centre = coerce_point(geometry.centre)
+    projected_points = project_points_through_homography(
+        checked_corners + (checked_centre,),
+        homography,
+    )
+    try:
+        return build_tag_geometry(
+            projected_points[:-1],
+            centre=projected_points[-1],
+        )
+    except ValueError as ex:
+        raise InvalidHomographyError(
+            'Homography produced invalid planar tag geometry',
+        ) from ex
 
 
 def is_finite_point(point: object) -> bool:
@@ -449,25 +618,41 @@ def camera_to_projector(
     return project_point(point, matrix)
 
 
+def project_camera_points_to_projector(
+    points: Sequence[PointLike],
+    homography: MatrixLike | HomographyPair,
+    calibrated_region: RegionLike | None = None,
+    projector_resolution: Resolution | Sequence[int] | None = None,
+) -> tuple[Point2D, ...]:
+    """Transform supported camera points atomically and enforce output bounds."""
+    checked_points = tuple(coerce_point(point) for point in points)
+    if calibrated_region is not None:
+        for point in checked_points:
+            validate_point_in_region(point, calibrated_region)
+    projected_points = project_points_through_homography(checked_points, homography)
+    if projector_resolution is not None:
+        for projected_point in projected_points:
+            if not is_point_in_resolution(projected_point, projector_resolution):
+                raise PointOutsideProjectorError(
+                    f'Projected point {projected_point!r} is outside projector bounds',
+                )
+    return projected_points
+
+
 def project_camera_to_projector(
     point: PointLike,
     homography: MatrixLike | HomographyPair,
     calibrated_region: RegionLike | None = None,
     projector_resolution: Resolution | Sequence[int] | None = None,
 ) -> Point2D:
-    """Transform a supported camera point and enforce projector output bounds."""
-    checked_point = coerce_point(point)
-    if calibrated_region is not None:
-        validate_point_in_region(checked_point, calibrated_region)
-    projected_point = camera_to_projector(checked_point, homography)
-    if projector_resolution is not None and not is_point_in_resolution(
-        projected_point,
+    """Transform one supported camera point through the shared point path."""
+    projected_points = project_camera_points_to_projector(
+        (point,),
+        homography,
+        calibrated_region,
         projector_resolution,
-    ):
-        raise PointOutsideProjectorError(
-            f'Projected point {projected_point!r} is outside projector bounds',
-        )
-    return projected_point
+    )
+    return projected_points[0]
 
 
 def coerce_point(point: PointLike) -> Point2D:
@@ -695,6 +880,29 @@ def _determinant(matrix: tuple[tuple[float, float, float], ...]) -> float:
     )
 
 
+def _cross_product(first: Point2D, second: Point2D) -> float:
+    return first.x * second.y - first.y * second.x
+
+
+def _is_convex_ordered_polygon(polygon: Sequence[Point2D]) -> bool:
+    cross_products = tuple(
+        _cross_product(
+            Point2D(
+                polygon[(idx + 1) % len(polygon)].x - polygon[idx].x,
+                polygon[(idx + 1) % len(polygon)].y - polygon[idx].y,
+            ),
+            Point2D(
+                polygon[(idx + 2) % len(polygon)].x - polygon[(idx + 1) % len(polygon)].x,
+                polygon[(idx + 2) % len(polygon)].y - polygon[(idx + 1) % len(polygon)].y,
+            ),
+        )
+        for idx in range(len(polygon))
+    )
+    return all(value > 0 for value in cross_products) or all(
+        value < 0 for value in cross_products
+    )
+
+
 __all__ = [
     'BoundsLike',
     'CoordinateBounds',
@@ -705,10 +913,15 @@ __all__ = [
     'PointLike',
     'PreviewTransform',
     'RegionLike',
+    'TagGeometry',
     'build_preview_transform',
+    'build_tag_geometry',
     'calculate_available_projector_area',
     'calculate_convex_hull',
+    'calculate_diagonal_intersection',
+    'calculate_edge_orientation_degrees',
     'calculate_polygon_area',
+    'calculate_polygon_orientation_degrees',
     'camera_to_projector',
     'coerce_point',
     'intersect_polygon_with_bounds',
@@ -719,10 +932,14 @@ __all__ = [
     'is_point_in_resolution',
     'is_valid_homography',
     'preview_local_to_camera_native',
+    'project_camera_points_to_projector',
     'project_camera_to_projector',
     'project_point',
+    'project_points_through_homography',
     'project_polygon',
+    'project_tag_geometry',
     'projector_to_camera',
     'validate_homography',
+    'validate_planar_corners',
     'validate_point_in_region',
 ]

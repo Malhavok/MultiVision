@@ -27,6 +27,9 @@ APRILTAG_FAMILIES = frozenset(
         APRILTAG_36H11,
     },
 )
+DICT_5X5_1000 = 'DICT_5X5_1000'
+SUPPORTED_TAG_DICTIONARIES = APRILTAG_FAMILIES | {DICT_5X5_1000}
+DEFAULT_TAG_DICTIONARY = DICT_5X5_1000
 DEFAULT_MARKER_COUNT = 20
 SUPPORTED_MARKER_COUNTS = frozenset({9, 10, 11, 12, 20})
 _DEFAULT_MARKER_SIZE_FRACTION = 0.225
@@ -88,6 +91,16 @@ class CalibrationPattern(NamedTuple):
             if marker.marker_id == marker_id:
                 return marker
         raise KeyError(marker_id)
+
+
+def validate_tag_dictionary(dictionary_name: object) -> str:
+    """Validate one supported OpenCV dictionary name."""
+    if (
+        not isinstance(dictionary_name, str)
+        or dictionary_name not in SUPPORTED_TAG_DICTIONARIES
+    ):
+        raise ValueError(f'Unsupported tag dictionary: {dictionary_name!r}')
+    return dictionary_name
 
 
 def build_calibration_pattern(
@@ -352,10 +365,14 @@ def _coerce_finite_float(value: object, field_name: str) -> float:
 __all__ = [
     'APRILTAG_36H11',
     'APRILTAG_FAMILIES',
+    'DEFAULT_TAG_DICTIONARY',
+    'DICT_5X5_1000',
     'CalibrationMarker',
     'CalibrationPattern',
     'DEFAULT_MARKER_COUNT',
     'MarkerCorner',
     'SUPPORTED_MARKER_COUNTS',
+    'SUPPORTED_TAG_DICTIONARIES',
     'build_calibration_pattern',
+    'validate_tag_dictionary',
 ]

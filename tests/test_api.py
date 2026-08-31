@@ -1,3 +1,4 @@
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -69,6 +70,44 @@ class FailingService:
         self.shutdown_count += 1
 
 
+class TagInspectionApiResult:
+    def to_data(self) -> dict[str, object]:
+        return {
+            'camera': 'overhead',
+            'camera_id': 'camera-0',
+            'dictionary': 'DICT_5X5_1000',
+            'frame_counter': 17,
+            'captured_at_seconds': 123.5,
+            'tags': [
+                {
+                    'id': 23,
+                    'camera': {
+                        'corners': ((10.0, 20.0), (30.0, 20.0), (30.0, 40.0), (10.0, 40.0)),
+                        'centre': (20.0, 30.0),
+                        'orientation_degrees': 0.0,
+                        'area_px': 400.0,
+                    },
+                    'projector': None,
+                    'projection_status': None,
+                },
+            ],
+            'projection_status': None,
+        }
+
+
+class TagInspectionApiService:
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str | None]] = []
+
+    def inspect_tags(
+        self,
+        camera: str,
+        dictionary: str | None,
+    ) -> TagInspectionApiResult:
+        self.requests.append((camera, dictionary))
+        return TagInspectionApiResult()
+
+
 class MalformedStatusRuntime:
     def start(self) -> None:
         pass
@@ -81,6 +120,38 @@ class MalformedStatusRuntime:
 
 
 class ApiTest(unittest.TestCase):
+    def test_tag_route_delegates_named_camera_and_serialises_complete_document(self) -> None:
+        service = TagInspectionApiService()
+
+        with TestClient(create_app(service, manage_lifecycle=False)) as client:
+            response = client.get(
+                '/cameras/overhead/tags',
+                params={'dictionary': 'DICT_5X5_1000'},
+            )
+            invalid_response = client.get('/cameras/overhead/tags?dictionary=')
+            unsupported_response = client.get(
+                '/cameras/overhead/tags',
+                params={'dictionary': 'DICT_UNKNOWN'},
+            )
+
+        data = response.json()
+        assert response.status_code == 200, f'{response.text=}'
+        assert data['camera'] == 'overhead', f'{data=}'
+        assert data['camera_id'] == 'camera-0', f'{data=}'
+        assert data['tags'][0]['id'] == 23, f'{data=}'
+        assert data['tags'][0]['camera']['corners'] == [
+            [10.0, 20.0],
+            [30.0, 20.0],
+            [30.0, 40.0],
+            [10.0, 40.0],
+        ], f'{data=}'
+        json.dumps(data, allow_nan=False)
+        assert invalid_response.status_code == 422
+        assert invalid_response.json()['error']['code'] == 'REQUEST_VALIDATION_ERROR'
+        assert unsupported_response.status_code == 422
+        assert unsupported_response.json()['error']['code'] == 'REQUEST_VALIDATION_ERROR'
+        assert service.requests == [('overhead', 'DICT_5X5_1000')], f'{service.requests=}'
+
     def test_projector_overlay_routes_return_state_without_primitives(self) -> None:
         service = MultiVisionService(
             Configuration(projector_resolution=Resolution(100, 80)),

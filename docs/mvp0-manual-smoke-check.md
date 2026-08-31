@@ -632,3 +632,102 @@ identification, lens/capture error, raster stroke width and ruler-reading
 error. Until the rows above contain observations from the target hardware,
 Plan5 physical accuracy remains **not established**; automated tests and API
 responses must not be reported as hardware acceptance.
+
+## Plan6 planar tag hardware check
+
+This is a separate physical check for Plan6's read-only tag inspection. The
+requirements and response semantics are in the [Plan6 validation
+contract](../plans/plan6-validation-contract.md) and the [tag-detection
+implementation boundary](tag-detection-implementation.md). Run it against the
+same running service and identified camera slots used above. Synthetic tests,
+JSON values and fake devices do not establish physical detection or
+projector correspondence.
+
+### 1. Inspect tags in several poses and positions
+
+Choose an `OPEN`/`AVAILABLE` session camera and record its slot, current name,
+live physical camera and native resolution. For projector-space checks, its
+camera-to-projector calibration must also be current. Use a printed
+`DICT_5X5_1000` tag, keep it fully visible, and issue the explicit hardware
+query:
+
+```sh
+multivision tags list --camera <camera> --dictionary DICT_5X5_1000
+```
+
+If `multivision` is not on `PATH`, use the repository wrapper without changing
+the request:
+
+```sh
+"$PWD/bin/multivision" tags list --camera <camera> --dictionary DICT_5X5_1000
+```
+
+Repeat the query after placing the tag at separated tabletop positions — for
+example, centre, left/right and near the usable-area edges — and after several
+physical rotations such as approximately 0°, 45°, 90° and 135°. Allow the live
+frame to settle before each individual query, but do not treat a later frame
+or a retry as the same observation. Record the returned `frame_counter`,
+`captured_at_seconds`, requested camera, resolved `camera_id`, dictionary,
+tag ID, camera corners, centre, area and orientation.
+
+`camera.orientation_degrees` is apparent camera-image geometry for the ordered
+corner 0→1 edge. It must **not** be interpreted as physical table yaw: do not
+use that value to claim the tag's physical rotation, camera pose or 3D pose.
+The physical rotation is the separately recorded setup condition.
+
+Where practical, place two physical copies carrying the same marker ID at
+different positions or orientations and repeat the query. Confirm from one
+response that both valid detections remain visible as separate entries in
+`tags`; record the duplicate only if it was actually observed. Do not create a
+physical duplicate solely to fill the record, and do not assume marker IDs are
+unique.
+
+### 2. Check projector-space correspondence on the calibration plane
+
+With the camera calibration current, place the tag flat on the calibrated table
+plane at several of the positions above. For each response, record the
+projector `corners`, `centre`, `area_px` and independently calculated
+`orientation_degrees`, together with the top-level and tag-level
+`projection_status`. Compare the reported projector centre/corners with the
+same physical positions established by the existing projected calibration
+reference or another already-supported known surface reference. Record the
+physical correspondence, not just agreement between numbers in the response.
+
+The projector orientation is the orientation of the transformed 0→1 edge in
+projector coordinates; it is not copied from the camera orientation. An empty
+or unavailable calibration may still return raw camera geometry but must leave
+projector geometry absent with its structured status. Do not treat either case
+as a physical correspondence pass.
+
+For a tag deliberately held materially above the calibration plane — for
+example on a safe spacer — repeat one query if the hardware setup permits it.
+Record that the existing planar homography has no height correction: projected
+position, corners, area or orientation may disagree with the elevated tag, and
+this is a known limitation rather than evidence of 3D pose support. Do not
+claim above-plane accuracy or table-plane correspondence from this check.
+
+Keep a physical record in this form, leaving `result` as `not exercised` until
+an observation has actually been made:
+
+```text
+camera slot/name | live physical camera | resolution | frame counter | captured_at_seconds
+position | physical rotation | tag IDs observed | duplicate IDs | camera centre/orientation
+projector centre/corners/orientation | projection status | physical correspondence | result
+```
+
+### 3. Keep automated validation and physical evidence separate
+
+Run the deterministic checks separately from the physical record:
+
+```sh
+"$PWD/.venv/bin/python" -m pytest
+pi-harness validate --plan plans/plan6.md
+```
+
+During integration review, confirm that the CLI delegates to the service, the
+persistent latest-frame camera owner is used, projector geometry comes from
+the shared calibration authority, no overlays or persistent state change, and
+no duplicate transform or dictionary logic or unrelated scope has been added.
+These commands and the review verify software boundaries only; until the
+physical rows above contain actual observations, Plan6 hardware results remain
+**not established**.

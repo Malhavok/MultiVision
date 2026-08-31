@@ -11,7 +11,6 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from numbers import Real
 from typing import Any
 
 from multivision.calibration import (
@@ -31,17 +30,19 @@ from multivision.errors import (
     GeometryError,
     InvalidCalibrationStateError,
     InvalidHomographyError,
+    PointOutsideCalibratedRegionError,
 )
 from multivision.fiducials import CameraCorrespondences, FiducialCorrespondence
 from multivision.geometry import (
-    CoordinateBounds,
     MatrixLike,
     Point2D,
+    PointLike,
     RegionLike,
+    coerce_point,
     invert_homography,
     is_finite_point,
     is_point_in_resolution,
-    project_camera_to_projector,
+    project_camera_points_to_projector,
     project_point,
     validate_homography,
     validate_point_in_region,
@@ -588,14 +589,14 @@ class CalibrationRegistry:
             )
             return self._statuses[camera_id]
 
-    def project_camera_to_projector(
+    def project_camera_points_to_projector(
         self,
         camera_id: str,
-        point: Sequence[Real],
+        points: Sequence[PointLike],
         camera_resolution: Resolution | None = None,
         projector_resolution: Resolution | None = None,
         projector_output_descriptor: ProjectorOutputDescriptor | None = None,
-    ) -> Point2D:
+    ) -> tuple[Point2D, ...]:
         _validate_camera_id(camera_id)
         _validate_optional_projector_descriptor(projector_output_descriptor)
         with self._lock:
@@ -624,18 +625,38 @@ class CalibrationRegistry:
                 if self._projector_resolution is not None
                 else record.projector_resolution
             )
-            camera_bounds = CoordinateBounds(
-                0.0,
-                0.0,
-                float(record.camera_resolution.width),
-                float(record.camera_resolution.height),
-            )
-            return project_camera_to_projector(
-                point,
+            checked_points = tuple(coerce_point(point) for point in points)
+            if any(
+                not is_point_in_resolution(point, record.camera_resolution)
+                for point in checked_points
+            ):
+                raise PointOutsideCalibratedRegionError(
+                    'A camera point is outside the native camera bounds',
+                )
+            return project_camera_points_to_projector(
+                checked_points,
                 record.camera_to_projector,
-                calibrated_region=camera_bounds,
+                calibrated_region=record.valid_region,
                 projector_resolution=effective_projector_resolution,
             )
+
+    def project_camera_to_projector(
+        self,
+        camera_id: str,
+        point: PointLike,
+        camera_resolution: Resolution | None = None,
+        projector_resolution: Resolution | None = None,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
+    ) -> Point2D:
+        """Project one point through the shared multi-point authority."""
+        projected_points = self.project_camera_points_to_projector(
+            camera_id,
+            (point,),
+            camera_resolution,
+            projector_resolution,
+            projector_output_descriptor,
+        )
+        return projected_points[0]
 
 
 def _passes_verification(

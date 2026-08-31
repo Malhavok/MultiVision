@@ -730,6 +730,7 @@ def _camera_calibration(configuration: Configuration) -> SimpleNamespace:
         camera_to_projector=IDENTITY_MATRIX,
         projector_output_descriptor=configuration.projector_output_descriptor,
         camera_resolution=Resolution(640, 480),
+        valid_region=((0, 0), (640, 0), (640, 480), (0, 480)),
         version=configuration.calibration_version,
         timestamp=1.0,
     )

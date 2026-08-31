@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import threading
+from collections.abc import Sequence
 from typing import (
     Any,
     NamedTuple,
@@ -26,7 +27,7 @@ from multivision.geometry import (
     coerce_point,
     is_finite_point,
     is_point_in_resolution,
-    project_camera_to_projector,
+    project_camera_points_to_projector,
 )
 from multivision.persistence import PersistedCalibration
 from multivision.session import SessionCamera
@@ -63,14 +64,14 @@ class CalibrationPointRegistry(Protocol):
     ) -> str:
         ...
 
-    def project_camera_to_projector(
+    def project_camera_points_to_projector(
         self,
         camera_id: str,
-        point: PointLike,
+        points: Sequence[PointLike],
         camera_resolution: Resolution,
         projector_resolution: Resolution,
         projector_output_descriptor: ProjectorOutputDescriptor | None = None,
-    ) -> Point2D:
+    ) -> tuple[Point2D, ...]:
         ...
 
 
@@ -170,6 +171,23 @@ class PointOverlayService:
         with self._lock:
             camera = self._get_available_camera(logical_name)
             return self._point_from_camera(camera, checked_camera_point)
+
+    def project_camera_points(
+        self,
+        logical_name: str,
+        camera_points: Sequence[PointLike],
+    ) -> tuple[Point2D, ...]:
+        """Project camera-native points without changing the current overlay."""
+        try:
+            checked_camera_points = tuple(
+                coerce_point(camera_point)
+                for camera_point in camera_points
+            )
+        except TypeError:
+            raise ValueError('camera_points must be an iterable of points') from None
+        with self._lock:
+            camera = self._get_available_camera(logical_name)
+            return self._project_camera_points(camera, checked_camera_points)
 
     def clear_overlay(self) -> None:
         """Remove the current overlay without changing calibration state."""
@@ -279,11 +297,34 @@ class PointOverlayService:
         camera: _ResolvedCamera,
         camera_point: Point2D,
     ) -> RedCircleOverlay:
+        projector_point = self._project_camera_points(camera, (camera_point,))[0]
+        status = camera.status
+        overlay = RedCircleOverlay(
+            camera.session_camera.display_name
+            if camera.session_camera is not None
+            else status.logical_name,
+            camera.calibration_id,
+            camera_point,
+            projector_point,
+            self.overlay_radius,
+        )
+        with self._lock:
+            self._overlay = overlay
+        return overlay
+
+    def _project_camera_points(
+        self,
+        camera: _ResolvedCamera,
+        camera_points: Sequence[Point2D],
+    ) -> tuple[Point2D, ...]:
         status = camera.status
         assert status.native_resolution is not None
-        if not is_point_in_resolution(camera_point, status.native_resolution):
+        if any(
+            not is_point_in_resolution(camera_point, status.native_resolution)
+            for camera_point in camera_points
+        ):
             raise PointOutsideCalibratedRegionError(
-                f'Camera point {camera_point!r} is outside the native camera bounds',
+                'A camera point is outside the native camera bounds',
             )
         session_calibration_error_code = self._get_session_calibration_error_code(camera)
         if session_calibration_error_code is not None:
@@ -314,28 +355,75 @@ class PointOverlayService:
                 error_code,
                 f'Camera {status.logical_name!r} calibration is {calibration_status.value}',
             )
-        projector_point = self._project_camera_point(camera, camera_point)
-        if not isinstance(projector_point, Point2D) or not is_finite_point(projector_point):
+
+        projected_points = self._project_camera_points_with_authority(
+            camera,
+            camera_points,
+        )
+        try:
+            checked_authority_points = tuple(projected_points)
+        except (TypeError, ValueError):
             raise InvalidHomographyError(
-                'Camera-to-projector homography produced a non-finite point',
+                'Camera-to-projector homography returned an invalid point set',
+            ) from None
+        if len(checked_authority_points) != len(camera_points):
+            raise InvalidHomographyError(
+                'Camera-to-projector homography returned an incomplete point set',
             )
-        if not is_point_in_resolution(projector_point, self.projector_resolution):
-            raise PointOutsideProjectorError(
-                f'Projected point {projector_point!r} is outside projector bounds',
+        checked_projected_points: list[Point2D] = []
+        for projected_point in checked_authority_points:
+            if not isinstance(projected_point, Point2D) or not is_finite_point(
+                projected_point,
+            ):
+                raise InvalidHomographyError(
+                    'Camera-to-projector homography produced a non-finite point',
+                )
+            if not is_point_in_resolution(projected_point, self.projector_resolution):
+                raise PointOutsideProjectorError(
+                    f'Projected point {projected_point!r} is outside projector bounds',
+                )
+            checked_projected_points.append(projected_point)
+        return tuple(checked_projected_points)
+
+    def _project_camera_points_with_authority(
+        self,
+        camera: _ResolvedCamera,
+        camera_points: Sequence[Point2D],
+    ) -> tuple[Point2D, ...]:
+        status = camera.status
+        assert status.native_resolution is not None
+        session_camera = camera.session_camera
+        if session_camera is None:
+            return self.calibration_registry.project_camera_points_to_projector(
+                camera.calibration_id,
+                camera_points,
+                status.native_resolution,
+                self.projector_resolution,
+                self.projector_output_descriptor,
+            )
+        if session_camera.calibration is None:
+            raise InvalidHomographyError(
+                'Session camera has no current calibration transform',
             )
 
-        overlay = RedCircleOverlay(
-            camera.session_camera.display_name
-            if camera.session_camera is not None
-            else status.logical_name,
-            camera.calibration_id,
-            camera_point,
-            projector_point,
-            self.overlay_radius,
+        calibration = session_camera.calibration
+        camera_to_projector = getattr(calibration, 'camera_to_projector', None)
+        if camera_to_projector is None:
+            raise InvalidHomographyError(
+                'Session camera calibration has no camera-to-projector transform',
+            )
+        calibrated_region = getattr(calibration, 'valid_region', None)
+        if calibrated_region is None:
+            raise self._calibration_error(
+                'CALIBRATION_INVALID',
+                'Session camera calibration has no calibrated support region',
+            )
+        return project_camera_points_to_projector(
+            camera_points,
+            camera_to_projector,
+            calibrated_region=calibrated_region,
+            projector_resolution=self.projector_resolution,
         )
-        with self._lock:
-            self._overlay = overlay
-        return overlay
 
     def _get_session_calibration_error_code(
         self,
@@ -379,51 +467,6 @@ class PointOverlayService:
             camera_resolution=camera.status.native_resolution,
             projector_resolution=self.projector_resolution,
             projector_output_descriptor=self.projector_output_descriptor,
-        )
-
-    def _project_camera_point(
-        self,
-        camera: _ResolvedCamera,
-        camera_point: Point2D,
-    ) -> Point2D:
-        session_camera = camera.session_camera
-        if session_camera is None:
-            if self.projector_output_descriptor is None:
-                return self.calibration_registry.project_camera_to_projector(
-                    camera.calibration_id,
-                    camera_point,
-                    camera_resolution=camera.status.native_resolution,
-                    projector_resolution=self.projector_resolution,
-                )
-            return self.calibration_registry.project_camera_to_projector(
-                camera.calibration_id,
-                camera_point,
-                camera_resolution=camera.status.native_resolution,
-                projector_resolution=self.projector_resolution,
-                projector_output_descriptor=self.projector_output_descriptor,
-            )
-        if session_camera.calibration is None:
-            raise InvalidHomographyError(
-                'Session camera has no current calibration transform',
-            )
-
-        calibration = session_camera.calibration
-        camera_to_projector = getattr(calibration, 'camera_to_projector', None)
-        if camera_to_projector is None:
-            raise InvalidHomographyError(
-                'Session camera calibration has no camera-to-projector transform',
-            )
-        camera_bounds = CoordinateBounds(
-            0.0,
-            0.0,
-            float(camera.status.native_resolution.width),
-            float(camera.status.native_resolution.height),
-        )
-        return project_camera_to_projector(
-            camera_point,
-            camera_to_projector,
-            calibrated_region=camera_bounds,
-            projector_resolution=self.projector_resolution,
         )
 
     @staticmethod

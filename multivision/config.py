@@ -12,6 +12,10 @@ from typing import Any
 
 from multivision.errors import ConfigurationError
 from multivision.overlays import OverlayConfiguration
+from multivision.pattern import (
+    DEFAULT_TAG_DICTIONARY,
+    validate_tag_dictionary,
+)
 from multivision.types import (
     Resolution,
     is_valid_resolution,
@@ -91,6 +95,7 @@ class Configuration:
         default_factory=MetricCalibrationThresholds,
     )
     overlay_limits: OverlayConfiguration = field(default_factory=OverlayConfiguration)
+    tag_dictionary: str = DEFAULT_TAG_DICTIONARY
 
     def __post_init__(self) -> None:
         _validate_resolution(self.projector_resolution, 'projector_resolution')
@@ -107,6 +112,7 @@ class Configuration:
         if not isinstance(self.overlay_limits, OverlayConfiguration):
             raise ConfigurationError('overlay_limits must be OverlayConfiguration')
         _validate_positive_integer(self.calibration_version, 'calibration_version')
+        _validate_tag_dictionary(self.tag_dictionary)
 
     @property
     def projector_output_descriptor(self) -> ProjectorOutputDescriptor:
@@ -133,6 +139,7 @@ class Configuration:
             data.get('overlay_limits', {}),
         )
         calibration_version = data.get('calibration_version', 1)
+        tag_dictionary = data.get('tag_dictionary', DEFAULT_TAG_DICTIONARY)
 
         return cls(
             projector_resolution=projector_resolution,
@@ -141,6 +148,7 @@ class Configuration:
             metric_calibration_thresholds=metric_thresholds,
             overlay_limits=overlay_limits,
             calibration_version=calibration_version,
+            tag_dictionary=tag_dictionary,
         )
 
     def to_data(self) -> dict[str, Any]:
@@ -189,6 +197,7 @@ class Configuration:
             },
             'overlay_limits': self.overlay_limits.to_data(),
             'calibration_version': self.calibration_version,
+            'tag_dictionary': self.tag_dictionary,
         }
 
 
@@ -474,6 +483,13 @@ def _validate_finite_non_negative_numbers(
             raise ConfigurationError(f'{field_name} must be finite')
         if field_value < 0:
             raise ConfigurationError(f'{field_name} must not be negative')
+
+
+def _validate_tag_dictionary(value: Any) -> None:
+    try:
+        validate_tag_dictionary(value)
+    except ValueError as ex:
+        raise ConfigurationError(str(ex)) from ex
 
 
 def _validate_output_identity(value: Any) -> None:

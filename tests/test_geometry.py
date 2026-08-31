@@ -1,12 +1,17 @@
 import math
 import unittest
 
+from multivision.errors import InvalidHomographyError
 from multivision.geometry import (
     CoordinateBounds,
     HomographyPair,
     Point2D,
     build_preview_transform,
+    build_tag_geometry,
     calculate_available_projector_area,
+    calculate_diagonal_intersection,
+    calculate_edge_orientation_degrees,
+    calculate_polygon_orientation_degrees,
     camera_to_projector,
     intersect_polygon_with_bounds,
     invert_homography,
@@ -16,15 +21,75 @@ from multivision.geometry import (
     is_point_in_region,
     is_valid_homography,
     projector_to_camera,
+    project_camera_points_to_projector,
     project_camera_to_projector,
     project_point,
+    project_points_through_homography,
     project_polygon,
+    project_tag_geometry,
     preview_local_to_camera_native,
 )
 from multivision.types import Resolution
 
 
 class GeometryTest(unittest.TestCase):
+    def test_planar_tag_geometry_uses_diagonals_and_ordered_edge(self) -> None:
+        corners = ((0, 0), (8, 0), (6, 4), (1, 4))
+
+        centre = calculate_diagonal_intersection(corners)
+        geometry = build_tag_geometry(corners)
+
+        assert math.isclose(centre.x, 48 / 13, abs_tol=1e-9), f'{centre=}'
+        assert math.isclose(centre.y, 32 / 13, abs_tol=1e-9), f'{centre=}'
+        assert geometry.corners == tuple(Point2D(*corner) for corner in corners)
+        assert geometry.centre == centre, f'{geometry=}'
+        assert geometry.area_px == 26.0, f'{geometry=}'
+        assert calculate_polygon_orientation_degrees(corners) == 0.0
+
+    def test_planar_orientation_uses_image_axes_and_normalises_degrees(self) -> None:
+        assert calculate_edge_orientation_degrees((0, 0), (0, 1)) == 90.0
+        assert calculate_edge_orientation_degrees((0, 0), (1, -1)) == -45.0
+        assert calculate_edge_orientation_degrees((0, 0), (-1, 0)) == -180.0
+
+    def test_invalid_planar_tag_geometry_is_rejected(self) -> None:
+        invalid_corners = [
+            ((0, 0), (1, 0), (0, 0), (0, 1)),
+            ((0, 0), (2, 0), (0.5, 0.5), (0, 2)),
+            ((0, 0), (1, 0), (2, 0), (0, 1)),
+            ((0, 0), (1, 0), (1, math.nan), (0, 1)),
+        ]
+        for corners in invalid_corners:
+            with self.subTest(corners=corners):
+                with self.assertRaises(ValueError):
+                    build_tag_geometry(corners)
+
+    def test_projected_planar_tag_recomputes_geometry_from_all_points(self) -> None:
+        geometry = build_tag_geometry(((0, 0), (10, 0), (10, 10), (0, 10)))
+        homography = ((1, 0.2, 0), (0.1, 1, 0), (0.01, 0, 1))
+
+        projected = project_tag_geometry(geometry, homography)
+        projected_corners = project_points_through_homography(
+            geometry.corners,
+            homography,
+        )
+
+        assert projected.corners == projected_corners, f'{projected=}'
+        assert projected.centre == project_point(geometry.centre, homography)
+        assert projected.orientation_degrees == calculate_polygon_orientation_degrees(
+            projected_corners,
+        )
+        assert projected.orientation_degrees != geometry.orientation_degrees
+        assert projected.area_px != geometry.area_px
+
+    def test_projected_planar_tag_rejects_horizon_crossing(self) -> None:
+        geometry = build_tag_geometry(((0, 0), (10, 0), (10, 10), (0, 10)))
+
+        with self.assertRaises(ValueError):
+            project_tag_geometry(
+                geometry,
+                ((1, 0, 0), (0, 1, 0), (0.2, 0, -1)),
+            )
+
     def test_scaled_preview_maps_to_native_coordinates(self) -> None:
         native_resolution = Resolution(1920, 1080)
         preview_resolution = Resolution(960, 540)
@@ -278,6 +343,19 @@ class GeometryTest(unittest.TestCase):
                     Resolution(100, 100),
                 )
                 assert available_area is None, f'{available_area=}'
+
+    def test_multi_point_projection_validates_the_complete_set_before_transforming(self) -> None:
+        with self.assertRaises(ValueError):
+            project_camera_points_to_projector(
+                ((20, 20), (200, 200)),
+                ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+                calibrated_region=CoordinateBounds(0, 0, 100, 100),
+                projector_resolution=Resolution(300, 300),
+            )
+
+    def test_empty_multi_point_projection_still_validates_homography(self) -> None:
+        with self.assertRaises(InvalidHomographyError):
+            project_points_through_homography((), ((0, 0, 0),) * 3)
 
     def test_outside_calibrated_region_and_projector_bounds_are_rejected(self) -> None:
         transforms = HomographyPair.from_projector_to_camera(

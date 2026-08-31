@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import threading
 from collections.abc import (
     Iterable,
     Mapping,
@@ -12,6 +13,7 @@ from collections.abc import (
 from numbers import Integral, Real
 from typing import (
     Any,
+    Callable,
     NamedTuple,
     Protocol,
 )
@@ -21,11 +23,17 @@ from multivision.errors import (
     InvalidHomographyError,
 )
 from multivision.geometry import (
+    HomographyPair,
+    MatrixLike,
     Point2D,
+    TagGeometry,
+    build_tag_geometry,
     calculate_convex_hull,
     calculate_polygon_area,
     project_point,
+    project_tag_geometry,
     validate_homography,
+    validate_planar_corners,
 )
 from multivision.metric_target import (
     METRIC_TARGET,
@@ -35,8 +43,8 @@ from multivision.metric_target import (
 )
 from multivision.pattern import (
     APRILTAG_36H11,
-    APRILTAG_FAMILIES,
     CalibrationPattern,
+    validate_tag_dictionary,
 )
 
 
@@ -47,11 +55,22 @@ class DetectedMarker(NamedTuple):
     corners: tuple[Point2D, ...]
 
 
+class PlanarTagObservation(NamedTuple):
+    """One immutable camera observation with optional projector geometry."""
+
+    marker_id: int
+    camera: TagGeometry
+    projector: TagGeometry | None = None
+
+
 class FiducialDetector(Protocol):
     """Detector boundary used by both OpenCV and deterministic test fakes."""
 
     def detect(self, frame: Any) -> Iterable[DetectedMarker]:
         ...
+
+
+TagDetectorFactory = Callable[[str], FiducialDetector]
 
 
 class FiducialCorrespondence(NamedTuple):
@@ -134,6 +153,35 @@ class MetricTargetCorrespondences(NamedTuple):
         )
 
 
+class CachedTagDetectorFactory:
+    """Create and cache independent OpenCV detectors by dictionary name."""
+
+    def __init__(
+        self,
+        detector_factory: Callable[[str], FiducialDetector] | None = None,
+    ) -> None:
+        if detector_factory is not None and not callable(detector_factory):
+            raise TypeError('detector_factory must be callable')
+        self._detector_factory = (
+            detector_factory
+            if detector_factory is not None
+            else OpenCVArucoDetector
+        )
+        self._detectors: dict[str, FiducialDetector] = {}
+        self._lock = threading.RLock()
+
+    def __call__(self, dictionary_name: str) -> FiducialDetector:
+        """Return the detector for one dictionary, creating it at most once."""
+        checked_dictionary_name = validate_tag_dictionary(dictionary_name)
+        with self._lock:
+            detector = self._detectors.get(checked_dictionary_name)
+            if detector is not None:
+                return detector
+            detector = self._detector_factory(checked_dictionary_name)
+            self._detectors[checked_dictionary_name] = detector
+            return detector
+
+
 class OpenCVArucoDetector:
     """Detect AprilTags through OpenCV's ``cv2.aruco`` API."""
 
@@ -143,8 +191,7 @@ class OpenCVArucoDetector:
         detector_parameters: Any | None = None,
         cv2_module: Any | None = None,
     ) -> None:
-        if not isinstance(dictionary_name, str) or dictionary_name not in APRILTAG_FAMILIES:
-            raise ValueError(f'Unsupported AprilTag family: {dictionary_name!r}')
+        dictionary_name = validate_tag_dictionary(dictionary_name)
 
         if cv2_module is None:
             try:
@@ -186,15 +233,23 @@ class OpenCVArucoDetector:
     def detect(self, frame: Any) -> tuple[DetectedMarker, ...]:
         """Return only well-formed four-corner detections from one frame."""
         raw_ids, raw_corners = self._detect_raw(frame)
-        if raw_ids is None or raw_corners is None:
+        if raw_ids is None and raw_corners is None:
             return ()
+        if raw_ids is None or raw_corners is None:
+            if not _has_partial_detector_evidence(raw_ids, raw_corners):
+                return ()
+            raise FiducialDetectionError(
+                'Detector returned only one of marker IDs and corners',
+            )
 
         detections: list[DetectedMarker] = []
         try:
             marker_ids = list(raw_ids)
             marker_corners = list(raw_corners)
-        except (TypeError, ValueError):
-            return ()
+        except Exception as ex:  # noqa: BLE001 (OpenCV is an external boundary).
+            raise FiducialDetectionError(
+                'Detector returned non-iterable marker evidence',
+            ) from ex
         if len(marker_ids) != len(marker_corners):
             raise FiducialDetectionError(
                 'Detector returned mismatched marker IDs and corners',
@@ -211,14 +266,7 @@ class OpenCVArucoDetector:
         if raw_ids is None and raw_corners is None:
             return ()
         if raw_ids is None or raw_corners is None:
-            available_evidence = raw_corners if raw_ids is None else raw_ids
-            try:
-                evidence_count = len(tuple(available_evidence))  # type: ignore[arg-type]
-            except Exception as ex:  # noqa: BLE001 (the detector is an external boundary).
-                raise FiducialDetectionError(
-                    'Detector returned non-iterable marker evidence',
-                ) from ex
-            if evidence_count == 0:
+            if not _has_partial_detector_evidence(raw_ids, raw_corners):
                 return ()
             raise FiducialDetectionError(
                 'Detector returned only one of marker IDs and corners',
@@ -254,6 +302,91 @@ class OpenCVArucoDetector:
         except Exception as ex:  # noqa: BLE001 (OpenCV is an external boundary).
             raise FiducialDetectionError('Could not detect fiducials in the frame') from ex
         return raw_ids, raw_corners
+
+
+def _has_partial_detector_evidence(
+    raw_ids: object | None,
+    raw_corners: object | None,
+) -> bool:
+    available_evidence = raw_corners if raw_ids is None else raw_ids
+    try:
+        return len(tuple(available_evidence)) > 0  # type: ignore[arg-type]
+    except Exception as ex:  # noqa: BLE001 (OpenCV is an external boundary).
+        raise FiducialDetectionError(
+            'Detector returned non-iterable marker evidence',
+        ) from ex
+
+
+def build_planar_tag_observation(
+    detected_marker: object,
+    homography: MatrixLike | HomographyPair | None = None,
+) -> PlanarTagObservation:
+    """Build one validated planar observation without filtering its marker ID."""
+    normalised_marker = _normalise_marker_from_object(detected_marker)
+    if normalised_marker is None:
+        raise ValueError('detected_marker contains malformed evidence')
+    marker_id, corners = normalised_marker
+    camera_geometry = build_tag_geometry(corners)
+    projector_geometry = (
+        None
+        if homography is None
+        else project_tag_geometry(camera_geometry, homography)
+    )
+    return PlanarTagObservation(marker_id, camera_geometry, projector_geometry)
+
+
+def build_planar_tag_observations(
+    detected_markers: Iterable[DetectedMarker],
+    homography: MatrixLike | HomographyPair | None = None,
+) -> tuple[PlanarTagObservation, ...]:
+    """Build all valid observations, retaining unknown and duplicate marker IDs."""
+    if isinstance(detected_markers, (Mapping, str, bytes, bytearray)):
+        raise ValueError('detected_markers must be an ordered marker collection')
+    try:
+        marker_iterator = iter(detected_markers)
+    except TypeError:
+        raise ValueError('detected_markers must be iterable') from None
+
+    observations: list[PlanarTagObservation] = []
+    try:
+        for detected_marker in marker_iterator:
+            try:
+                observations.append(
+                    build_planar_tag_observation(detected_marker, homography),
+                )
+            except InvalidHomographyError:
+                raise
+            except ValueError:
+                continue
+    except (FiducialDetectionError, InvalidHomographyError):
+        raise
+    except Exception as ex:  # noqa: BLE001 (detector evidence is an external boundary).
+        raise FiducialDetectionError(
+            'Detector failed while returning tag evidence',
+        ) from ex
+    return tuple(sorted(observations, key=_tag_observation_sort_key))
+
+
+def detect_tag_observations(
+    frame: Any,
+    detector: FiducialDetector,
+    homography: MatrixLike | HomographyPair | None = None,
+) -> tuple[PlanarTagObservation, ...]:
+    """Detect and build ordered planar observations through an injected detector."""
+    try:
+        detected_markers = detector.detect(frame)
+    except FiducialDetectionError:
+        raise
+    except Exception as ex:  # noqa: BLE001 (the detector is an external boundary).
+        raise FiducialDetectionError('Could not detect tags in the frame') from ex
+    try:
+        return build_planar_tag_observations(detected_markers, homography)
+    except (FiducialDetectionError, InvalidHomographyError):
+        raise
+    except ValueError as ex:
+        raise FiducialDetectionError(
+            'Detector returned malformed tag evidence',
+        ) from ex
 
 
 def detect_fiducials(
@@ -451,6 +584,17 @@ def detect_and_assemble_correspondences(
         for camera_id, frame in sorted(frames_by_camera.items())
     }
     return assemble_camera_correspondences(detected_markers_by_camera, pattern)
+
+
+def _tag_observation_sort_key(
+    observation: PlanarTagObservation,
+) -> tuple[int, float, float, tuple[Point2D, ...]]:
+    return (
+        observation.marker_id,
+        observation.camera.centre.y,
+        observation.camera.centre.x,
+        observation.camera.corners,
+    )
 
 
 def _normalise_markers_strict(markers: object) -> tuple[DetectedMarker, ...]:
@@ -776,15 +920,11 @@ def _normalise_marker(
         if normalised_corner is None:
             return None
         normalised_corners.append(normalised_corner)
-    polygon_area = calculate_polygon_area(normalised_corners)
-    if (
-        len(set(normalised_corners)) != 4
-        or not math.isfinite(polygon_area)
-        or polygon_area == 0
-        or not _is_convex_polygon(normalised_corners)
-    ):
+    try:
+        checked_corners = validate_planar_corners(normalised_corners)
+    except ValueError:
         return None
-    return checked_marker_id, tuple(normalised_corners)
+    return checked_marker_id, checked_corners
 
 
 def _normalise_marker_id(marker_id: object) -> int | None:
@@ -824,26 +964,8 @@ def _normalise_point(point: object) -> Point2D | None:
     return Point2D(x_pos, y_pos)
 
 
-def _is_convex_polygon(corners: Sequence[Point2D]) -> bool:
-    cross_products = [
-        (
-            corners[(idx + 1) % len(corners)].x - corners[idx].x
-        ) * (
-            corners[(idx + 2) % len(corners)].y - corners[(idx + 1) % len(corners)].y
-        )
-        - (
-            corners[(idx + 1) % len(corners)].y - corners[idx].y
-        ) * (
-            corners[(idx + 2) % len(corners)].x - corners[(idx + 1) % len(corners)].x
-        )
-        for idx in range(len(corners))
-    ]
-    return all(cross_product > 0 for cross_product in cross_products) or all(
-        cross_product < 0 for cross_product in cross_products
-    )
-
-
 __all__ = [
+    'CachedTagDetectorFactory',
     'CameraCorrespondences',
     'DetectedMarker',
     'FiducialCorrespondence',
@@ -851,11 +973,16 @@ __all__ = [
     'MetricTargetCorrespondence',
     'MetricTargetCorrespondences',
     'OpenCVArucoDetector',
+    'PlanarTagObservation',
+    'TagDetectorFactory',
     'assemble_camera_correspondences',
     'assemble_correspondences',
     'assemble_metric_correspondences',
+    'build_planar_tag_observation',
+    'build_planar_tag_observations',
     'detect_and_assemble_correspondences',
     'detect_and_assemble_metric_correspondences',
     'detect_fiducials',
     'detect_metric_fiducials',
+    'detect_tag_observations',
 ]

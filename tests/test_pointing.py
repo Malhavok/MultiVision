@@ -95,17 +95,18 @@ class FakeCalibrationRegistry:
             CalibrationStatus.STALE: 'CALIBRATION_STALE',
         }[self.status]
 
-    def project_camera_to_projector(
+    def project_camera_points_to_projector(
         self,
         _camera_id: str,
-        point: Point2D,
+        points: tuple[Point2D, ...],
         camera_resolution: Resolution,
         projector_resolution: Resolution,
-    ) -> Point2D:
+        _projector_output_descriptor: object | None = None,
+    ) -> tuple[Point2D, ...]:
         assert camera_resolution == Resolution(800, 600)
         assert projector_resolution == Resolution(1000, 700)
-        self.camera_points.append(point)
-        return self.projected_point
+        self.camera_points.extend(points)
+        return tuple(self.projected_point for _point in points)
 
 
 class FakeDisplayService:
@@ -154,25 +155,30 @@ class BlockingCalibrationRegistry(FakeCalibrationRegistry):
         self.release_first_projection = threading.Event()
         self.projection_count = 0
 
-    def project_camera_to_projector(
+    def project_camera_points_to_projector(
         self,
         camera_id: str,
-        point: Point2D,
+        points: tuple[Point2D, ...],
         camera_resolution: Resolution,
         projector_resolution: Resolution,
-    ) -> Point2D:
+        _projector_output_descriptor: object | None = None,
+    ) -> tuple[Point2D, ...]:
         self.projection_count += 1
         projection_number = self.projection_count
         if projection_number == 1:
             self.first_projection_started.set()
             assert self.release_first_projection.wait(1), f'{self.release_first_projection=}'
-        super().project_camera_to_projector(
+        super().project_camera_points_to_projector(
             camera_id,
-            point,
+            points,
             camera_resolution,
             projector_resolution,
+            _projector_output_descriptor,
         )
-        return Point2D(300 + projection_number, 200 + projection_number)
+        return tuple(
+            Point2D(300 + projection_number, 200 + projection_number)
+            for _point in points
+        )
 
 
 class PointingTest(unittest.TestCase):
@@ -207,6 +213,22 @@ class PointingTest(unittest.TestCase):
         ]
         service.clear_overlay()
         assert service.overlay is None
+
+    def test_multi_point_projection_is_side_effect_free_and_uses_point_authority(self) -> None:
+        service = PointOverlayService(
+            FakeCameraRuntime(),
+            FakeCalibrationRegistry(),
+            Resolution(1000, 700),
+        )
+        existing_overlay = service.point_from_camera('overhead', (10, 20))
+
+        projected_points = service.project_camera_points(
+            'overhead',
+            ((30, 40), (50, 60)),
+        )
+
+        assert projected_points == (Point2D(300, 200), Point2D(300, 200))
+        assert service.overlay is existing_overlay
 
     def test_overlay_management_requires_session_identity_not_just_display_name(self) -> None:
         service = PointOverlayService(
@@ -526,8 +548,10 @@ class PointingTest(unittest.TestCase):
         assert context.exception.code == 'PROJECTOR_RESOLUTION_CHANGED'
 
         registry = FakeCalibrationRegistry()
-        registry.project_camera_to_projector = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            PointOutsideCalibratedRegionError('outside region'),
+        registry.project_camera_points_to_projector = (
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                PointOutsideCalibratedRegionError('outside region'),
+            )
         )
         with self.assertRaises(PointOutsideCalibratedRegionError) as context:
             PointOverlayService(camera_runtime, registry, Resolution(1000, 700)).point_from_camera(

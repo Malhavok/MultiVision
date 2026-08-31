@@ -26,6 +26,7 @@ from multivision.errors import (
     CameraSlotNotFoundError,
     CameraUnavailableError,
     FrameCaptureError,
+    GeometryError,
     InvalidAvailableAreaError,
     InvalidCalibrationStateError,
     SessionCameraError,
@@ -37,20 +38,26 @@ from multivision.geometry import (
     PointLike,
     Polygon,
     PreviewTransform,
+    TagGeometry,
+    build_tag_geometry,
     calculate_available_projector_area,
     project_point,
     validate_homography,
 )
 from multivision.fiducials import (
+    CachedTagDetectorFactory,
     CameraCorrespondences,
     FiducialCorrespondence,
     FiducialDetector,
     MetricTargetCorrespondence,
     MetricTargetCorrespondences,
     OpenCVArucoDetector,
+    PlanarTagObservation,
+    TagDetectorFactory,
     assemble_correspondences,
     detect_and_assemble_metric_correspondences,
     detect_fiducials,
+    detect_tag_observations,
 )
 from multivision.hardware import (
     CaptureDeviceFactory,
@@ -87,7 +94,11 @@ from multivision.overlays import (
     get_overlay_dependencies,
     materialise_overlay,
 )
-from multivision.pattern import CalibrationPattern, build_calibration_pattern
+from multivision.pattern import (
+    CalibrationPattern,
+    build_calibration_pattern,
+    validate_tag_dictionary,
+)
 from multivision.persistence import (
     CalibrationRegistry,
     CalibrationStore,
@@ -104,6 +115,7 @@ from multivision.types import (
     RuntimeStatus,
     Resolution,
     SessionCameraState,
+    is_finite_real,
     is_valid_resolution,
 )
 
@@ -135,6 +147,68 @@ class CameraArea(NamedTuple):
     area_colour: tuple[int, int, int]
 
 
+class ProjectionStatus(NamedTuple):
+    """A structured explanation for unavailable projector geometry."""
+
+    code: str
+    message: str
+
+    def to_data(self) -> dict[str, str]:
+        return {'code': self.code, 'message': self.message}
+
+
+class TagObservation(NamedTuple):
+    """One detected tag with optional, independently validated projection."""
+
+    marker_id: int
+    camera: TagGeometry
+    projector: TagGeometry | None = None
+    projection_status: ProjectionStatus | None = None
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            'id': self.marker_id,
+            'camera': _tag_geometry_to_data(self.camera),
+            'projector': (
+                None
+                if self.projector is None
+                else _tag_geometry_to_data(self.projector)
+            ),
+            'projection_status': (
+                None
+                if self.projection_status is None
+                else self.projection_status.to_data()
+            ),
+        }
+
+
+class TagInspectionResult(NamedTuple):
+    """The read-only result of inspecting one retained camera frame."""
+
+    camera: str
+    camera_id: str | None
+    dictionary: str
+    frame_counter: int
+    captured_at_seconds: float
+    tags: tuple[TagObservation, ...]
+    projection_status: ProjectionStatus | None = None
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            'camera': self.camera,
+            'camera_id': self.camera_id,
+            'dictionary': self.dictionary,
+            'frame_counter': self.frame_counter,
+            'captured_at_seconds': self.captured_at_seconds,
+            'tags': [tag.to_data() for tag in self.tags],
+            'projection_status': (
+                None
+                if self.projection_status is None
+                else self.projection_status.to_data()
+            ),
+        }
+
+
 class MultiVisionService:
     """Own camera, calibration and overlay capabilities for one service run."""
 
@@ -149,6 +223,7 @@ class MultiVisionService:
         calibration_store: CalibrationStore | None = None,
         calibration_registry: CalibrationRegistry | None = None,
         detector: FiducialDetector | None = None,
+        tag_detector_factory: TagDetectorFactory | None = None,
         calibration_pattern: CalibrationPattern | None = None,
         point_service: PointOverlayService | None = None,
         sleep_inhibitor: SleepInhibitor | None = None,
@@ -230,6 +305,11 @@ class MultiVisionService:
         )
         self.point_service.projector_output_descriptor = self._projector_output_descriptor
         self.detector = detector
+        self.tag_detector_factory = (
+            tag_detector_factory
+            if tag_detector_factory is not None
+            else CachedTagDetectorFactory()
+        )
         self.sleep_inhibitor = (
             sleep_inhibitor
             if sleep_inhibitor is not None
@@ -632,6 +712,89 @@ class MultiVisionService:
                 f'Camera {logical_name!r} returned an invalid frame',
             )
         return frame
+
+    def inspect_tags(
+        self,
+        camera_reference: str,
+        dictionary_name: str | None = None,
+    ) -> TagInspectionResult:
+        """Inspect every valid tag in one camera's retained latest frame."""
+        if not isinstance(camera_reference, str) or len(camera_reference) == 0:
+            raise ValueError('camera_reference must be a non-empty string')
+        selected_dictionary = (
+            self.configuration.tag_dictionary
+            if dictionary_name is None
+            else dictionary_name
+        )
+        selected_dictionary = validate_tag_dictionary(selected_dictionary)
+        with self._camera_management_lock:
+            resolved_slot = self._resolve_camera_reference(camera_reference)
+            session_camera = self._get_session_camera(resolved_slot)
+            if (
+                session_camera is not None
+                and session_camera.state is not SessionCameraState.OPEN
+            ):
+                raise CameraUnavailableError(
+                    session_camera.error_message
+                    or f'Camera {camera_reference!r} is not available',
+                )
+            get_status = getattr(self.camera_runtime, 'get_status', None)
+            status: CameraStatus | None = None
+            if callable(get_status):
+                try:
+                    status = get_status(resolved_slot)
+                except CameraUnavailableError:
+                    raise
+                except (KeyError, ValueError) as ex:
+                    raise CameraUnavailableError(
+                        f'Camera {camera_reference!r} is not configured',
+                    ) from ex
+                if not isinstance(status, CameraStatus):
+                    raise CameraUnavailableError(
+                        f'Camera {camera_reference!r} returned an invalid status',
+                    )
+                _validate_camera_status(status, resolved_slot)
+                if status.runtime_status is not RuntimeStatus.AVAILABLE:
+                    raise CameraUnavailableError(
+                        status.error_message
+                        or f'Camera {camera_reference!r} is not available',
+                    )
+            frame = self.snapshot(resolved_slot)
+            if (
+                not isinstance(frame.frame_counter, int)
+                or isinstance(frame.frame_counter, bool)
+                or frame.frame_counter < 0
+                or not is_finite_real(frame.captured_at_seconds)
+            ):
+                raise FrameCaptureError('Camera returned malformed frame metadata')
+            captured_at_seconds = float(frame.captured_at_seconds)
+
+            detector = self.tag_detector_factory(selected_dictionary)
+            camera_observations = detect_tag_observations(frame.data, detector)
+            projection_status = self._get_tag_projection_status(resolved_slot)
+            tags = tuple(
+                self._build_tag_observation(
+                    resolved_slot,
+                    observation,
+                    projection_status,
+                )
+                for observation in camera_observations
+            )
+            if session_camera is not None:
+                camera_id = session_camera.slot_id
+            elif status is not None:
+                camera_id = status.device_id
+            else:
+                camera_id = None
+            return TagInspectionResult(
+                camera_reference,
+                camera_id,
+                selected_dictionary,
+                frame.frame_counter,
+                captured_at_seconds,
+                tags,
+                projection_status,
+            )
 
     def get_session_cameras(self) -> list[SessionCamera]:
         """Return the fixed, deterministically ordered session camera inventory."""
@@ -1055,7 +1218,7 @@ class MultiVisionService:
         time.sleep(METRIC_CAPTURE_SETTLE_SECONDS)
         detector = self.detector
         if detector is None:
-            detector = OpenCVArucoDetector()
+            detector = OpenCVArucoDetector(METRIC_TARGET.marker_family)
         get_consecutive_frames = getattr(
             self.camera_runtime,
             'get_consecutive_frames',
@@ -1633,7 +1796,7 @@ class MultiVisionService:
             )
         detector = self.detector
         if detector is None:
-            detector = OpenCVArucoDetector()
+            detector = OpenCVArucoDetector(self.calibration_pattern.marker_family)
         detected_markers = detect_fiducials(frame.data, detector)
         return assemble_correspondences(
             detected_markers,
@@ -1664,6 +1827,64 @@ class MultiVisionService:
             self.overlay_registry.invalidate_camera(session_camera.slot_id)
             return CalibrationStatus.STALE
         return session_camera.calibration_status
+
+    def _get_tag_projection_status(
+        self,
+        camera_reference: str,
+    ) -> ProjectionStatus | None:
+        try:
+            self.point_service.project_camera_points(camera_reference, ())
+        except GeometryError as ex:
+            return _projection_status_from_error(ex)
+        except ValueError as ex:
+            return ProjectionStatus('INVALID_HOMOGRAPHY', str(ex))
+        return None
+
+    def _build_tag_observation(
+        self,
+        camera_reference: str,
+        observation: PlanarTagObservation,
+        projection_status: ProjectionStatus | None,
+    ) -> TagObservation:
+        if projection_status is not None:
+            return TagObservation(
+                observation.marker_id,
+                observation.camera,
+                projection_status=projection_status,
+            )
+        try:
+            projected_points = self.point_service.project_camera_points(
+                camera_reference,
+                observation.camera.corners + (observation.camera.centre,),
+            )
+            if len(projected_points) != 5:
+                raise ValueError(
+                    'Camera-to-projector authority returned an incomplete point set',
+                )
+            projector_geometry = build_tag_geometry(
+                projected_points[:4],
+                centre=projected_points[4],
+            )
+        except GeometryError as ex:
+            return TagObservation(
+                observation.marker_id,
+                observation.camera,
+                projection_status=_projection_status_from_error(ex),
+            )
+        except (TypeError, ValueError):
+            return TagObservation(
+                observation.marker_id,
+                observation.camera,
+                projection_status=ProjectionStatus(
+                    'INVALID_HOMOGRAPHY',
+                    'Camera-to-projector authority returned invalid tag geometry',
+                ),
+            )
+        return TagObservation(
+            observation.marker_id,
+            observation.camera,
+            projector_geometry,
+        )
 
     def _get_session_cameras(self) -> list[SessionCamera] | None:
         get_session_cameras = getattr(self.camera_runtime, 'get_session_cameras', None)
@@ -2321,4 +2542,28 @@ def _validate_camera_status(
         )
 
 
-__all__ = ['AREA_COLOURS', 'CameraArea', 'MultiVisionService', 'get_camera_area_colour']
+def _tag_geometry_to_data(geometry: TagGeometry) -> dict[str, object]:
+    return {
+        'corners': [[point.x, point.y] for point in geometry.corners],
+        'centre': [geometry.centre.x, geometry.centre.y],
+        'orientation_degrees': geometry.orientation_degrees,
+        'area_px': geometry.area_px,
+    }
+
+
+def _projection_status_from_error(exception: Exception) -> ProjectionStatus:
+    code = getattr(exception, 'code', 'CALIBRATION_INVALID')
+    if not isinstance(code, str) or len(code) == 0:
+        code = 'CALIBRATION_INVALID'
+    return ProjectionStatus(code, str(exception))
+
+
+__all__ = [
+    'AREA_COLOURS',
+    'CameraArea',
+    'MultiVisionService',
+    'ProjectionStatus',
+    'TagInspectionResult',
+    'TagObservation',
+    'get_camera_area_colour',
+]

@@ -28,6 +28,11 @@ from multivision.hardware import (
     OpenCVCaptureDevice,
     OpenCVCaptureDeviceFactory,
 )
+from multivision.pattern import (
+    APRILTAG_FAMILIES,
+    DEFAULT_TAG_DICTIONARY,
+    DICT_5X5_1000,
+)
 from multivision.types import (
     CalibrationStatus,
     DeviceInfo,
@@ -51,6 +56,22 @@ class PackageTest(unittest.TestCase):
             loaded_configuration = load_configuration(path)
 
         assert loaded_configuration == configuration, f'{loaded_configuration=}, {configuration=}'
+
+    def test_tag_dictionary_defaults_and_round_trips(self) -> None:
+        assert Configuration().tag_dictionary == DEFAULT_TAG_DICTIONARY
+        assert Configuration().to_data()['tag_dictionary'] == DICT_5X5_1000
+        for dictionary_name in sorted(APRILTAG_FAMILIES | {DICT_5X5_1000}):
+            configuration = Configuration(tag_dictionary=dictionary_name)
+            round_tripped = Configuration.from_data(configuration.to_data())
+            assert round_tripped == configuration, f'{round_tripped=}, {configuration=}'
+
+    def test_unsupported_tag_dictionary_is_explicitly_rejected(self) -> None:
+        for dictionary_name in [None, '', 'DICT_UNKNOWN', 1, True]:
+            with self.subTest(dictionary_name=dictionary_name):
+                with self.assertRaises(ConfigurationError):
+                    Configuration(tag_dictionary=dictionary_name)  # type: ignore[arg-type]
+                with self.assertRaises(ConfigurationError):
+                    Configuration.from_data({'tag_dictionary': dictionary_name})
 
     def test_malformed_configuration_file_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
