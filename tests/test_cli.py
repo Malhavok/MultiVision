@@ -159,6 +159,43 @@ class CliTest(unittest.TestCase):
             ('DELETE', 'http://service.test/overlays', None),
         ], f'{requests=}'
 
+    def test_projector_grid_command_delegates_physical_spacing_to_service(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            return ServiceResponse(200, 'application/json', b'{}')
+
+        client = MultiVisionClient('http://service.test', request_sender=request_sender)
+
+        assert main(
+            [
+                'overlay',
+                'grid',
+                '--fill-projector',
+                '--spacing',
+                '35mm',
+                '--name',
+                'whole-projector',
+            ],
+            client,
+        ) == 0
+        assert requests[0][:3] == (
+            'POST',
+            'http://service.test/overlays/grid/projector-footprint',
+            {
+                'name': 'whole-projector',
+                'spacing': {'value': 35.0, 'unit': 'mm'},
+                'angle_deg': 0.0,
+                'style': {'colour': '#ffffff'},
+            },
+        ), f'{requests=}'
+
     def test_invalid_overlay_spec_is_rejected_before_http(self) -> None:
         requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
         client = MultiVisionClient(

@@ -63,6 +63,7 @@ from multivision.overlays import (
     GridRequest,
     LineRequest,
     OverlayEntry,
+    ProjectorCoverageGridRequest,
     RectRequest,
     RulerRequest,
 )
@@ -478,6 +479,14 @@ def create_app(
     @app.post('/overlays/grid')
     def create_grid_overlay(request: GridRequest) -> dict[str, Any]:
         return _overlay_entry_to_data(owned_service.create_overlay(request))
+
+    @app.post('/overlays/grid/projector-footprint')
+    def create_projector_coverage_grid_overlay(
+        request: ProjectorCoverageGridRequest,
+    ) -> dict[str, Any]:
+        return _overlay_entry_to_data(
+            owned_service.create_projector_coverage_grid(request),
+        )
 
     @app.post('/overlays/circle')
     def create_circle_overlay(request: CircleRequest) -> dict[str, Any]:

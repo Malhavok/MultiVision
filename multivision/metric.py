@@ -40,6 +40,7 @@ from multivision.geometry import (
     invert_homography,
     is_point_in_bounds,
     project_point,
+    project_polygon,
     validate_homography,
 )
 from multivision.metric_target import (
@@ -955,6 +956,60 @@ def projector_to_surface(
     return project_point(checked_point, matrix)
 
 
+def calculate_projector_surface_bounds(
+    projector_to_surface_matrix: (
+        MatrixLike | MetricHomographyPair | MetricCalibrationRecord
+    ),
+    projector_bounds: MetricBounds,
+) -> CoordinateBounds:
+    """Return finite surface bounds covering the complete projector output."""
+    checked_projector_bounds = _coerce_metric_bounds(projector_bounds)
+    projector_corners = (
+        Point2D(checked_projector_bounds.left, checked_projector_bounds.top),
+        Point2D(checked_projector_bounds.right, checked_projector_bounds.top),
+        Point2D(checked_projector_bounds.right, checked_projector_bounds.bottom),
+        Point2D(checked_projector_bounds.left, checked_projector_bounds.bottom),
+    )
+    projector_to_surface_matrix = _projector_to_surface_matrix(
+        getattr(
+            projector_to_surface_matrix,
+            'projector_to_surface',
+            projector_to_surface_matrix,
+        ),
+    )
+    surface_points = tuple(
+        project_point(point, projector_to_surface_matrix)
+        for point in projector_corners
+    )
+    surface_bounds = CoordinateBounds(
+        min(point.x for point in surface_points),
+        min(point.y for point in surface_points),
+        max(point.x for point in surface_points),
+        max(point.y for point in surface_points),
+    )
+    if (
+        surface_bounds.left >= surface_bounds.right
+        or surface_bounds.top >= surface_bounds.bottom
+    ):
+        raise InvalidHomographyError(
+            'Projector output has a degenerate surface footprint',
+        )
+    surface_to_projector_matrix = invert_homography(projector_to_surface_matrix)
+    if project_polygon(
+        (
+            Point2D(surface_bounds.left, surface_bounds.top),
+            Point2D(surface_bounds.right, surface_bounds.top),
+            Point2D(surface_bounds.right, surface_bounds.bottom),
+            Point2D(surface_bounds.left, surface_bounds.bottom),
+        ),
+        surface_to_projector_matrix,
+    ) is None:
+        raise InvalidHomographyError(
+            'Projector output surface footprint crosses the homography horizon',
+        )
+    return surface_bounds
+
+
 def project_surface_points(
     surface_points: Iterable[PointLike],
     surface_to_projector_matrix: MatrixLike | MetricHomographyPair,
@@ -1570,6 +1625,7 @@ __all__ = [
     'MAX_METRIC_RULER_TICKS',
     'RULER_TICK_SPACING_SOURCE_UNITS',
     'METRIC_RULER_RASTER_MARGIN_PIXELS',
+    'calculate_projector_surface_bounds',
     'calculate_ruler_tick_layout',
     'build_metric_ruler',
     'calibrate_metric_homography',

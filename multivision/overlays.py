@@ -415,6 +415,28 @@ class GridRequest(OverlayRequest):
         return self
 
 
+class ProjectorCoverageGridRequest(OverlayRequest):
+    """A physical grid whose finite extent is derived from the projector output."""
+
+    spacing: Quantity
+    angle_deg: float = 0.0
+
+    @field_validator('angle_deg', mode='before')
+    @classmethod
+    def validate_angle(
+        cls: type['ProjectorCoverageGridRequest'],
+        value: Any,
+    ) -> float:
+        return _validate_angle(value)
+
+    @model_validator(mode='after')
+    def validate_grid(self) -> 'ProjectorCoverageGridRequest':
+        self.spacing.validate_for_space(GeometrySpace.SURFACE_MM).require_positive()
+        if self.style.fill:
+            raise ValueError('Grid styles cannot request fill')
+        return self
+
+
 class CircleRequest(OverlayRequest):
     kind: Literal['circle'] = 'circle'
     centre: PointReference
@@ -974,6 +996,47 @@ def build_rotated_rect(
         request.angle_deg,
         request.geometry_space,
         request.style,
+    )
+
+
+def build_projector_coverage_grid_request(
+    request: ProjectorCoverageGridRequest,
+    metric_calibration: object,
+    projector_resolution: Resolution | CoordinateBounds | Sequence[int],
+) -> GridRequest:
+    """Build a finite surface grid covering the complete projector output."""
+    if not isinstance(request, ProjectorCoverageGridRequest):
+        raise ValueError('request must be ProjectorCoverageGridRequest')
+    from multivision.metric import calculate_projector_surface_bounds
+
+    surface_bounds = calculate_projector_surface_bounds(
+        metric_calibration,
+        projector_resolution,
+    )
+    return GridRequest(
+        id=request.id,
+        name=request.name,
+        visible=request.visible,
+        style=request.style,
+        origin={
+            'space': GeometrySpace.SURFACE_MM.value,
+            'x': surface_bounds.left,
+            'y': surface_bounds.top,
+            'unit': 'mm',
+        },
+        geometry_space=GeometrySpace.SURFACE_MM.value,
+        spacing=request.spacing,
+        extent={
+            'width': {
+                'value': surface_bounds.right - surface_bounds.left,
+                'unit': 'mm',
+            },
+            'height': {
+                'value': surface_bounds.bottom - surface_bounds.top,
+                'unit': 'mm',
+            },
+        },
+        angle_deg=request.angle_deg,
     )
 
 
@@ -1814,6 +1877,7 @@ __all__ = [
     'PHYSICAL_UNITS',
     'CircleGeometry',
     'GridGeometry',
+    'ProjectorCoverageGridRequest',
     'LineGeometry',
     'RectGeometry',
     'RulerGeometry',
@@ -1829,6 +1893,7 @@ __all__ = [
     'DEFAULT_CIRCLE_SAMPLE_COUNT',
     'build_circle',
     'build_grid',
+    'build_projector_coverage_grid_request',
     'build_line',
     'build_rotated_rect',
     'build_ruler',

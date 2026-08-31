@@ -28,6 +28,7 @@ from multivision.metric import (
     MetricCalibrationResult,
     MetricHomographyPair,
     build_metric_ruler,
+    calculate_projector_surface_bounds,
     calibrate_metric_homography,
     calculate_surface_distance_mm,
     normalise_length_to_mm,
@@ -143,6 +144,45 @@ class MetricTest(unittest.TestCase):
         assert math.isclose(recovered_point.y, surface_point.y, abs_tol=1e-8), (
             f'{recovered_point=}'
         )
+
+    def test_projector_surface_bounds_cover_the_complete_output(self) -> None:
+        surface_to_projector = (
+            (1.8, 0.15, 20.0),
+            (0.1, 1.4, 10.0),
+            (0.0004, 0.0002, 1.0),
+        )
+        transform = MetricHomographyPair.from_surface_to_projector(
+            surface_to_projector,
+        )
+
+        bounds = calculate_projector_surface_bounds(transform, Resolution(640, 480))
+
+        assert bounds.left < bounds.right, f'{bounds=}'
+        assert bounds.top < bounds.bottom, f'{bounds=}'
+        for projector_point in (
+            Point2D(0, 0),
+            Point2D(640, 0),
+            Point2D(640, 480),
+            Point2D(0, 480),
+        ):
+            surface_point = projector_to_surface(projector_point, transform)
+            assert (
+                bounds.left <= surface_point.x <= bounds.right
+                and bounds.top <= surface_point.y <= bounds.bottom
+            ), f'{projector_point=}, {bounds=}'
+
+    def test_projector_surface_bounds_reject_a_bbox_crossing_the_horizon(self) -> None:
+        surface_to_projector = (
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (1.0, 0.0, 1.0),
+        )
+        transform = MetricHomographyPair.from_surface_to_projector(
+            surface_to_projector,
+        )
+
+        with self.assertRaises(InvalidHomographyError):
+            calculate_projector_surface_bounds(transform, Resolution(2, 2))
 
     def test_ruler_uses_projective_geometry_and_projector_bounds(self) -> None:
         matrix = ((1.5, 0, 0), (0, 1.5, 0), (0.005, 0, 1))

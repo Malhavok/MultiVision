@@ -20,7 +20,7 @@ The following ideas are intentionally deferred from Plan5:
 - `surface_edge_mm` or any second physical coordinate frame;
 - `camera_px` as a shape-size space;
 - `camera_px` as a ruler measurement space;
-- implicit or automatic infinite-grid extent derived through inverse-projector geometry;
+- implicit or automatic **infinite**-grid extent; a named projector-footprint mode may derive one finite extent from the current metric homography;
 - generic z-index/scene graph/plugin rendering;
 - alpha/compositing systems;
 - update/replace semantics for existing overlays;
@@ -170,9 +170,9 @@ angle_deg: finite angle
 style
 ```
 
-**Extent is required in Plan5.** There is no automatic/infinite extent mode.
+**Extent is required for a normal `GridRequest`.** The named projector-footprint grid capability derives one finite surface-mm extent by inverse-projecting the four projector-output corners; it is not an automatic/infinite extent mode.
 
-The grid is square in its declared source space. `origin` is one deterministic grid intersection. Spacing and extent are applied before rotation and projection. The generated segment collection must be finite before projection and must respect configured budgets.
+The grid is square in its declared source space. `origin` is one deterministic grid intersection. Spacing and extent are applied before rotation and projection. The generated segment collection must be finite before projection and must respect configured budgets. The derived footprint bounding box must be finite and must not cross the homography horizon; projector-native clipping remains authoritative.
 
 A physical 1-inch grid means exactly 25.4 mm source spacing before projection.
 

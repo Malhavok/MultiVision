@@ -32,6 +32,7 @@ from multivision.metric import (
     MetricHomographyPair,
 )
 from multivision.metric_target import METRIC_TARGET
+from multivision.overlays import ProjectorCoverageGridRequest
 from multivision.session import SessionCameraRegistry
 from multivision.types import (
     CalibrationStatus,
@@ -99,6 +100,35 @@ class MetricApplicationTest(unittest.TestCase):
             service.calibrate_metric('camera-0', _build_correspondences(0.0))
 
         assert service.get_calibration_stage().value == 'METRIC_CALIBRATED'
+
+    def test_projector_coverage_grid_uses_the_current_metric_output_footprint(self) -> None:
+        runtime = MetricSessionRuntime()
+        configuration = Configuration(projector_resolution=Resolution(640, 480))
+        camera_calibration = _camera_calibration(configuration)
+        runtime.registry.set_calibration(
+            'camera-0',
+            CalibrationStatus.CALIBRATED,
+            camera_calibration,
+        )
+        service = MultiVisionService(configuration, camera_runtime=runtime)
+        service.metric_registry.register(
+            _metric_result(configuration.projector_resolution),
+            configuration.projector_output_descriptor,
+            'camera-0',
+            camera_calibration,
+        )
+
+        entry = service.create_projector_coverage_grid(
+            ProjectorCoverageGridRequest(
+                name='projector-grid',
+                spacing={'value': 35, 'unit': 'mm'},
+            ),
+        )
+
+        assert entry.request.extent.width.value == 640.0, f'{entry=}'
+        assert entry.request.extent.height.value == 480.0, f'{entry=}'
+        assert entry.request.spacing.value == 35.0, f'{entry=}'
+        assert len(service.list_overlays()) == 1, f'{service.list_overlays()=}'
 
     def test_metric_capture_selects_a_white_balance_stable_frame_window(self) -> None:
         frames = tuple(

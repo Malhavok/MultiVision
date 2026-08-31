@@ -270,15 +270,42 @@ def _build_parser() -> argparse.ArgumentParser:
             overlay_kind,
             help=f'create a {overlay_kind} overlay',
         )
-        create_overlay_parser.add_argument(
-            '--spec-json',
-            required=True,
-            type=_parse_json_object,
-            help='validated overlay request as a JSON object',
-        )
+        if overlay_kind == 'grid':
+            grid_mode = create_overlay_parser.add_mutually_exclusive_group(required=True)
+            grid_mode.add_argument(
+                '--spec-json',
+                dest='spec_json',
+                type=_parse_json_object,
+                help='validated overlay request as a JSON object',
+            )
+            grid_mode.add_argument(
+                '--fill-projector',
+                action='store_true',
+                help='fill the projector footprint with a physical grid',
+            )
+            create_overlay_parser.add_argument(
+                '--spacing',
+                type=_parse_quantity_argument,
+                help='physical spacing such as 35mm or 1in',
+            )
+            create_overlay_parser.add_argument('--name', default=None)
+            create_overlay_parser.add_argument(
+                '--angle-deg',
+                type=_parse_finite_float,
+                default=0.0,
+            )
+            create_overlay_parser.add_argument('--colour', default='#ffffff')
+        else:
+            create_overlay_parser.add_argument(
+                '--spec-json',
+                required=True,
+                type=_parse_json_object,
+                help='validated overlay request as a JSON object',
+            )
         create_overlay_parser.set_defaults(
             command_handler='overlay_create',
             overlay_kind=overlay_kind,
+            fill_projector=False,
         )
     for lifecycle_action in ('show', 'hide', 'remove'):
         lifecycle_parser = overlay_subparsers.add_parser(
@@ -558,6 +585,17 @@ def _overlay_create(
     client: MultiVisionClient,
     arguments: argparse.Namespace,
 ) -> ServiceResponse:
+    if arguments.overlay_kind == 'grid' and arguments.fill_projector:
+        if arguments.spacing is None:
+            raise ValueError('--spacing is required with --fill-projector')
+        spacing_value, spacing_unit = arguments.spacing
+        payload = {
+            'name': arguments.name,
+            'spacing': {'value': spacing_value, 'unit': spacing_unit},
+            'angle_deg': arguments.angle_deg,
+            'style': {'colour': arguments.colour},
+        }
+        return client.post('/overlays/grid/projector-footprint', payload)
     spec = _validate_overlay_spec(arguments.overlay_kind, arguments.spec_json)
     return client.post(f'/overlays/{arguments.overlay_kind}', spec)
 
@@ -787,6 +825,27 @@ def _parse_positive_finite_float(value: str) -> float:
     if parsed_value <= 0:
         raise argparse.ArgumentTypeError('must be positive')
     return parsed_value
+
+
+def _parse_quantity_argument(value: str) -> tuple[float, str]:
+    if not isinstance(value, str):
+        raise argparse.ArgumentTypeError('must be a finite number followed by mm, cm or in')
+    value = value.strip()
+    for unit in ('mm', 'cm', 'in'):
+        if not value.endswith(unit):
+            continue
+        try:
+            quantity_value = float(value[:-len(unit)].strip())
+        except (TypeError, ValueError, OverflowError) as ex:
+            raise argparse.ArgumentTypeError(
+                'must be a finite number followed by mm, cm or in',
+            ) from ex
+        if not math.isfinite(quantity_value):
+            raise argparse.ArgumentTypeError(
+                'must be a finite number followed by mm, cm or in',
+            )
+        return quantity_value, unit
+    raise argparse.ArgumentTypeError('must be a finite number followed by mm, cm or in')
 
 
 def _parse_metric_point(value: str) -> tuple[float, float]:

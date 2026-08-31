@@ -11,6 +11,7 @@ from multivision.overlays import (
     CircleRequest,
     GridRequest,
     LineRequest,
+    ProjectorCoverageGridRequest,
     OverlayConfiguration,
     OverlayStyle,
     PointReference,
@@ -21,6 +22,7 @@ from multivision.overlays import (
     build_circle,
     build_grid,
     build_line,
+    build_projector_coverage_grid_request,
     build_rotated_rect,
     build_ruler,
     materialise_circle,
@@ -296,6 +298,29 @@ def test_builds_source_shapes_without_pixel_scale_approximations() -> None:
     )
     assert ruler.length == 5.0, f'{ruler=}'
     assert ruler.length_mm is None, f'{ruler=}'
+
+
+def test_projector_coverage_grid_derives_a_finite_surface_extent() -> None:
+    request = ProjectorCoverageGridRequest(
+        name='coverage',
+        spacing={'value': 35, 'unit': 'mm'},
+    )
+    metric_calibration = SimpleNamespace(
+        projector_to_surface=((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+        surface_to_projector=((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+    )
+
+    grid_request = build_projector_coverage_grid_request(
+        request,
+        metric_calibration,
+        Resolution(100, 80),
+    )
+
+    assert grid_request.origin.x == 0.0, f'{grid_request=}'
+    assert grid_request.origin.y == 0.0, f'{grid_request=}'
+    assert grid_request.extent.width.value == 100.0, f'{grid_request=}'
+    assert grid_request.extent.height.value == 80.0, f'{grid_request=}'
+    assert grid_request.spacing.value == 35.0, f'{grid_request=}'
 
 
 def test_grid_generation_honours_segment_and_vertex_budgets() -> None:

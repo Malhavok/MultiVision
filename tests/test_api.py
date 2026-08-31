@@ -11,6 +11,12 @@ from multivision.camera import CameraRuntime
 from multivision.config import Configuration, load_configuration, save_configuration
 from multivision.fiducials import FiducialCorrespondence
 from multivision.geometry import Point2D
+from multivision.metric import (
+    MetricCalibrationMetrics,
+    MetricCalibrationResult,
+    MetricHomographyPair,
+)
+from multivision.metric_target import METRIC_TARGET
 from multivision.persistence import CalibrationStore
 from multivision.pattern import build_calibration_pattern
 from multivision.service import RedCircleOverlay
@@ -113,6 +119,39 @@ class ApiTest(unittest.TestCase):
         assert hide_response.json()['visible'] is False
         assert remove_response.status_code == 200
         assert empty_response.json() == []
+
+    def test_projector_coverage_grid_route_derives_extent_from_metric_calibration(self) -> None:
+        configuration = Configuration(projector_resolution=Resolution(100, 80))
+        service = MultiVisionService(configuration)
+        service.metric_registry.register(
+            MetricCalibrationResult(
+                MetricHomographyPair.from_surface_to_projector(
+                    ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+                ),
+                MetricCalibrationMetrics(20, 80, 80, 1.0, 0.0, 0.0, 0.75),
+                configuration.projector_resolution,
+                METRIC_TARGET.format_name,
+                METRIC_TARGET.format_version,
+                METRIC_TARGET.marker_family,
+            ),
+            configuration.projector_output_descriptor,
+        )
+
+        with TestClient(create_app(service, manage_lifecycle=False)) as client:
+            response = client.post(
+                '/overlays/grid/projector-footprint',
+                json={
+                    'name': 'projector-grid',
+                    'spacing': {'value': 35, 'unit': 'mm'},
+                },
+            )
+
+        assert response.status_code == 200, f'{response.json()=}'
+        data = response.json()
+        assert data['request']['extent'] == {
+            'width': {'value': 100.0, 'unit': 'mm'},
+            'height': {'value': 80.0, 'unit': 'mm'},
+        }, f'{data=}'
 
     def test_calibration_pattern_can_be_held_without_changing_calibration(self) -> None:
         runtime = CameraRuntime(

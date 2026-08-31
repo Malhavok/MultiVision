@@ -79,8 +79,10 @@ from multivision.overlays import (
     OverlayEntry,
     OverlayRegistry,
     PointReference,
+    ProjectorCoverageGridRequest,
     RectRequest,
     RulerRequest,
+    build_projector_coverage_grid_request,
     get_overlay_dependencies,
     materialise_overlay,
 )
@@ -360,6 +362,22 @@ class MultiVisionService:
             self.overlay_registry.invalidate_metric()
             self.metric_calibration_registry.clear()
             self._metric_ruler = None
+
+    def create_projector_coverage_grid(
+        self,
+        request: ProjectorCoverageGridRequest,
+    ) -> OverlayEntry:
+        """Create a physical grid spanning the extrapolated projector footprint."""
+        if not isinstance(request, ProjectorCoverageGridRequest):
+            raise ValueError('request must be ProjectorCoverageGridRequest')
+        with self._camera_management_lock:
+            metric_calibration = self._require_overlay_metric_calibration()
+            grid_request = build_projector_coverage_grid_request(
+                request,
+                metric_calibration,
+                self._projector_output_descriptor.projector_resolution,
+            )
+            return self.create_overlay(grid_request)
 
     def create_overlay(self, request: AnyOverlayRequest) -> OverlayEntry:
         """Materialise and register one generic overlay atomically."""
