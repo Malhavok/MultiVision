@@ -66,6 +66,7 @@ from multivision.overlays import (
     ProjectorCoverageGridRequest,
     RectRequest,
     RulerRequest,
+    TextRequest,
 )
 from multivision.persistence import PersistedCalibration
 from multivision.service import RedCircleOverlay
@@ -494,6 +495,10 @@ def create_app(
 
     @app.post('/overlays/rect')
     def create_rect_overlay(request: RectRequest) -> dict[str, Any]:
+        return _overlay_entry_to_data(owned_service.create_overlay(request))
+
+    @app.post('/overlays/text')
+    def create_text_overlay(request: TextRequest) -> dict[str, Any]:
         return _overlay_entry_to_data(owned_service.create_overlay(request))
 
     @app.post('/overlays/line')

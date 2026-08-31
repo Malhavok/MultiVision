@@ -335,6 +335,22 @@ def _validate_angle(value: Any) -> float:
     return float(value)
 
 
+MIN_OVERLAY_LABEL_SCALE = 0.1
+MAX_OVERLAY_LABEL_SCALE = 32.0
+
+
+def _validate_scale(value: Any) -> float:
+    if (
+        not is_finite_real(value)
+        or not MIN_OVERLAY_LABEL_SCALE <= float(value) <= MAX_OVERLAY_LABEL_SCALE
+    ):
+        raise ValueError(
+            f'scale must be finite and between {MIN_OVERLAY_LABEL_SCALE} '
+            f'and {MAX_OVERLAY_LABEL_SCALE}',
+        )
+    return float(value)
+
+
 def _validate_overlay_label(value: str | None) -> str | None:
     if value is not None and len(value) > OverlayConfiguration().max_overlay_label_characters:
         raise ValueError('label exceeds the configured character limit')
@@ -456,8 +472,11 @@ class RectRequest(OverlayRequest):
     width: Quantity
     height: Quantity
     angle_deg: float = 0.0
+    label: str | None = None
+    label_angle_deg: float = 0.0
+    label_scale: float = 1.0
 
-    @field_validator('angle_deg', mode='before')
+    @field_validator('angle_deg', 'label_angle_deg', mode='before')
     @classmethod
     def validate_angle(
         cls: type['RectRequest'],
@@ -465,11 +484,63 @@ class RectRequest(OverlayRequest):
     ) -> float:
         return _validate_angle(value)
 
+    @field_validator('label')
+    @classmethod
+    def validate_label(
+        cls: type['RectRequest'],
+        value: str | None,
+    ) -> str | None:
+        return _validate_overlay_label(value)
+
+    @field_validator('label_scale', mode='before')
+    @classmethod
+    def validate_label_scale(
+        cls: type['RectRequest'],
+        value: Any,
+    ) -> float:
+        return _validate_scale(value)
+
     @model_validator(mode='after')
     def validate_rect(self) -> 'RectRequest':
         self.width.validate_for_space(self.geometry_space).require_positive()
         self.height.validate_for_space(self.geometry_space).require_positive()
         return self
+
+
+class TextRequest(OverlayRequest):
+    kind: Literal['text'] = 'text'
+    position: PointReference
+    text: str
+    angle_deg: float = 0.0
+    scale: float = 1.0
+
+    @field_validator('text')
+    @classmethod
+    def validate_text(
+        cls: type['TextRequest'],
+        value: str,
+    ) -> str:
+        if len(value) == 0:
+            raise ValueError('text must not be empty')
+        checked_text = _validate_overlay_label(value)
+        assert checked_text is not None
+        return checked_text
+
+    @field_validator('angle_deg', mode='before')
+    @classmethod
+    def validate_angle(
+        cls: type['TextRequest'],
+        value: Any,
+    ) -> float:
+        return _validate_angle(value)
+
+    @field_validator('scale', mode='before')
+    @classmethod
+    def validate_text_scale(
+        cls: type['TextRequest'],
+        value: Any,
+    ) -> float:
+        return _validate_scale(value)
 
 
 class LineRequest(OverlayRequest):
@@ -522,9 +593,21 @@ class RulerRequest(OverlayRequest):
 
 
 AnyOverlayRequest: TypeAlias = (
-    GridRequest | CircleRequest | RectRequest | LineRequest | RulerRequest
+    GridRequest
+    | CircleRequest
+    | RectRequest
+    | TextRequest
+    | LineRequest
+    | RulerRequest
 )
-_OVERLAY_REQUEST_TYPES = (GridRequest, CircleRequest, RectRequest, LineRequest, RulerRequest)
+_OVERLAY_REQUEST_TYPES = (
+    GridRequest,
+    CircleRequest,
+    RectRequest,
+    TextRequest,
+    LineRequest,
+    RulerRequest,
+)
 
 
 class SourceSegment(NamedTuple):
@@ -552,6 +635,16 @@ class RectGeometry(NamedTuple):
     height: float
     angle_deg: float
     geometry_space: str
+    style: OverlayStyle
+
+
+class TextGeometry(NamedTuple):
+    """A floating projector-native text anchor."""
+
+    position: Point2D
+    text: str
+    angle_deg: float
+    scale: float
     style: OverlayStyle
 
 
@@ -616,6 +709,8 @@ class ProjectorLabel(NamedTuple):
     position: Point2D
     text: str
     style: OverlayStyle
+    angle_deg: float = 0.0
+    scale: float = 1.0
 
 
 class ProjectorMaterialisation(NamedTuple):
@@ -840,6 +935,12 @@ def _validate_projector_materialisation(
         _validate_finite_geometry_point(label.position)
         if not isinstance(label.text, str):
             raise ValueError('materialised label text must be a string')
+        if (
+            not is_finite_real(label.angle_deg)
+            or not is_finite_real(label.scale)
+            or not MIN_OVERLAY_LABEL_SCALE <= label.scale <= MAX_OVERLAY_LABEL_SCALE
+        ):
+            raise ValueError('materialised label rotation and scale are invalid')
         if not isinstance(label.style, OverlayStyle):
             raise ValueError('materialised label styles must be OverlayStyle values')
 
@@ -851,6 +952,8 @@ def get_overlay_point_references(
         return (request.origin,)
     if isinstance(request, (CircleRequest, RectRequest)):
         return (request.centre,)
+    if isinstance(request, TextRequest):
+        return (request.position,)
     if isinstance(request, (LineRequest, RulerRequest)):
         return (request.start, request.end)
     raise ValueError('request must be an overlay request')
@@ -995,6 +1098,29 @@ def build_rotated_rect(
         height,
         request.angle_deg,
         request.geometry_space,
+        request.style,
+    )
+
+
+def build_text(
+    request: TextRequest,
+    camera_to_projector: object | None = None,
+    metric_calibration: object | None = None,
+) -> TextGeometry:
+    """Resolve one floating text anchor to projector-native coordinates."""
+    if not isinstance(request, TextRequest):
+        raise ValueError('request must be a TextRequest')
+    position = resolve_point_reference(
+        request.position,
+        GeometrySpace.PROJECTOR_PX,
+        camera_to_projector,
+        metric_calibration,
+    )
+    return TextGeometry(
+        position,
+        request.text,
+        request.angle_deg,
+        request.scale,
         request.style,
     )
 
@@ -1234,6 +1360,21 @@ def materialise_rect(
     )
     if not isinstance(geometry, RectGeometry):
         raise ValueError('request_or_geometry must be RectRequest or RectGeometry')
+    label = (
+        request_or_geometry.label
+        if isinstance(request_or_geometry, RectRequest)
+        else None
+    )
+    label_angle_deg = (
+        request_or_geometry.label_angle_deg
+        if isinstance(request_or_geometry, RectRequest)
+        else 0.0
+    )
+    label_scale = (
+        request_or_geometry.label_scale
+        if isinstance(request_or_geometry, RectRequest)
+        else 1.0
+    )
     bounds, limits = _normalise_materialisation_arguments(
         projector_resolution,
         overlay_configuration,
@@ -1247,10 +1388,69 @@ def materialise_rect(
     )
     if geometry.style.fill:
         polygon = _clip_projector_polygon(projector_points, bounds, geometry.style)
-        return ProjectorMaterialisation(polygons=() if polygon is None else (polygon,))
-    return ProjectorMaterialisation(
-        segments=_materialise_closed_edges(projector_points, bounds, geometry.style),
+        materialisation = ProjectorMaterialisation(
+            polygons=() if polygon is None else (polygon,),
+        )
+    else:
+        materialisation = ProjectorMaterialisation(
+            segments=_materialise_closed_edges(projector_points, bounds, geometry.style),
+        )
+    projector_centre = _project_source_points(
+        (geometry.centre,),
+        geometry.geometry_space,
+        metric_calibration,
+    )[0]
+    labels = _materialise_optional_label_at_position(
+        label,
+        projector_centre,
+        materialisation,
+        bounds,
+        geometry.style,
+        label_angle_deg,
+        label_scale,
+        limits,
     )
+    return materialisation._replace(labels=labels)
+
+
+def materialise_text(
+    request_or_geometry: TextRequest | TextGeometry,
+    projector_resolution: Resolution | CoordinateBounds | Sequence[int],
+    camera_to_projector: object | None = None,
+    metric_calibration: object | None = None,
+    overlay_configuration: OverlayConfiguration | None = None,
+) -> ProjectorMaterialisation:
+    """Resolve one floating text label in projector-native coordinates."""
+    geometry = (
+        build_text(request_or_geometry, camera_to_projector, metric_calibration)
+        if isinstance(request_or_geometry, TextRequest)
+        else request_or_geometry
+    )
+    if not isinstance(geometry, TextGeometry):
+        raise ValueError('request_or_geometry must be TextRequest or TextGeometry')
+    bounds, limits = _normalise_materialisation_arguments(
+        projector_resolution,
+        overlay_configuration,
+    )
+    _validate_finite_geometry_point(geometry.position)
+    if not isinstance(geometry.text, str) or len(geometry.text) == 0:
+        raise ValueError('text must be a non-empty string')
+    if (
+        not is_finite_real(geometry.angle_deg)
+        or not is_finite_real(geometry.scale)
+        or not MIN_OVERLAY_LABEL_SCALE <= geometry.scale <= MAX_OVERLAY_LABEL_SCALE
+    ):
+        raise ValueError('text rotation and scale are invalid')
+    if len(geometry.text) > limits.max_overlay_label_characters:
+        raise ValueError('text exceeds the configured character limit')
+    label = ProjectorLabel(
+        _round_projector_point(geometry.position, bounds),
+        geometry.text,
+        geometry.style,
+        geometry.angle_deg,
+        geometry.scale,
+    )
+    return ProjectorMaterialisation(labels=(label,))
 
 
 def materialise_grid(
@@ -1410,6 +1610,7 @@ def materialise_overlay(
         'grid': materialise_grid,
         'circle': materialise_circle,
         'rect': materialise_rect,
+        'text': materialise_text,
         'line': materialise_line,
         'ruler': materialise_ruler,
     }[request.kind]
@@ -1732,13 +1933,47 @@ def _materialise_optional_label(
 ) -> tuple[ProjectorLabel, ...]:
     if label is None:
         return ()
+    midpoint = Point2D((start.x + end.x) / 2.0, (start.y + end.y) / 2.0)
+    return _materialise_optional_label_at_position(
+        label,
+        midpoint,
+        ProjectorMaterialisation(segments=tuple(visible_segments)),
+        bounds,
+        style,
+        0.0,
+        1.0,
+        limits,
+    )
+
+
+def _materialise_optional_label_at_position(
+    label: str | None,
+    position: Point2D,
+    materialisation: ProjectorMaterialisation,
+    bounds: CoordinateBounds,
+    style: OverlayStyle,
+    angle_deg: float,
+    scale: float,
+    limits: OverlayConfiguration,
+) -> tuple[ProjectorLabel, ...]:
+    if label is None:
+        return ()
     if len(label) > limits.max_overlay_label_characters:
         raise ValueError('label exceeds the configured character limit')
-    if len(visible_segments) == 0:
+    if (
+        len(materialisation.segments) == 0
+        and len(materialisation.polygons) == 0
+    ):
         return ()
-    midpoint = Point2D((start.x + end.x) / 2.0, (start.y + end.y) / 2.0)
-    midpoint = _round_projector_point(midpoint, bounds)
-    return (ProjectorLabel(midpoint, label, style),)
+    return (
+        ProjectorLabel(
+            _round_projector_point(position, bounds),
+            label,
+            style,
+            angle_deg,
+            scale,
+        ),
+    )
 
 
 def _calculate_grid_line_count(extent: float, spacing: float) -> int:
@@ -1859,6 +2094,8 @@ def _validate_finite_geometry_point(point: Point2D) -> None:
 __all__ = [
     'ANGLE_CONVENTION',
     'AnyOverlayRequest',
+    'MAX_OVERLAY_LABEL_SCALE',
+    'MIN_OVERLAY_LABEL_SCALE',
     'CircleRequest',
     'GeometrySpace',
     'GridRequest',
@@ -1875,6 +2112,7 @@ __all__ = [
     'Quantity',
     'RectRequest',
     'RulerRequest',
+    'TextRequest',
     'PHYSICAL_UNITS',
     'CircleGeometry',
     'GridGeometry',
@@ -1882,6 +2120,7 @@ __all__ = [
     'LineGeometry',
     'RectGeometry',
     'RulerGeometry',
+    'TextGeometry',
     'SourceSegment',
     'ProjectorLabel',
     'ProjectorMaterialisation',
@@ -1898,11 +2137,13 @@ __all__ = [
     'build_line',
     'build_rotated_rect',
     'build_ruler',
+    'build_text',
     'materialise_circle',
     'materialise_grid',
     'materialise_line',
     'materialise_overlay',
     'materialise_rect',
     'materialise_ruler',
+    'materialise_text',
     'resolve_point_reference',
 ]

@@ -82,6 +82,7 @@ from multivision.overlays import (
     ProjectorCoverageGridRequest,
     RectRequest,
     RulerRequest,
+    TextRequest,
     build_projector_coverage_grid_request,
     get_overlay_dependencies,
     materialise_overlay,
@@ -383,7 +384,14 @@ class MultiVisionService:
         """Materialise and register one generic overlay atomically."""
         if not isinstance(
             request,
-            (GridRequest, CircleRequest, RectRequest, LineRequest, RulerRequest),
+            (
+                GridRequest,
+                CircleRequest,
+                RectRequest,
+                TextRequest,
+                LineRequest,
+                RulerRequest,
+            ),
         ):
             raise ValueError('request must be an overlay request')
 

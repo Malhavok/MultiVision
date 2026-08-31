@@ -265,7 +265,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     clear_parser = overlay_subparsers.add_parser('clear', help='clear the current overlay')
     clear_parser.set_defaults(command_handler='overlay_clear')
-    for overlay_kind in ('grid', 'circle', 'rect', 'line', 'ruler'):
+    for overlay_kind in ('grid', 'circle', 'rect', 'text', 'line', 'ruler'):
         create_overlay_parser = overlay_subparsers.add_parser(
             overlay_kind,
             help=f'create a {overlay_kind} overlay',
@@ -638,12 +638,14 @@ def _validate_overlay_spec(
         LineRequest,
         RectRequest,
         RulerRequest,
+        TextRequest,
     )
 
     request_types = {
         'grid': GridRequest,
         'circle': CircleRequest,
         'rect': RectRequest,
+        'text': TextRequest,
         'line': LineRequest,
         'ruler': RulerRequest,
     }

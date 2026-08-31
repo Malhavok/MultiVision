@@ -107,6 +107,9 @@ class FakePygame:
         )
         self.transform = SimpleNamespace(
             smoothscale=lambda _surface, size: FakeSurface(size),
+            rotozoom=lambda _surface, _angle, scale: FakeSurface(
+                (round(scale), round(scale)),
+            ),
         )
         self.initialise_count = 0
         self.quit_count = 0
@@ -298,6 +301,28 @@ class DisplayTest(unittest.TestCase):
             f'{pygame_module.rendered_text=}'
         )
         assert len(surface.blits) == 1, f'{surface.blits=}'
+
+    def test_generic_labels_apply_rotation_and_scale_before_blitting(self) -> None:
+        pygame_module = FakePygame()
+        renderer = ProjectorRenderer(pygame_module)
+        style = OverlayStyle(colour='#123456', line_width_px=1)
+        overlay = SimpleNamespace(
+            kind='text',
+            visible=True,
+            insertion_sequence=0,
+            materialised_primitives=ProjectorMaterialisation(
+                labels=(ProjectorLabel(Point2D(50, 40), 'one\ntwo', style, 30, 2),),
+            ),
+        )
+
+        renderer.render_generic_overlays(
+            FakeSurface((100, 80)),
+            [overlay],
+            FakeFont(pygame_module.rendered_text),
+            'label',
+        )
+
+        assert pygame_module.rendered_text == ['one', 'two']
 
     def test_generic_overlays_are_suppressed_during_calibration_and_blank_capture(self) -> None:
         class GenericOverlayService(FakeCameraRuntime):

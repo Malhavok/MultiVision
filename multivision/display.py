@@ -25,6 +25,8 @@ from multivision.geometry import (
 )
 from multivision.metric import MetricCalibrationStatus
 from multivision.overlays import (
+    MAX_OVERLAY_LABEL_SCALE,
+    MIN_OVERLAY_LABEL_SCALE,
     OverlayStyle,
     ProjectorLabel,
     ProjectorMaterialisation,
@@ -609,6 +611,16 @@ class ProjectorRenderer:
                     raise TypeError('projector labels must contain string text')
                 if not _is_finite_display_point(label.position):
                     raise ValueError('projector label positions must be finite')
+                if (
+                    not _is_finite_display_number(label.angle_deg)
+                    or not _is_finite_display_number(label.scale)
+                    or not (
+                        MIN_OVERLAY_LABEL_SCALE
+                        <= label.scale
+                        <= MAX_OVERLAY_LABEL_SCALE
+                    )
+                ):
+                    raise ValueError('projector label rotation and scale are invalid')
                 _validate_overlay_style(label.style)
             if layer == 'label':
                 draw_labels.extend(materialisation.labels)
@@ -638,17 +650,37 @@ class ProjectorRenderer:
             font = self._pygame.font.Font(None, 16)
         for label in draw_labels:
             position = _round_generic_projector_point(label.position)
-            label_surface = font.render(label.text, True, label.style.colour)
-            label_size = _get_surface_size(label_surface, 0)
-            label_left = min(
-                max(position[0] - label_size[0] // 2, 0),
-                max(0, surface_size[0] - label_size[0]),
+            label_surfaces = [
+                font.render(line.rstrip('\r') or ' ', True, label.style.colour)
+                for line in label.text.split('\n')
+            ]
+            if label.angle_deg != 0.0 or label.scale != 1.0:
+                rotozoom = getattr(self._pygame.transform, 'rotozoom', None)
+                if not callable(rotozoom):
+                    raise RuntimeError('Pygame transform.rotozoom is unavailable')
+                label_surfaces = [
+                    rotozoom(label_surface, label.angle_deg, label.scale)
+                    for label_surface in label_surfaces
+                ]
+            line_sizes = [
+                _get_surface_size(label_surface, 0)
+                for label_surface in label_surfaces
+            ]
+            line_height = max(size[1] for size in line_sizes)
+            block_height = line_height * len(label_surfaces)
+            block_top = min(
+                max(position[1] - block_height // 2, 0),
+                max(0, surface_size[1] - block_height),
             )
-            label_top = min(
-                max(position[1] - label_size[1] // 2, 0),
-                max(0, surface_size[1] - label_size[1]),
-            )
-            surface.blit(label_surface, (label_left, label_top))
+            for line_index, (label_surface, label_size) in enumerate(
+                zip(label_surfaces, line_sizes),
+            ):
+                label_left = min(
+                    max(position[0] - label_size[0] // 2, 0),
+                    max(0, surface_size[0] - label_size[0]),
+                )
+                label_top = block_top + line_index * line_height
+                surface.blit(label_surface, (label_left, label_top))
 
     @staticmethod
     def _require_main_thread() -> None:
@@ -1607,6 +1639,7 @@ def _projector_overlay_layer_key(kind: str) -> int:
             'circle': 1,
             'line': 2,
             'ruler': 2,
+            'text': 1,
         }[kind]
     except KeyError as ex:
         raise ValueError(f'Unknown projector overlay kind: {kind!r}') from ex

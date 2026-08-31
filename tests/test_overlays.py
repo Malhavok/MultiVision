@@ -6,7 +6,12 @@ from pydantic import ValidationError
 
 from multivision.config import Configuration
 from multivision.errors import ConfigurationError
-from multivision.geometry import Point2D, invert_homography, project_point
+from multivision.geometry import (
+    CoordinateBounds,
+    Point2D,
+    invert_homography,
+    project_point,
+)
 from multivision.overlays import (
     CircleRequest,
     GridRequest,
@@ -15,10 +20,12 @@ from multivision.overlays import (
     OverlayConfiguration,
     OverlayStyle,
     PointReference,
+    ProjectorLabel,
     ProjectorMaterialisation,
     Quantity,
     RectRequest,
     RulerRequest,
+    TextRequest,
     build_circle,
     build_grid,
     build_line,
@@ -30,12 +37,44 @@ from multivision.overlays import (
     materialise_line,
     materialise_rect,
     materialise_ruler,
+    materialise_text,
     resolve_point_reference,
 )
 from multivision.types import Resolution
 
 
-def test_overlay_configuration_round_trip() -> None:
+def test_rectangle_and_floating_text_materialise_rotated_scaled_labels() -> None:
+    bounds = CoordinateBounds(0, 0, 200, 200)
+    rectangle = RectRequest(
+        centre={'space': 'projector_px', 'x': 100, 'y': 80},
+        geometry_space='projector_px',
+        width={'value': 40, 'unit': 'px'},
+        height={'value': 20, 'unit': 'px'},
+        label='card-1',
+        label_angle_deg=15,
+        label_scale=1.5,
+    )
+    rectangle_materialisation = materialise_rect(rectangle, bounds)
+    assert rectangle_materialisation.labels[0] == ProjectorLabel(
+        Point2D(100, 80),
+        'card-1',
+        rectangle.style,
+        15.0,
+        1.5,
+    ), f'{rectangle_materialisation=}'
+
+    text = TextRequest(
+        position={'space': 'projector_px', 'x': 25, 'y': 30},
+        text='floating',
+        angle_deg=-20,
+        scale=2,
+    )
+    text_materialisation = materialise_text(text, bounds)
+    assert text_materialisation.labels == (
+        ProjectorLabel(Point2D(25, 30), 'floating', text.style, -20.0, 2.0),
+    ), f'{text_materialisation=}'
+
+
     configuration = Configuration.from_data(
         {
             'overlay_limits': {

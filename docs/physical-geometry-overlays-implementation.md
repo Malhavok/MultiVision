@@ -27,4 +27,18 @@ The mode intentionally assumes
 that the calibrated A4 sheet and the full projected surface share one flat
 plane, as requested by the operator.
 
+## Text labels
+
+Rectangles accept an optional `label`, `label_angle_deg` and `label_scale`; the
+label is anchored at the rectangle centre. Independent floating labels use
+`POST /overlays/text` or `multivision overlay text --spec-json`, with a
+`position`, `text`, `angle_deg` and `scale`. Positions use the same
+`projector_px`, `camera_px` and `surface_mm` point references as other overlays
+and are resolved through the existing transform chain before rendering.
+
+Labels use the existing default Pygame font. Rotation and scale are applied in
+projector-native pixels at render time; font selection is intentionally not part
+of this capability. Scale is bounded to `0.1`–`32.0` to keep rasterisation
+bounded.
+
 See the [shared validation contract](../plans/plan5-validation-contract.md).

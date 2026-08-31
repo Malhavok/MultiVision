@@ -116,6 +116,15 @@ class CliTest(unittest.TestCase):
                 'geometry_space': 'projector_px',
                 'width': {'value': 10, 'unit': 'px'},
                 'height': {'value': 8, 'unit': 'px'},
+                'label': 'card-1',
+                'label_angle_deg': 10,
+                'label_scale': 1.5,
+            },
+            'text': {
+                'position': {'space': 'projector_px', 'x': 15, 'y': 25},
+                'text': 'floating',
+                'angle_deg': 20,
+                'scale': 2,
             },
             'line': {
                 'start': {'space': 'projector_px', 'x': 1, 'y': 2},
