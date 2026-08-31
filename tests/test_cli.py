@@ -269,6 +269,54 @@ class CliTest(unittest.TestCase):
             ('DELETE', 'http://service.test/metric/ruler', None),
         ]
 
+    def test_metric_rotation_calculates_local_camera_view_angle(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+        matrix = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            if url.endswith('/metric/calibration/status'):
+                body = {'surface_to_projector': matrix}
+            else:
+                body = {
+                    'calibrations': {
+                        'camera-1': {'projector_to_camera': matrix},
+                    },
+                }
+            return ServiceResponse(
+                200,
+                'application/json',
+                json.dumps(body).encode('utf-8'),
+            )
+
+        client = MultiVisionClient('http://service.test', request_sender=request_sender)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = main(
+                [
+                    'metric',
+                    'rotation',
+                    '--camera',
+                    'camera-1',
+                    '--at-mm=-80,80',
+                ],
+                client,
+            )
+
+        assert result == 0
+        response = json.loads(output.getvalue())
+        assert response['rotation_angle_deg'] == 0.0, f'{response=}'
+        assert response['camera_position_px'] == {'x': -80.0, 'y': 80.0}
+        assert [url for _method, url, _payload, _timeout in requests] == [
+            'http://service.test/metric/calibration/status',
+            'http://service.test/calibration/status',
+        ], f'{requests=}'
+
     def test_metric_target_generation_writes_locally_without_http(self) -> None:
         requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
 

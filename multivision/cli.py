@@ -391,6 +391,30 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     metric_status_parser.set_defaults(command_handler='metric_status')
 
+    metric_rotation_parser = metric_subparsers.add_parser(
+        'rotation',
+        help='calculate local surface rotation for a camera view',
+    )
+    metric_rotation_parser.add_argument(
+        '--camera',
+        required=True,
+        type=_parse_non_empty_argument,
+        help='calibrated camera whose view should be straightened',
+    )
+    metric_rotation_parser.add_argument(
+        '--at-mm',
+        required=True,
+        type=_parse_metric_point,
+        help='surface position at which to calculate the local rotation',
+    )
+    metric_rotation_parser.add_argument(
+        '--step-mm',
+        default=0.01,
+        type=_parse_positive_finite_float,
+        help='finite-difference step in millimetres (default: 0.01)',
+    )
+    metric_rotation_parser.set_defaults(command_handler='metric_rotation')
+
     metric_clear_parser = metric_subparsers.add_parser(
         'clear',
         help='clear metric calibration',
@@ -469,6 +493,7 @@ def _run_command(
         'metric_target_generate': _metric_target_generate,
         'metric_calibrate': _metric_calibrate,
         'metric_status': _metric_status,
+        'metric_rotation': _metric_rotation,
         'metric_clear': _metric_clear,
         'metric_ruler': _metric_ruler,
     }
@@ -693,6 +718,82 @@ def _metric_status(
     return client.get('/metric/calibration/status')
 
 
+def _metric_rotation(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    metric_status = _get_json_object(
+        client.get('/metric/calibration/status'),
+        'metric calibration status',
+    )
+    calibration_status = _get_json_object(
+        client.get('/calibration/status'),
+        'camera calibration status',
+    )
+    surface_to_projector = _get_matrix(
+        metric_status.get('surface_to_projector'),
+        'surface_to_projector',
+    )
+    calibrations = calibration_status.get('calibrations')
+    if not isinstance(calibrations, dict):
+        raise ValueError('camera calibration status does not contain calibrations')
+    camera_calibration = calibrations.get(arguments.camera)
+    if not isinstance(camera_calibration, dict):
+        raise ValueError(f'No calibration record for camera {arguments.camera!r}')
+    projector_to_camera = _get_matrix(
+        camera_calibration.get('projector_to_camera'),
+        f'projector_to_camera for {arguments.camera!r}',
+    )
+    surface_to_camera = _multiply_homographies(
+        projector_to_camera,
+        surface_to_projector,
+    )
+    surface_point = arguments.at_mm
+    camera_point = _project_homography(surface_to_camera, surface_point)
+    step = arguments.step_mm
+    surface_x_direction = _central_difference(
+        surface_to_camera,
+        surface_point,
+        (step, 0.0),
+        step,
+    )
+    surface_y_direction = _central_difference(
+        surface_to_camera,
+        surface_point,
+        (0.0, step),
+        step,
+    )
+    rotation_angle = math.degrees(
+        math.atan2(surface_x_direction[1], surface_y_direction[1]),
+    )
+    result = {
+        'camera': arguments.camera,
+        'surface_position_mm': {
+            'x': surface_point[0],
+            'y': surface_point[1],
+        },
+        'camera_position_px': {
+            'x': camera_point[0],
+            'y': camera_point[1],
+        },
+        'surface_x_direction_camera_px_per_mm': {
+            'x': surface_x_direction[0],
+            'y': surface_x_direction[1],
+        },
+        'surface_y_direction_camera_px_per_mm': {
+            'x': surface_y_direction[0],
+            'y': surface_y_direction[1],
+        },
+        'rotation_angle_deg': rotation_angle,
+        'step_mm': step,
+    }
+    return ServiceResponse(
+        200,
+        'application/json',
+        json.dumps(result, allow_nan=False).encode('utf-8'),
+    )
+
+
 def _metric_clear(
     client: MultiVisionClient,
     _arguments: argparse.Namespace,
@@ -800,6 +901,90 @@ def _validate_service_url(service_url: str) -> None:
         parsed_url.port
     except ValueError as ex:
         raise ValueError('service_url must contain a valid port') from ex
+
+
+def _get_json_object(response: ServiceResponse, description: str) -> dict[str, Any]:
+    try:
+        data = json.loads(response.body.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as ex:
+        raise ValueError(f'{description} was not valid JSON') from ex
+    if not isinstance(data, dict):
+        raise ValueError(f'{description} was not a JSON object')
+    return data
+
+
+def _get_matrix(value: object, description: str) -> tuple[tuple[float, ...], ...]:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f'{description} must be a 3x3 matrix')
+    rows: list[tuple[float, ...]] = []
+    for row in value:
+        if not isinstance(row, list) or len(row) != 3:
+            raise ValueError(f'{description} must be a 3x3 matrix')
+        try:
+            values = tuple(float(entry) for entry in row)
+        except (TypeError, ValueError, OverflowError) as ex:
+            raise ValueError(f'{description} must contain numeric values') from ex
+        if not all(math.isfinite(entry) for entry in values):
+            raise ValueError(f'{description} must contain finite values')
+        rows.append(values)
+    return tuple(rows)
+
+
+def _multiply_homographies(
+    left: tuple[tuple[float, ...], ...],
+    right: tuple[tuple[float, ...], ...],
+) -> tuple[tuple[float, ...], ...]:
+    return tuple(
+        tuple(
+            sum(left[row][index] * right[index][column] for index in range(3))
+            for column in range(3)
+        )
+        for row in range(3)
+    )
+
+
+def _project_homography(
+    matrix: tuple[tuple[float, ...], ...],
+    point: tuple[float, float],
+) -> tuple[float, float]:
+    denominator = matrix[2][0] * point[0] + matrix[2][1] * point[1] + matrix[2][2]
+    if not math.isfinite(denominator) or abs(denominator) <= 1e-12:
+        raise ValueError('homography projects the sample through its horizon')
+    projected = (
+        (
+            matrix[0][0] * point[0]
+            + matrix[0][1] * point[1]
+            + matrix[0][2]
+        ) / denominator,
+        (
+            matrix[1][0] * point[0]
+            + matrix[1][1] * point[1]
+            + matrix[1][2]
+        ) / denominator,
+    )
+    if not all(math.isfinite(entry) for entry in projected):
+        raise ValueError('homography produced a non-finite sample')
+    return projected
+
+
+def _central_difference(
+    matrix: tuple[tuple[float, ...], ...],
+    point: tuple[float, float],
+    offset: tuple[float, float],
+    step: float,
+) -> tuple[float, float]:
+    before = _project_homography(
+        matrix,
+        (point[0] - offset[0], point[1] - offset[1]),
+    )
+    after = _project_homography(
+        matrix,
+        (point[0] + offset[0], point[1] + offset[1]),
+    )
+    return (
+        (after[0] - before[0]) / (2.0 * step),
+        (after[1] - before[1]) / (2.0 * step),
+    )
 
 
 def _parse_json_object(value: str) -> dict[str, Any]:
