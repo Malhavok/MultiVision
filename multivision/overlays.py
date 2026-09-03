@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
+    Annotated,
     Any,
     Literal,
     NamedTuple,
@@ -34,9 +35,12 @@ from multivision.geometry import (
     CoordinateBounds,
     MatrixLike,
     Point2D,
+    TagGeometry,
     camera_to_projector as project_camera_point,
     project_point,
+    project_tag_geometry,
     validate_homography,
+    validate_planar_corners,
 )
 from multivision.types import (
     Resolution,
@@ -214,6 +218,130 @@ class PointReference(BaseModel):
         if self.unit != 'mm':
             raise ValueError('surface_mm points require mm, cm or in units')
         return self
+
+
+class SurfaceAnchor(BaseModel):
+    """An immutable point in the calibrated surface coordinate system."""
+
+    model_config = ConfigDict(extra='forbid', frozen=True, strict=True)
+
+    type: Literal['surface']
+    x: float
+    y: float
+    unit: PhysicalUnit
+
+    @model_validator(mode='before')
+    @classmethod
+    def normalise_units(cls: type['SurfaceAnchor'], value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        data = dict(value)
+        unit = data.get('unit')
+        if isinstance(unit, str) and unit in PHYSICAL_UNITS and unit != 'mm':
+            multiplier = _get_unit_to_mm()[unit]
+            for coordinate_name in ('x', 'y'):
+                coordinate = data.get(coordinate_name)
+                if is_finite_real(coordinate):
+                    data[coordinate_name] = float(coordinate) * multiplier
+            data['unit'] = 'mm'
+        return data
+
+    @field_validator('x', 'y', mode='before')
+    @classmethod
+    def validate_coordinate(cls: type['SurfaceAnchor'], value: Any) -> float:
+        if not is_finite_real(value):
+            raise ValueError('Surface anchor coordinates must be finite numbers')
+        return float(value)
+
+
+class ProjectorAnchor(BaseModel):
+    """An immutable point in projector-native pixels."""
+
+    model_config = ConfigDict(extra='forbid', frozen=True, strict=True)
+
+    type: Literal['projector']
+    x: float
+    y: float
+    unit: Literal['px']
+
+    @field_validator('x', 'y', mode='before')
+    @classmethod
+    def validate_coordinate(cls: type['ProjectorAnchor'], value: Any) -> float:
+        if not is_finite_real(value):
+            raise ValueError('Projector anchor coordinates must be finite numbers')
+        return float(value)
+
+
+class LocalOffset(BaseModel):
+    """A finite metric offset expressed in the marker-local surface frame."""
+
+    model_config = ConfigDict(extra='forbid', frozen=True, strict=True)
+
+    x: float
+    y: float
+    unit: PhysicalUnit
+
+    @model_validator(mode='before')
+    @classmethod
+    def normalise_units(cls: type['LocalOffset'], value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        data = dict(value)
+        unit = data.get('unit')
+        if isinstance(unit, str) and unit in PHYSICAL_UNITS and unit != 'mm':
+            multiplier = _get_unit_to_mm()[unit]
+            for coordinate_name in ('x', 'y'):
+                coordinate = data.get(coordinate_name)
+                if is_finite_real(coordinate):
+                    data[coordinate_name] = float(coordinate) * multiplier
+            data['unit'] = 'mm'
+        return data
+
+    @field_validator('x', 'y', mode='before')
+    @classmethod
+    def validate_coordinate(cls: type['LocalOffset'], value: Any) -> float:
+        if not is_finite_real(value):
+            raise ValueError('Local offsets must be finite numbers')
+        return float(value)
+
+
+class FiducialAnchor(BaseModel):
+    """An immutable namespace-qualified marker anchor."""
+
+    model_config = ConfigDict(extra='forbid', frozen=True, strict=True)
+
+    type: Literal['fiducial']
+    group: str
+    id: int
+    local_offset: LocalOffset | None = None
+    follow_rotation: bool = False
+
+    @field_validator('group')
+    @classmethod
+    def validate_group(cls: type['FiducialAnchor'], value: str) -> str:
+        if len(value.strip()) == 0:
+            raise ValueError('Fiducial anchor groups must be non-empty')
+        return value
+
+    @field_validator('id', mode='before')
+    @classmethod
+    def validate_marker_id(cls: type['FiducialAnchor'], value: Any) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError('Fiducial anchor ids must be non-negative integers')
+        return value
+
+    @model_validator(mode='after')
+    def validate_rotation_flag(self) -> 'FiducialAnchor':
+        if not isinstance(self.follow_rotation, bool):
+            raise ValueError('follow_rotation must be boolean')
+        return self
+
+
+Anchor: TypeAlias = Annotated[
+    SurfaceAnchor | ProjectorAnchor | FiducialAnchor,
+    Field(discriminator='type'),
+]
+AnchorReference: TypeAlias = Anchor | PointReference
 
 
 class Quantity(BaseModel):
@@ -407,7 +535,7 @@ class OverlayRequest(BaseModel):
 
 class GridRequest(OverlayRequest):
     kind: Literal['grid'] = 'grid'
-    origin: PointReference
+    origin: AnchorReference
     geometry_space: Literal['projector_px', 'surface_mm']
     spacing: Quantity
     extent: OverlayExtent
@@ -455,7 +583,7 @@ class ProjectorCoverageGridRequest(OverlayRequest):
 
 class CircleRequest(OverlayRequest):
     kind: Literal['circle'] = 'circle'
-    centre: PointReference
+    centre: AnchorReference
     geometry_space: Literal['projector_px', 'surface_mm']
     radius: Quantity
 
@@ -467,7 +595,7 @@ class CircleRequest(OverlayRequest):
 
 class RectRequest(OverlayRequest):
     kind: Literal['rect'] = 'rect'
-    centre: PointReference
+    centre: AnchorReference
     geometry_space: Literal['projector_px', 'surface_mm']
     width: Quantity
     height: Quantity
@@ -509,7 +637,7 @@ class RectRequest(OverlayRequest):
 
 class TextRequest(OverlayRequest):
     kind: Literal['text'] = 'text'
-    position: PointReference
+    position: AnchorReference
     text: str
     angle_deg: float = 0.0
     scale: float = 1.0
@@ -545,8 +673,8 @@ class TextRequest(OverlayRequest):
 
 class LineRequest(OverlayRequest):
     kind: Literal['line'] = 'line'
-    start: PointReference
-    end: PointReference
+    start: AnchorReference
+    end: AnchorReference
     label: str | None = None
 
     @field_validator('label')
@@ -566,8 +694,8 @@ class LineRequest(OverlayRequest):
 
 class RulerRequest(OverlayRequest):
     kind: Literal['ruler'] = 'ruler'
-    start: PointReference
-    end: PointReference
+    start: AnchorReference
+    end: AnchorReference
     measurement_space: Literal['projector_px', 'surface_mm']
     unit: OverlayUnit
     label: str | None = None
@@ -592,6 +720,38 @@ class RulerRequest(OverlayRequest):
         return self
 
 
+MAX_ARROW_HEAD_DIMENSION = 10_000.0
+
+
+class ArrowRequest(OverlayRequest):
+    """A declarative arrow whose endpoints may resolve independently."""
+
+    kind: Literal['arrow'] = 'arrow'
+    start: AnchorReference
+    end: AnchorReference
+    geometry_space: Literal['projector_px', 'surface_mm']
+    head_length: Quantity
+    head_width: Quantity
+    label: str | None = None
+
+    @field_validator('label')
+    @classmethod
+    def validate_label(cls: type['ArrowRequest'], value: str | None) -> str | None:
+        return _validate_overlay_label(value)
+
+    @model_validator(mode='after')
+    def validate_arrow(self) -> 'ArrowRequest':
+        self.head_length.validate_for_space(self.geometry_space).require_positive()
+        self.head_width.validate_for_space(self.geometry_space).require_positive()
+        for quantity, field_name in (
+            (self.head_length, 'head_length'),
+            (self.head_width, 'head_width'),
+        ):
+            if quantity.value > MAX_ARROW_HEAD_DIMENSION:
+                raise ValueError(f'{field_name} exceeds the bounded arrow dimension')
+        return self
+
+
 AnyOverlayRequest: TypeAlias = (
     GridRequest
     | CircleRequest
@@ -599,6 +759,7 @@ AnyOverlayRequest: TypeAlias = (
     | TextRequest
     | LineRequest
     | RulerRequest
+    | ArrowRequest
 )
 _OVERLAY_REQUEST_TYPES = (
     GridRequest,
@@ -607,6 +768,7 @@ _OVERLAY_REQUEST_TYPES = (
     TextRequest,
     LineRequest,
     RulerRequest,
+    ArrowRequest,
 )
 
 
@@ -684,6 +846,19 @@ class RulerGeometry(NamedTuple):
     unit: str
     length: float
     length_mm: float | None
+    label: str | None
+    style: OverlayStyle
+
+
+class ArrowGeometry(NamedTuple):
+    """An arrow retained in its declared source coordinate space."""
+
+    start: Point2D
+    end: Point2D
+    head: tuple[Point2D, Point2D, Point2D]
+    head_length: float
+    head_width: float
+    geometry_space: str
     label: str | None
     style: OverlayStyle
 
@@ -947,14 +1122,14 @@ def _validate_projector_materialisation(
 
 def get_overlay_point_references(
     request: AnyOverlayRequest,
-) -> tuple[PointReference, ...]:
-    if isinstance(request, GridRequest):
+) -> tuple[AnchorReference, ...]:
+    if isinstance(request, (GridRequest,)):
         return (request.origin,)
     if isinstance(request, (CircleRequest, RectRequest)):
         return (request.centre,)
     if isinstance(request, TextRequest):
         return (request.position,)
-    if isinstance(request, (LineRequest, RulerRequest)):
+    if isinstance(request, (LineRequest, RulerRequest, ArrowRequest)):
         return (request.start, request.end)
     raise ValueError('request must be an overlay request')
 
@@ -963,11 +1138,31 @@ def get_overlay_dependencies(
     request: AnyOverlayRequest,
 ) -> tuple[tuple[str, ...], bool]:
     point_references = get_overlay_point_references(request)
-    metric_dependency = any(
-        point_reference.space == PointReferenceSpace.SURFACE_MM.value
-        for point_reference in point_references
-    )
-    if isinstance(request, (GridRequest, CircleRequest, RectRequest)):
+    metric_dependency = False
+    camera_dependencies: list[str] = []
+    for point_reference in point_references:
+        if isinstance(point_reference, PointReference):
+            metric_dependency = metric_dependency or (
+                point_reference.space == PointReferenceSpace.SURFACE_MM.value
+            )
+            camera_id = point_reference.camera
+            if (
+                point_reference.space == PointReferenceSpace.CAMERA_PX.value
+                and camera_id is not None
+                and camera_id not in camera_dependencies
+            ):
+                camera_dependencies.append(camera_id)
+            continue
+        if isinstance(point_reference, SurfaceAnchor):
+            metric_dependency = True
+            continue
+        if isinstance(point_reference, FiducialAnchor):
+            metric_dependency = metric_dependency or (
+                point_reference.local_offset is not None
+                or point_reference.follow_rotation
+            )
+
+    if isinstance(request, (GridRequest, CircleRequest, RectRequest, ArrowRequest)):
         metric_dependency = metric_dependency or (
             request.geometry_space == GeometrySpace.SURFACE_MM.value
         )
@@ -975,16 +1170,6 @@ def get_overlay_dependencies(
         metric_dependency = metric_dependency or (
             request.measurement_space == GeometrySpace.SURFACE_MM.value
         )
-
-    camera_dependencies: list[str] = []
-    for point_reference in point_references:
-        camera_id = point_reference.camera
-        if (
-            point_reference.space == PointReferenceSpace.CAMERA_PX.value
-            and camera_id is not None
-            and camera_id not in camera_dependencies
-        ):
-            camera_dependencies.append(camera_id)
     return tuple(camera_dependencies), metric_dependency
 
 
@@ -996,6 +1181,214 @@ def _validate_projector_output_descriptor(value: object) -> None:
         raise ValueError('projector_output_descriptor is invalid')
     if not is_valid_resolution(value.projector_resolution):
         raise ValueError('projector_output_descriptor is invalid')
+
+
+class AnchorResolution(NamedTuple):
+    """One resolved point and optional marker orientation in source space."""
+
+    position: Point2D
+    orientation_degrees: float = 0.0
+
+
+ResolvedAnchor = AnchorResolution
+
+
+def resolve_anchor(
+    anchor: AnchorReference,
+    geometry_space: GeometrySpace | str,
+    spatial_state: object | None = None,
+    camera_to_projector: object | None = None,
+    metric_calibration: object | None = None,
+) -> AnchorResolution:
+    """Resolve one fixed or namespaced marker anchor without changing it."""
+    # Accepting the state before the space keeps this helper convenient for
+    # callers that naturally start with the changing authority.
+    if not isinstance(geometry_space, (GeometrySpace, str)) and isinstance(
+        spatial_state,
+        (GeometrySpace, str),
+    ):
+        geometry_space, spatial_state = spatial_state, geometry_space
+    target_space = _normalise_geometry_space(geometry_space)
+    authority = metric_calibration
+    if authority is None:
+        authority = getattr(spatial_state, 'metric_calibration', None)
+    if isinstance(anchor, PointReference):
+        return AnchorResolution(
+            resolve_point_reference(
+                anchor,
+                target_space,
+                camera_to_projector,
+                authority,
+            ),
+        )
+    if not isinstance(anchor, (SurfaceAnchor, ProjectorAnchor, FiducialAnchor)):
+        raise ValueError('anchor must be a valid anchor or point reference')
+
+    if isinstance(anchor, SurfaceAnchor):
+        position = Point2D(anchor.x, anchor.y)
+        if target_space == GeometrySpace.PROJECTOR_PX.value:
+            position = _project_surface_point_to_projector(
+                position,
+                authority,
+            )
+        return AnchorResolution(position)
+
+    if isinstance(anchor, ProjectorAnchor):
+        position = Point2D(anchor.x, anchor.y)
+        if target_space == GeometrySpace.SURFACE_MM.value:
+            position = _project_projector_point_to_surface(
+                position,
+                authority,
+            )
+        return AnchorResolution(position)
+
+    observation = _find_spatial_observation(spatial_state, anchor.group, anchor.id)
+    if observation is None:
+        raise ValueError(
+            f'Fiducial anchor {anchor.group!r}/{anchor.id} is unresolved',
+        )
+    requires_metric = anchor.local_offset is not None or anchor.follow_rotation
+    if requires_metric and authority is None:
+        raise ValueError('Marker-local anchors require usable metric calibration')
+    if requires_metric:
+        _require_metric_authority(authority)
+
+    surface_geometry = getattr(observation, 'surface', None)
+    projector_geometry = getattr(observation, 'projector', None)
+    if surface_geometry is not None:
+        _validate_fiducial_geometry(surface_geometry)
+    if projector_geometry is not None:
+        _validate_fiducial_geometry(projector_geometry)
+
+    if anchor.local_offset is not None and surface_geometry is None:
+        if authority is None or projector_geometry is None:
+            raise ValueError('Marker-local offsets require surface geometry')
+        surface_geometry = _project_marker_geometry(
+            projector_geometry,
+            authority,
+            'projector_to_surface',
+        )
+
+    if target_space == GeometrySpace.SURFACE_MM.value:
+        if surface_geometry is None:
+            if authority is None or projector_geometry is None:
+                raise ValueError('Fiducial has no usable surface geometry')
+            surface_geometry = _project_marker_geometry(
+                projector_geometry,
+                authority,
+                'projector_to_surface',
+            )
+        marker_position = surface_geometry.centre
+        marker_orientation = surface_geometry.orientation_degrees
+    else:
+        if projector_geometry is None:
+            if authority is None or surface_geometry is None:
+                raise ValueError('Fiducial has no usable projector geometry')
+            projector_geometry = _project_marker_geometry(
+                surface_geometry,
+                authority,
+                'surface_to_projector',
+            )
+        marker_position = projector_geometry.centre
+        marker_orientation = projector_geometry.orientation_degrees
+
+    if anchor.local_offset is not None:
+        assert surface_geometry is not None
+        offset = _rotate_marker_local_offset(
+            anchor.local_offset.x,
+            anchor.local_offset.y,
+            surface_geometry.orientation_degrees,
+        )
+        surface_position = Point2D(
+            surface_geometry.centre.x + offset.x,
+            surface_geometry.centre.y + offset.y,
+        )
+        marker_position = (
+            surface_position
+            if target_space == GeometrySpace.SURFACE_MM.value
+            else _project_surface_point_to_projector(surface_position, authority)
+        )
+        if target_space == GeometrySpace.SURFACE_MM.value:
+            marker_orientation = surface_geometry.orientation_degrees
+
+    if not anchor.follow_rotation:
+        marker_orientation = 0.0
+    _validate_finite_geometry_point(marker_position)
+    if not is_finite_real(marker_orientation):
+        raise ValueError('Fiducial orientation must be finite')
+    return AnchorResolution(marker_position, marker_orientation)
+
+
+def _find_spatial_observation(
+    spatial_state: object | None,
+    group: str,
+    marker_id: int,
+) -> object | None:
+    if spatial_state is None:
+        return None
+    get_observation = getattr(spatial_state, 'get_observation', None)
+    if callable(get_observation):
+        return get_observation(group, marker_id)
+    observations = getattr(spatial_state, 'selected_observations', None)
+    if observations is None:
+        observations = getattr(spatial_state, 'observations', spatial_state)
+    if isinstance(observations, Mapping):
+        return observations.get((group, marker_id))
+    return None
+
+
+def _validate_fiducial_geometry(geometry: object) -> None:
+    if not isinstance(geometry, TagGeometry):
+        raise ValueError('Fiducial geometry must be TagGeometry')
+    try:
+        validate_planar_corners(geometry.corners)
+    except (TypeError, ValueError, OverflowError) as ex:
+        raise ValueError('Fiducial geometry must be a valid quadrilateral') from ex
+    _validate_finite_geometry_point(geometry.centre)
+    if (
+        not is_finite_real(geometry.orientation_degrees)
+        or not is_finite_real(geometry.area_px)
+        or geometry.area_px <= 0
+    ):
+        raise ValueError('Fiducial geometry must be finite and usable')
+
+
+def _require_metric_authority(metric_calibration: object) -> None:
+    for direction in ('projector_to_surface', 'surface_to_projector'):
+        try:
+            _get_metric_matrix(metric_calibration, direction)
+        except ValueError:
+            continue
+        return
+    raise ValueError('Metric calibration is not usable')
+
+
+def _project_marker_geometry(
+    geometry: TagGeometry,
+    metric_calibration: object,
+    direction: str,
+) -> TagGeometry:
+    matrix = _get_metric_matrix(metric_calibration, direction)
+    try:
+        return project_tag_geometry(geometry, matrix)
+    except (TypeError, ValueError) as ex:
+        raise ValueError('Fiducial geometry cannot be projected safely') from ex
+
+
+def _rotate_marker_local_offset(
+    x_offset: float,
+    y_offset: float,
+    orientation_degrees: float,
+) -> Point2D:
+    angle_radians = math.radians(orientation_degrees)
+    cosine = math.cos(angle_radians)
+    sine = math.sin(angle_radians)
+    result = Point2D(
+        cosine * x_offset - sine * y_offset,
+        sine * x_offset + cosine * y_offset,
+    )
+    _validate_finite_geometry_point(result)
+    return result
 
 
 def resolve_point_reference(
@@ -1039,20 +1432,47 @@ def resolve_point_reference(
     )
 
 
+def _resolve_overlay_reference(
+    reference: AnchorReference,
+    geometry_space: GeometrySpace | str,
+    spatial_state: object | None,
+    camera_to_projector: object | None,
+    metric_calibration: object | None,
+) -> AnchorResolution:
+    if isinstance(reference, PointReference):
+        return AnchorResolution(
+            resolve_point_reference(
+                reference,
+                geometry_space,
+                camera_to_projector,
+                metric_calibration,
+            ),
+        )
+    return resolve_anchor(
+        reference,
+        geometry_space,
+        spatial_state,
+        camera_to_projector,
+        metric_calibration,
+    )
+
+
 def build_circle(
     request: CircleRequest,
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
+    spatial_state: object | None = None,
 ) -> CircleGeometry:
     """Build a finite circle after converting its anchor to its source space."""
     if not isinstance(request, CircleRequest):
         raise ValueError('request must be a CircleRequest')
-    centre = resolve_point_reference(
+    centre = _resolve_overlay_reference(
         request.centre,
         request.geometry_space,
+        spatial_state,
         camera_to_projector,
         metric_calibration,
-    )
+    ).position
     radius = request.radius.value
     return CircleGeometry(centre, radius, request.geometry_space, request.style)
 
@@ -1061,16 +1481,20 @@ def build_rotated_rect(
     request: RectRequest,
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
+    spatial_state: object | None = None,
 ) -> RectGeometry:
     """Build four rotated corners in the requested source space."""
     if not isinstance(request, RectRequest):
         raise ValueError('request must be a RectRequest')
-    centre = resolve_point_reference(
+    resolved_centre = _resolve_overlay_reference(
         request.centre,
         request.geometry_space,
+        spatial_state,
         camera_to_projector,
         metric_calibration,
     )
+    centre = resolved_centre.position
+    angle_deg = request.angle_deg + resolved_centre.orientation_degrees
     width = request.width.value
     height = request.height.value
     half_width = width / 2.0
@@ -1080,7 +1504,7 @@ def build_rotated_rect(
             centre,
             x_offset,
             y_offset,
-            request.angle_deg,
+            angle_deg,
         )
         for x_offset, y_offset in (
             (-half_width, -half_height),
@@ -1096,7 +1520,7 @@ def build_rotated_rect(
         corners,
         width,
         height,
-        request.angle_deg,
+        angle_deg,
         request.geometry_space,
         request.style,
     )
@@ -1106,20 +1530,22 @@ def build_text(
     request: TextRequest,
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
+    spatial_state: object | None = None,
 ) -> TextGeometry:
     """Resolve one floating text anchor to projector-native coordinates."""
     if not isinstance(request, TextRequest):
         raise ValueError('request must be a TextRequest')
-    position = resolve_point_reference(
+    resolved_position = _resolve_overlay_reference(
         request.position,
         GeometrySpace.PROJECTOR_PX,
+        spatial_state,
         camera_to_projector,
         metric_calibration,
     )
     return TextGeometry(
-        position,
+        resolved_position.position,
         request.text,
-        request.angle_deg,
+        request.angle_deg + resolved_position.orientation_degrees,
         request.scale,
         request.style,
     )
@@ -1172,16 +1598,20 @@ def build_grid(
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
     overlay_configuration: OverlayConfiguration | None = None,
+    spatial_state: object | None = None,
 ) -> GridGeometry:
     """Build a finite square grid with exact source-space spacing."""
     if not isinstance(request, GridRequest):
         raise ValueError('request must be a GridRequest')
-    origin = resolve_point_reference(
+    resolved_origin = _resolve_overlay_reference(
         request.origin,
         request.geometry_space,
+        spatial_state,
         camera_to_projector,
         metric_calibration,
     )
+    origin = resolved_origin.position
+    angle_deg = request.angle_deg + resolved_origin.orientation_degrees
     spacing = request.spacing.value
     width = request.extent.width.value
     height = request.extent.height.value
@@ -1202,15 +1632,15 @@ def build_grid(
 
     vertical_segments = tuple(
         SourceSegment(
-            _rotate_source_offset(origin, x_idx * spacing, 0.0, request.angle_deg),
-            _rotate_source_offset(origin, x_idx * spacing, height, request.angle_deg),
+            _rotate_source_offset(origin, x_idx * spacing, 0.0, angle_deg),
+            _rotate_source_offset(origin, x_idx * spacing, height, angle_deg),
         )
         for x_idx in range(vertical_count)
     )
     horizontal_segments = tuple(
         SourceSegment(
-            _rotate_source_offset(origin, 0.0, y_idx * spacing, request.angle_deg),
-            _rotate_source_offset(origin, width, y_idx * spacing, request.angle_deg),
+            _rotate_source_offset(origin, 0.0, y_idx * spacing, angle_deg),
+            _rotate_source_offset(origin, width, y_idx * spacing, angle_deg),
         )
         for y_idx in range(horizontal_count)
     )
@@ -1222,7 +1652,7 @@ def build_grid(
         spacing,
         width,
         height,
-        request.angle_deg,
+        angle_deg,
         request.geometry_space,
         vertical_segments,
         horizontal_segments,
@@ -1234,45 +1664,115 @@ def build_line(
     request: LineRequest,
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
+    spatial_state: object | None = None,
 ) -> LineGeometry:
     """Build a literal projector-native line from independently resolved endpoints."""
     if not isinstance(request, LineRequest):
         raise ValueError('request must be a LineRequest')
-    start = resolve_point_reference(
+    start = _resolve_overlay_reference(
         request.start,
         GeometrySpace.PROJECTOR_PX,
+        spatial_state,
         camera_to_projector,
         metric_calibration,
-    )
-    end = resolve_point_reference(
+    ).position
+    end = _resolve_overlay_reference(
         request.end,
         GeometrySpace.PROJECTOR_PX,
+        spatial_state,
         camera_to_projector,
         metric_calibration,
-    )
+    ).position
     return LineGeometry(start, end, request.label, request.style)
+
+
+def build_arrow(
+    request: ArrowRequest,
+    camera_to_projector: object | None = None,
+    metric_calibration: object | None = None,
+    spatial_state: object | None = None,
+) -> ArrowGeometry:
+    """Build one deterministic shaft and triangle head in source space."""
+    if not isinstance(request, ArrowRequest):
+        raise ValueError('request must be an ArrowRequest')
+    start = _resolve_overlay_reference(
+        request.start,
+        request.geometry_space,
+        spatial_state,
+        camera_to_projector,
+        metric_calibration,
+    ).position
+    end = _resolve_overlay_reference(
+        request.end,
+        request.geometry_space,
+        spatial_state,
+        camera_to_projector,
+        metric_calibration,
+    ).position
+    difference_x = end.x - start.x
+    difference_y = end.y - start.y
+    length = math.hypot(difference_x, difference_y)
+    if not math.isfinite(length) or length == 0:
+        raise ValueError('Arrow endpoints must be distinct and finite')
+    direction_x = difference_x / length
+    direction_y = difference_y / length
+    head_length = request.head_length.value
+    head_width = request.head_width.value
+    base = Point2D(
+        end.x - direction_x * head_length,
+        end.y - direction_y * head_length,
+    )
+    perpendicular = Point2D(-direction_y, direction_x)
+    head = (
+        end,
+        Point2D(
+            base.x + perpendicular.x * head_width / 2.0,
+            base.y + perpendicular.y * head_width / 2.0,
+        ),
+        Point2D(
+            base.x - perpendicular.x * head_width / 2.0,
+            base.y - perpendicular.y * head_width / 2.0,
+        ),
+    )
+    _validate_finite_geometry_point(start)
+    _validate_finite_geometry_point(end)
+    for point in head:
+        _validate_finite_geometry_point(point)
+    return ArrowGeometry(
+        start,
+        end,
+        head,
+        head_length,
+        head_width,
+        request.geometry_space,
+        request.label,
+        request.style,
+    )
 
 
 def build_ruler(
     request: RulerRequest,
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
+    spatial_state: object | None = None,
 ) -> RulerGeometry:
     """Build a ruler in projector pixels or canonical surface millimetres."""
     if not isinstance(request, RulerRequest):
         raise ValueError('request must be a RulerRequest')
-    start = resolve_point_reference(
+    start = _resolve_overlay_reference(
         request.start,
         request.measurement_space,
+        spatial_state,
         camera_to_projector,
         metric_calibration,
-    )
-    end = resolve_point_reference(
+    ).position
+    end = _resolve_overlay_reference(
         request.end,
         request.measurement_space,
+        spatial_state,
         camera_to_projector,
         metric_calibration,
-    )
+    ).position
     if request.measurement_space == GeometrySpace.SURFACE_MM.value:
         from multivision.metric import calculate_surface_distance_mm
 
@@ -1304,10 +1804,16 @@ def materialise_circle(
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
     overlay_configuration: OverlayConfiguration | None = None,
+    spatial_state: object | None = None,
 ) -> ProjectorMaterialisation:
     """Sample and clip one circle in projector-native coordinates."""
     geometry = (
-        build_circle(request_or_geometry, camera_to_projector, metric_calibration)
+        build_circle(
+            request_or_geometry,
+            camera_to_projector,
+            metric_calibration,
+            spatial_state,
+        )
         if isinstance(request_or_geometry, CircleRequest)
         else request_or_geometry
     )
@@ -1351,10 +1857,16 @@ def materialise_rect(
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
     overlay_configuration: OverlayConfiguration | None = None,
+    spatial_state: object | None = None,
 ) -> ProjectorMaterialisation:
     """Project and clip all four edges of a rotated rectangle."""
     geometry = (
-        build_rotated_rect(request_or_geometry, camera_to_projector, metric_calibration)
+        build_rotated_rect(
+            request_or_geometry,
+            camera_to_projector,
+            metric_calibration,
+            spatial_state,
+        )
         if isinstance(request_or_geometry, RectRequest)
         else request_or_geometry
     )
@@ -1419,10 +1931,16 @@ def materialise_text(
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
     overlay_configuration: OverlayConfiguration | None = None,
+    spatial_state: object | None = None,
 ) -> ProjectorMaterialisation:
     """Resolve one floating text label in projector-native coordinates."""
     geometry = (
-        build_text(request_or_geometry, camera_to_projector, metric_calibration)
+        build_text(
+            request_or_geometry,
+            camera_to_projector,
+            metric_calibration,
+            spatial_state,
+        )
         if isinstance(request_or_geometry, TextRequest)
         else request_or_geometry
     )
@@ -1459,6 +1977,7 @@ def materialise_grid(
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
     overlay_configuration: OverlayConfiguration | None = None,
+    spatial_state: object | None = None,
 ) -> ProjectorMaterialisation:
     """Project and independently clip a finite grid's source-space segments."""
     geometry = (
@@ -1467,6 +1986,7 @@ def materialise_grid(
             camera_to_projector,
             metric_calibration,
             overlay_configuration,
+            spatial_state,
         )
         if isinstance(request_or_geometry, GridRequest)
         else request_or_geometry
@@ -1502,10 +2022,16 @@ def materialise_line(
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
     overlay_configuration: OverlayConfiguration | None = None,
+    spatial_state: object | None = None,
 ) -> ProjectorMaterialisation:
     """Resolve, clip and optionally label a literal line segment."""
     geometry = (
-        build_line(request_or_geometry, camera_to_projector, metric_calibration)
+        build_line(
+            request_or_geometry,
+            camera_to_projector,
+            metric_calibration,
+            spatial_state,
+        )
         if isinstance(request_or_geometry, LineRequest)
         else request_or_geometry
     )
@@ -1531,16 +2057,102 @@ def materialise_line(
     return ProjectorMaterialisation(segments=segments, labels=labels)
 
 
+def materialise_arrow(
+    request_or_geometry: ArrowRequest | ArrowGeometry,
+    projector_resolution: Resolution | CoordinateBounds | Sequence[int],
+    camera_to_projector: object | None = None,
+    metric_calibration: object | None = None,
+    overlay_configuration: OverlayConfiguration | None = None,
+    spatial_state: object | None = None,
+) -> ProjectorMaterialisation:
+    """Project and clip one arrow shaft and its deterministic triangle head."""
+    geometry = (
+        build_arrow(
+            request_or_geometry,
+            camera_to_projector,
+            metric_calibration,
+            spatial_state,
+        )
+        if isinstance(request_or_geometry, ArrowRequest)
+        else request_or_geometry
+    )
+    if not isinstance(geometry, ArrowGeometry):
+        raise ValueError('request_or_geometry must be ArrowRequest or ArrowGeometry')
+    _validate_finite_geometry_point(geometry.start)
+    _validate_finite_geometry_point(geometry.end)
+    if len(geometry.head) != 3:
+        raise ValueError('Arrow heads must contain exactly three points')
+    for point in geometry.head:
+        _validate_finite_geometry_point(point)
+    for dimension, field_name in (
+        (geometry.head_length, 'head_length'),
+        (geometry.head_width, 'head_width'),
+    ):
+        if (
+            not is_finite_real(dimension)
+            or dimension <= 0
+            or dimension > MAX_ARROW_HEAD_DIMENSION
+        ):
+            raise ValueError(f'{field_name} must be positive and bounded')
+    source_length = math.hypot(
+        geometry.end.x - geometry.start.x,
+        geometry.end.y - geometry.start.y,
+    )
+    if not math.isfinite(source_length) or source_length == 0:
+        raise ValueError('Arrow endpoints must be distinct and finite')
+    bounds, limits = _normalise_materialisation_arguments(
+        projector_resolution,
+        overlay_configuration,
+    )
+    if 1 > limits.max_overlay_segments or 5 > limits.max_overlay_vertices:
+        raise ValueError('Arrow exceeds the configured primitive budget')
+    projector_start, projector_end = _project_source_points(
+        (geometry.start, geometry.end),
+        geometry.geometry_space,
+        metric_calibration,
+    )
+    projector_head = _project_source_points(
+        geometry.head,
+        geometry.geometry_space,
+        metric_calibration,
+    )
+    shaft = _clip_projector_segment(
+        projector_start,
+        projector_end,
+        bounds,
+        geometry.style,
+    )
+    polygon = _clip_projector_polygon(projector_head, bounds, geometry.style)
+    segments = () if shaft is None else (shaft,)
+    polygons = () if polygon is None else (polygon,)
+    labels = _materialise_optional_label(
+        geometry.label,
+        projector_start,
+        projector_end,
+        segments,
+        bounds,
+        geometry.style,
+        limits,
+    )
+    return ProjectorMaterialisation(segments, polygons, labels)
+
+
 def materialise_ruler(
     request_or_geometry: RulerRequest | RulerGeometry,
     projector_resolution: Resolution | CoordinateBounds | Sequence[int],
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
     overlay_configuration: OverlayConfiguration | None = None,
+    spatial_state: object | None = None,
 ) -> ProjectorMaterialisation:
     """Build physical or projector-pixel ticks, then clip every segment."""
     geometry = (
-        build_ruler(request_or_geometry, camera_to_projector, metric_calibration)
+        build_ruler(
+            request_or_geometry,
+            camera_to_projector,
+            metric_calibration,
+            spatial_state,
+        )
         if isinstance(request_or_geometry, RulerRequest)
         else request_or_geometry
     )
@@ -1602,6 +2214,7 @@ def materialise_overlay(
     camera_to_projector: object | None = None,
     metric_calibration: object | None = None,
     overlay_configuration: OverlayConfiguration | None = None,
+    spatial_state: object | None = None,
 ) -> ProjectorMaterialisation:
     """Materialise one validated request through the appropriate pure builder."""
     if not isinstance(request, _OVERLAY_REQUEST_TYPES):
@@ -1613,6 +2226,7 @@ def materialise_overlay(
         'text': materialise_text,
         'line': materialise_line,
         'ruler': materialise_ruler,
+        'arrow': materialise_arrow,
     }[request.kind]
     return materialise(
         request,
@@ -1620,6 +2234,7 @@ def materialise_overlay(
         camera_to_projector,
         metric_calibration,
         overlay_configuration,
+        spatial_state,
     )
 
 
@@ -2030,7 +2645,10 @@ def _get_metric_matrix(metric_calibration: object | None, direction: str) -> Mat
     if metric_calibration is None:
         raise ValueError('A usable metric calibration is required')
     is_usable = getattr(metric_calibration, 'is_usable', None)
-    if callable(is_usable) and is_usable() is not True:
+    if callable(is_usable):
+        if is_usable() is not True:
+            raise ValueError('Metric calibration is not usable')
+    elif is_usable is not None and is_usable is not True:
         raise ValueError('Metric calibration is not usable')
 
     get_record = getattr(metric_calibration, 'get_record', None)
@@ -2094,6 +2712,12 @@ def _validate_finite_geometry_point(point: Point2D) -> None:
 __all__ = [
     'ANGLE_CONVENTION',
     'AnyOverlayRequest',
+    'Anchor',
+    'AnchorReference',
+    'AnchorResolution',
+    'ArrowGeometry',
+    'ArrowRequest',
+    'MAX_ARROW_HEAD_DIMENSION',
     'MAX_OVERLAY_LABEL_SCALE',
     'MIN_OVERLAY_LABEL_SCALE',
     'CircleRequest',
@@ -2108,13 +2732,17 @@ __all__ = [
     'PhysicalUnit',
     'PointReference',
     'PointReferenceSpace',
+    'ProjectorAnchor',
     'PointSpace',
     'Quantity',
     'RectRequest',
     'RulerRequest',
+    'ResolvedAnchor',
+    'SurfaceAnchor',
     'TextRequest',
     'PHYSICAL_UNITS',
     'CircleGeometry',
+    'FiducialAnchor',
     'GridGeometry',
     'ProjectorCoverageGridRequest',
     'LineGeometry',
@@ -2138,6 +2766,8 @@ __all__ = [
     'build_rotated_rect',
     'build_ruler',
     'build_text',
+    'build_arrow',
+    'materialise_arrow',
     'materialise_circle',
     'materialise_grid',
     'materialise_line',
@@ -2145,5 +2775,7 @@ __all__ = [
     'materialise_rect',
     'materialise_ruler',
     'materialise_text',
+    'resolve_anchor',
     'resolve_point_reference',
+    'LocalOffset',
 ]

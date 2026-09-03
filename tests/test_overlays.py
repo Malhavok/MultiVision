@@ -9,11 +9,15 @@ from multivision.errors import ConfigurationError
 from multivision.geometry import (
     CoordinateBounds,
     Point2D,
+    TagGeometry,
+    build_tag_geometry,
     invert_homography,
     project_point,
 )
 from multivision.overlays import (
+    ArrowRequest,
     CircleRequest,
+    FiducialAnchor,
     GridRequest,
     LineRequest,
     ProjectorCoverageGridRequest,
@@ -26,19 +30,25 @@ from multivision.overlays import (
     RectRequest,
     RulerRequest,
     TextRequest,
+    build_arrow,
     build_circle,
     build_grid,
     build_line,
     build_projector_coverage_grid_request,
     build_rotated_rect,
     build_ruler,
+    build_text,
+    materialise_arrow,
     materialise_circle,
     materialise_grid,
     materialise_line,
     materialise_rect,
     materialise_ruler,
     materialise_text,
+    resolve_anchor,
     resolve_point_reference,
+    SurfaceAnchor,
+    ProjectorAnchor,
 )
 from multivision.types import Resolution
 
@@ -120,6 +130,272 @@ def test_point_reference_requires_explicit_camera_identity() -> None:
             y=2,
             camera='camera-1',
         )
+
+
+def test_anchor_models_are_explicit_strict_and_immutable() -> None:
+    surface_anchor = SurfaceAnchor(type='surface', x=2, y=3, unit='cm')
+    assert surface_anchor == SurfaceAnchor(
+        type='surface',
+        x=20,
+        y=30,
+        unit='mm',
+    ), f'{surface_anchor=}'
+    assert surface_anchor.unit == 'mm', f'{surface_anchor=}'
+
+    with pytest.raises(ValidationError):
+        SurfaceAnchor(x=1, y=2, unit='mm')  # type: ignore[call-arg]
+    with pytest.raises(ValidationError):
+        FiducialAnchor(type='fiducial', group='cards', id=True)
+    with pytest.raises(ValidationError):
+        FiducialAnchor(
+            type='fiducial',
+            group='cards',
+            id=3,
+            local_offset={'x': 1, 'y': 2, 'unit': 'mm', 'extra': True},
+        )
+    with pytest.raises(ValidationError):
+        ProjectorAnchor(type='projector', x=float('nan'), y=2, unit='px')
+
+    with pytest.raises(ValidationError):
+        surface_anchor.x = 4  # type: ignore[misc]
+
+
+def _anchor_spatial_state() -> SimpleNamespace:
+    identity = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+    metric_calibration = SimpleNamespace(
+        state='CALIBRATED',
+        projector_to_surface=identity,
+        surface_to_projector=identity,
+    )
+    cards_geometry = build_tag_geometry(
+        ((0, 0), (0, 10), (10, 10), (10, 0)),
+    )
+    tokens_geometry = build_tag_geometry(
+        ((20, 0), (20, 10), (30, 10), (30, 0)),
+    )
+    return SimpleNamespace(
+        metric_calibration=metric_calibration,
+        selected_observations={
+            ('cards', 7): SimpleNamespace(
+                projector=cards_geometry,
+                surface=cards_geometry,
+            ),
+            ('tokens', 7): SimpleNamespace(
+                projector=tokens_geometry,
+                surface=tokens_geometry,
+            ),
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ['start', 'end'],
+    [
+        (
+            {'type': 'surface', 'x': 20, 'y': 20, 'unit': 'mm'},
+            {'type': 'surface', 'x': 30, 'y': 20, 'unit': 'mm'},
+        ),
+        (
+            {'type': 'surface', 'x': 20, 'y': 20, 'unit': 'mm'},
+            {'type': 'projector', 'x': 70, 'y': 40, 'unit': 'px'},
+        ),
+        (
+            {'type': 'surface', 'x': 20, 'y': 20, 'unit': 'mm'},
+            {'type': 'fiducial', 'group': 'tokens', 'id': 7},
+        ),
+        (
+            {'type': 'projector', 'x': 40, 'y': 20, 'unit': 'px'},
+            {'type': 'surface', 'x': 30, 'y': 20, 'unit': 'mm'},
+        ),
+        (
+            {'type': 'projector', 'x': 40, 'y': 20, 'unit': 'px'},
+            {'type': 'projector', 'x': 70, 'y': 40, 'unit': 'px'},
+        ),
+        (
+            {'type': 'projector', 'x': 40, 'y': 20, 'unit': 'px'},
+            {'type': 'fiducial', 'group': 'tokens', 'id': 7},
+        ),
+        (
+            {'type': 'fiducial', 'group': 'cards', 'id': 7},
+            {'type': 'surface', 'x': 30, 'y': 20, 'unit': 'mm'},
+        ),
+        (
+            {'type': 'fiducial', 'group': 'cards', 'id': 7},
+            {'type': 'projector', 'x': 70, 'y': 40, 'unit': 'px'},
+        ),
+        (
+            {'type': 'fiducial', 'group': 'cards', 'id': 7},
+            {'type': 'fiducial', 'group': 'tokens', 'id': 7},
+        ),
+    ],
+)
+def test_arrow_resolves_independent_anchor_pairs(
+    start: dict[str, object],
+    end: dict[str, object],
+) -> None:
+    request = ArrowRequest(
+        start=start,
+        end=end,
+        geometry_space='projector_px',
+        head_length={'value': 5, 'unit': 'px'},
+        head_width={'value': 4, 'unit': 'px'},
+    )
+
+    geometry = build_arrow(request, spatial_state=_anchor_spatial_state())
+
+    assert geometry.start != geometry.end, f'{geometry=}'
+    assert len(geometry.head) == 3, f'{geometry=}'
+    assert request == request.model_copy(), f'{request=}'
+
+
+def test_marker_local_offset_rotates_in_surface_coordinates() -> None:
+    state = _anchor_spatial_state()
+    anchor = FiducialAnchor(
+        type='fiducial',
+        group='cards',
+        id=7,
+        local_offset={'x': 10, 'y': 0, 'unit': 'mm'},
+        follow_rotation=True,
+    )
+
+    resolved = resolve_anchor(anchor, 'surface_mm', state)
+
+    assert resolved.position.x == pytest.approx(5), f'{resolved=}'
+    assert resolved.position.y == pytest.approx(15), f'{resolved=}'
+    assert resolved.orientation_degrees == 90.0, f'{resolved=}'
+
+
+def test_dynamic_anchor_only_rotates_orientation_bearing_geometry() -> None:
+    state = _anchor_spatial_state()
+    anchor = {
+        'type': 'fiducial',
+        'group': 'cards',
+        'id': 7,
+        'follow_rotation': True,
+    }
+    rectangle = RectRequest(
+        centre=anchor,
+        geometry_space='surface_mm',
+        width={'value': 4, 'unit': 'mm'},
+        height={'value': 2, 'unit': 'mm'},
+        angle_deg=15,
+    )
+    grid = GridRequest(
+        origin=anchor,
+        geometry_space='surface_mm',
+        spacing={'value': 2, 'unit': 'mm'},
+        extent={
+            'width': {'value': 4, 'unit': 'mm'},
+            'height': {'value': 2, 'unit': 'mm'},
+        },
+        angle_deg=15,
+    )
+    circle = CircleRequest(
+        centre=anchor,
+        geometry_space='surface_mm',
+        radius={'value': 2, 'unit': 'mm'},
+    )
+    text = TextRequest(position=anchor, text='marker', angle_deg=15)
+    requests = (rectangle, grid, circle, text)
+    before_resolution = tuple(request.model_dump() for request in requests)
+
+    rectangle_geometry = build_rotated_rect(rectangle, spatial_state=state)
+    grid_geometry = build_grid(grid, spatial_state=state)
+    circle_geometry = build_circle(circle, spatial_state=state)
+    text_geometry = build_text(text, spatial_state=state)
+
+    assert rectangle_geometry.angle_deg == 105.0, f'{rectangle_geometry=}'
+    assert grid_geometry.angle_deg == 105.0, f'{grid_geometry=}'
+    assert circle_geometry.centre == Point2D(5, 5), f'{circle_geometry=}'
+    assert text_geometry.angle_deg == 105.0, f'{text_geometry=}'
+    assert tuple(request.model_dump() for request in requests) == before_resolution
+
+
+def test_anchor_resolution_fails_closed_for_missing_and_expired_markers() -> None:
+    anchor = FiducialAnchor(type='fiducial', group='cards', id=7)
+    retained_state = _anchor_spatial_state()
+    unresolved_state = SimpleNamespace(
+        metric_calibration=retained_state.metric_calibration,
+        selected_observations={},
+    )
+
+    assert resolve_anchor(anchor, 'projector_px', retained_state).position == Point2D(5, 5)
+    with pytest.raises(ValueError, match='unresolved'):
+        resolve_anchor(anchor, 'projector_px', unresolved_state)
+
+
+def test_anchor_resolution_rejects_malformed_marker_quadrilaterals() -> None:
+    malformed_geometry = TagGeometry(
+        (Point2D(0, 0), Point2D(1, 0), Point2D(0, 1)),
+        Point2D(0, 0),
+        0.0,
+        1.0,
+    )
+    state = SimpleNamespace(
+        selected_observations={
+            ('cards', 7): SimpleNamespace(
+                projector=malformed_geometry,
+                surface=malformed_geometry,
+            ),
+        },
+    )
+
+    with pytest.raises(ValueError, match='quadrilateral'):
+        resolve_anchor(
+            FiducialAnchor(type='fiducial', group='cards', id=7),
+            'projector_px',
+            state,
+        )
+
+
+def test_anchor_units_and_arrow_failure_cases_are_explicit() -> None:
+    state = _anchor_spatial_state()
+    surface_anchor = SurfaceAnchor(type='surface', x=2, y=3, unit='cm')
+    projector_anchor = ProjectorAnchor(type='projector', x=20, y=30, unit='px')
+
+    assert resolve_anchor(surface_anchor, 'surface_mm', state).position == Point2D(20, 30)
+    assert resolve_anchor(surface_anchor, 'projector_px', state).position == Point2D(20, 30)
+    assert resolve_anchor(projector_anchor, 'projector_px', state).position == Point2D(20, 30)
+    assert resolve_anchor(projector_anchor, 'surface_mm', state).position == Point2D(20, 30)
+
+    zero_length = ArrowRequest(
+        start={'type': 'projector', 'x': 20, 'y': 20, 'unit': 'px'},
+        end={'type': 'projector', 'x': 20, 'y': 20, 'unit': 'px'},
+        geometry_space='projector_px',
+        head_length={'value': 5, 'unit': 'px'},
+        head_width={'value': 4, 'unit': 'px'},
+    )
+    with pytest.raises(ValueError, match='distinct'):
+        build_arrow(zero_length, spatial_state=state)
+    with pytest.raises(ValidationError):
+        ArrowRequest(
+            start={'type': 'projector', 'x': 0, 'y': 0, 'unit': 'px'},
+            end={'type': 'projector', 'x': 1, 'y': 1, 'unit': 'px'},
+            geometry_space='projector_px',
+            head_length={'value': float('nan'), 'unit': 'px'},
+            head_width={'value': 4, 'unit': 'px'},
+        )
+
+
+def test_arrow_materialisation_handles_arbitrary_direction_and_clipping() -> None:
+    request = ArrowRequest(
+        start={'type': 'projector', 'x': 80, 'y': 60, 'unit': 'px'},
+        end={'type': 'projector', 'x': 20, 'y': 20, 'unit': 'px'},
+        geometry_space='projector_px',
+        head_length={'value': 8, 'unit': 'px'},
+        head_width={'value': 6, 'unit': 'px'},
+    )
+
+    materialisation = materialise_arrow(request, Resolution(100, 80))
+
+    assert len(materialisation.segments) == 1, f'{materialisation=}'
+    assert len(materialisation.polygons) == 1, f'{materialisation=}'
+    assert all(
+        0 <= coordinate < limit
+        for polygon in materialisation.polygons
+        for point in polygon.points
+        for coordinate, limit in ((point.x, 100), (point.y, 80))
+    ), f'{materialisation=}'
 
 
 def test_quantities_and_geometry_spaces_must_agree() -> None:
@@ -591,11 +867,19 @@ def test_materialisation_rejects_source_geometry_crossing_projective_horizon() -
         measurement_space='surface_mm',
         unit='mm',
     )
+    arrow = ArrowRequest(
+        start={'type': 'surface', 'x': -2, 'y': 0, 'unit': 'mm'},
+        end={'type': 'surface', 'x': 2, 'y': 0, 'unit': 'mm'},
+        geometry_space='surface_mm',
+        head_length={'value': 1, 'unit': 'mm'},
+        head_width={'value': 1, 'unit': 'mm'},
+    )
 
     for materialise, request in (
         (materialise_rect, rectangle),
         (materialise_grid, grid),
         (materialise_ruler, ruler),
+        (materialise_arrow, arrow),
     ):
         with pytest.raises(ValueError, match='projective horizon'):
             materialise(

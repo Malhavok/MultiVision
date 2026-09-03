@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import math
 import threading
+import time
 from collections.abc import (
     Iterable,
     Mapping,
@@ -20,6 +21,7 @@ from typing import (
 
 from multivision.errors import (
     FiducialDetectionError,
+    FiducialGroupDetectionError,
     InvalidHomographyError,
 )
 from multivision.geometry import (
@@ -61,6 +63,115 @@ class PlanarTagObservation(NamedTuple):
     marker_id: int
     camera: TagGeometry
     projector: TagGeometry | None = None
+
+
+class FiducialIdentity(NamedTuple):
+    """The namespace-qualified identity of one configured fiducial."""
+
+    group: str
+    id: int
+
+    @property
+    def marker_id(self) -> int:
+        return self.id
+
+
+class FiducialObservation(NamedTuple):
+    """One immutable, namespace-qualified observation and its spatial geometry."""
+
+    group: str
+    id: int
+    camera: TagGeometry
+    projector: TagGeometry | None
+    surface: TagGeometry | None
+    marker_size_mm: float
+    camera_slot: str
+    camera_lifecycle_generation: int
+    frame_counter: int
+    received_monotonic_seconds: float
+    camera_calibration_generation: int = 0
+
+    @property
+    def identity(self) -> FiducialIdentity:
+        return FiducialIdentity(self.group, self.id)
+
+    @property
+    def marker_id(self) -> int:
+        return self.id
+
+    @property
+    def camera_id(self) -> str:
+        return self.camera_slot
+
+    @property
+    def camera_geometry(self) -> TagGeometry:
+        return self.camera
+
+    @property
+    def projector_geometry(self) -> TagGeometry | None:
+        return self.projector
+
+    @property
+    def surface_geometry(self) -> TagGeometry | None:
+        return self.surface
+
+    @property
+    def lifecycle_generation(self) -> int:
+        return self.camera_lifecycle_generation
+
+    @property
+    def calibration_generation(self) -> int:
+        return self.camera_calibration_generation
+
+    @property
+    def monotonic_timestamp(self) -> float:
+        return self.received_monotonic_seconds
+
+    @property
+    def received_at_monotonic_seconds(self) -> float:
+        return self.received_monotonic_seconds
+
+    @property
+    def freshness_monotonic_seconds(self) -> float:
+        return self.received_monotonic_seconds
+
+
+NamespacedFiducialObservation = FiducialObservation
+GroupFiducialObservation = FiducialObservation
+
+
+class GroupTrackingError(NamedTuple):
+    """An explicit unresolved state for one independently detected group."""
+
+    group: str
+    dictionary: str
+    code: str
+    message: str
+
+    @property
+    def is_unresolved(self) -> bool:
+        return True
+
+
+class GroupFiducialDetectionResult(NamedTuple):
+    """Complete result of scanning all configured groups in one frame."""
+
+    observations: tuple[FiducialObservation, ...]
+    errors: tuple[GroupTrackingError, ...] = ()
+
+    @property
+    def unresolved_groups(self) -> tuple[str, ...]:
+        return tuple(error.group for error in self.errors)
+
+    @property
+    def observations_by_group(self) -> dict[str, tuple[FiducialObservation, ...]]:
+        observations_by_group: dict[str, list[FiducialObservation]] = {}
+        for observation in self.observations:
+            observations_by_group.setdefault(observation.group, []).append(observation)
+        return {
+            group: tuple(group_observations)
+            for group, group_observations in observations_by_group.items()
+        }
 
 
 class FiducialDetector(Protocol):
@@ -162,7 +273,7 @@ class _SynchronizedTagDetector:
 
     def detect(self, frame: Any) -> Iterable[DetectedMarker]:
         with self._detect_lock:
-            return self._detector.detect(frame)
+            return tuple(self._detector.detect(frame))
 
     def __getattr__(self, name: str) -> Any:
         attribute = getattr(self._detector, name)
@@ -171,7 +282,7 @@ class _SynchronizedTagDetector:
 
         def detect_strict(frame: Any) -> Iterable[DetectedMarker]:
             with self._detect_lock:
-                return attribute(frame)
+                return tuple(attribute(frame))
 
         return detect_strict
 
@@ -414,6 +525,239 @@ def detect_tag_observations(
         ) from ex
 
 
+def build_fiducial_observation(
+    detected_marker: object,
+    group: str,
+    marker_size_mm: object,
+    camera_to_projector: MatrixLike | HomographyPair | None = None,
+    projector_to_surface: MatrixLike | object | None = None,
+    camera_slot: str = 'camera-0',
+    camera_lifecycle_generation: int = 0,
+    frame_counter: int = 0,
+    received_monotonic_seconds: float | None = None,
+    *,
+    metric_calibration: object | None = None,
+    lifecycle_generation: int | None = None,
+    monotonic_timestamp: float | None = None,
+    camera_calibration_generation: int = 0,
+) -> FiducialObservation:
+    """Build one finite namespaced observation through the shared transforms."""
+    if lifecycle_generation is not None:
+        camera_lifecycle_generation = lifecycle_generation
+    if monotonic_timestamp is not None:
+        received_monotonic_seconds = monotonic_timestamp
+    if metric_calibration is not None:
+        if projector_to_surface is not None:
+            raise ValueError(
+                'Specify either projector_to_surface or metric_calibration, not both',
+            )
+        projector_to_surface = metric_calibration
+    checked_group = _validate_observation_group(group)
+    checked_marker_size = _validate_observation_marker_size(marker_size_mm)
+    checked_camera_slot = _validate_observation_camera_slot(camera_slot)
+    checked_lifecycle_generation = _validate_observation_counter(
+        camera_lifecycle_generation,
+        'camera_lifecycle_generation',
+    )
+    checked_frame_counter = _validate_observation_counter(
+        frame_counter,
+        'frame_counter',
+    )
+    checked_calibration_generation = _validate_observation_counter(
+        camera_calibration_generation,
+        'camera_calibration_generation',
+    )
+    checked_monotonic_seconds = _validate_observation_timestamp(
+        received_monotonic_seconds,
+    )
+    planar_observation = (
+        detected_marker
+        if isinstance(detected_marker, PlanarTagObservation)
+        else build_planar_tag_observation(detected_marker)
+    )
+    if not isinstance(planar_observation.marker_id, int) or isinstance(
+        planar_observation.marker_id,
+        bool,
+    ) or planar_observation.marker_id < 0:
+        raise ValueError('detected_marker contains an invalid marker ID')
+    camera_geometry = build_tag_geometry(planar_observation.camera.corners)
+    projector_geometry = (
+        None
+        if camera_to_projector is None
+        else project_tag_geometry(
+            camera_geometry,
+            _get_camera_to_projector_matrix(camera_to_projector),
+        )
+    )
+    surface_geometry = None
+    if projector_geometry is not None and projector_to_surface is not None:
+        surface_matrix = _get_projector_to_surface_matrix(projector_to_surface)
+        surface_geometry = project_tag_geometry(projector_geometry, surface_matrix)
+    return FiducialObservation(
+        checked_group,
+        planar_observation.marker_id,
+        camera_geometry,
+        projector_geometry,
+        surface_geometry,
+        checked_marker_size,
+        checked_camera_slot,
+        checked_lifecycle_generation,
+        checked_frame_counter,
+        checked_monotonic_seconds,
+        checked_calibration_generation,
+    )
+
+
+def detect_group_fiducial_observations(
+    frame: Any,
+    group: str,
+    group_definition: object,
+    detector_factory: TagDetectorFactory | CachedTagDetectorFactory | None = None,
+    camera_to_projector: MatrixLike | HomographyPair | None = None,
+    projector_to_surface: MatrixLike | object | None = None,
+    camera_slot: str = 'camera-0',
+    camera_lifecycle_generation: int = 0,
+    frame_counter: int = 0,
+    received_monotonic_seconds: float | None = None,
+    configured_groups: Mapping[str, object] | None = None,
+    *,
+    metric_calibration: object | None = None,
+    camera_calibration_generation: int = 0,
+) -> tuple[FiducialObservation, ...]:
+    """Detect one configured group without touching camera or overlay state."""
+    checked_group = _validate_observation_group(group)
+    if configured_groups is not None:
+        if not isinstance(configured_groups, Mapping):
+            raise ValueError('configured_groups must be a mapping')
+        if checked_group not in configured_groups:
+            raise ValueError(f'Unknown fiducial group: {checked_group!r}')
+        configured_definition = _normalise_group_definition(
+            configured_groups[checked_group],
+        )
+        supplied_definition = _normalise_group_definition(group_definition)
+        if supplied_definition != configured_definition:
+            raise ValueError(
+                f'Fiducial group definition does not match {checked_group!r}',
+            )
+        dictionary, marker_size_mm = configured_definition
+    else:
+        dictionary, marker_size_mm = _normalise_group_definition(group_definition)
+    factory = _normalise_group_detector_factory(detector_factory)
+    checked_monotonic_seconds = _validate_observation_timestamp(
+        received_monotonic_seconds,
+    )
+    try:
+        detector = factory(dictionary)
+        camera_observations = detect_tag_observations(frame, detector)
+        return tuple(
+            sorted(
+                (
+                    build_fiducial_observation(
+                        observation,
+                        checked_group,
+                        marker_size_mm,
+                        camera_to_projector,
+                        projector_to_surface,
+                        camera_slot,
+                        camera_lifecycle_generation,
+                        frame_counter,
+                        checked_monotonic_seconds,
+                        metric_calibration=metric_calibration,
+                        camera_calibration_generation=camera_calibration_generation,
+                    )
+                    for observation in camera_observations
+                ),
+                key=_fiducial_observation_sort_key,
+            )
+        )
+    except FiducialGroupDetectionError:
+        raise
+    except Exception as ex:  # noqa: BLE001 (One group's detector is an external boundary).
+        raise FiducialGroupDetectionError(group, str(ex)) from ex
+
+
+def detect_configured_fiducial_observations(
+    frame: Any,
+    configured_groups: Mapping[str, object],
+    detector_factory: TagDetectorFactory | CachedTagDetectorFactory | None = None,
+    camera_to_projector: MatrixLike | HomographyPair | None = None,
+    projector_to_surface: MatrixLike | object | None = None,
+    camera_slot: str = 'camera-0',
+    camera_lifecycle_generation: int = 0,
+    frame_counter: int = 0,
+    received_monotonic_seconds: float | None = None,
+    requested_groups: Sequence[str] | None = None,
+    *,
+    metric_calibration: object | None = None,
+    camera_calibration_generation: int = 0,
+) -> GroupFiducialDetectionResult:
+    """Scan each configured namespace independently, retaining valid duplicates."""
+    if not isinstance(configured_groups, Mapping):
+        raise ValueError('configured_groups must be a mapping')
+    group_names = (
+        tuple(configured_groups)
+        if requested_groups is None
+        else tuple(requested_groups)
+    )
+    for group in group_names:
+        _validate_observation_group(group)
+        if group not in configured_groups:
+            raise ValueError(f'Unknown fiducial group: {group!r}')
+    if len(set(group_names)) != len(group_names):
+        raise ValueError('requested_groups must not contain duplicates')
+    # Validate every definition before a detector is asked to run. This makes a
+    # malformed startup definition a configuration error, not a partial scan.
+    definitions = {
+        group: _normalise_group_definition(configured_groups[group])
+        for group in sorted(group_names)
+    }
+    factory = _normalise_group_detector_factory(detector_factory)
+    checked_monotonic_seconds = _validate_observation_timestamp(
+        received_monotonic_seconds,
+    )
+    observations: list[FiducialObservation] = []
+    errors: list[GroupTrackingError] = []
+    for group in sorted(group_names):
+        dictionary, marker_size_mm = definitions[group]
+        try:
+            group_observations = detect_group_fiducial_observations(
+                frame,
+                group,
+                {'dictionary': dictionary, 'marker_size_mm': marker_size_mm},
+                factory,
+                camera_to_projector,
+                projector_to_surface,
+                camera_slot,
+                camera_lifecycle_generation,
+                frame_counter,
+                checked_monotonic_seconds,
+                metric_calibration=metric_calibration,
+                camera_calibration_generation=camera_calibration_generation,
+            )
+        except FiducialGroupDetectionError as ex:
+            errors.append(
+                GroupTrackingError(
+                    group,
+                    dictionary,
+                    getattr(ex, 'code', FiducialGroupDetectionError.code),
+                    str(ex),
+                ),
+            )
+            continue
+        observations.extend(group_observations)
+    return GroupFiducialDetectionResult(
+        tuple(sorted(observations, key=_fiducial_observation_sort_key)),
+        tuple(errors),
+    )
+
+
+# These names make the boundary discoverable without duplicating its implementation.
+build_group_fiducial_observation = build_fiducial_observation
+build_namespaced_fiducial_observation = build_fiducial_observation
+detect_fiducial_groups = detect_configured_fiducial_observations
+detect_group_fiducials = detect_group_fiducial_observations
+
+
 def detect_fiducials(
     frame: Any,
     detector: FiducialDetector,
@@ -620,6 +964,115 @@ def _tag_observation_sort_key(
         observation.camera.centre.x,
         observation.camera.corners,
     )
+
+
+def _fiducial_observation_sort_key(
+    observation: FiducialObservation,
+) -> tuple[str, int, float, float, tuple[Point2D, ...]]:
+    return (
+        observation.group,
+        observation.id,
+        observation.camera.centre.y,
+        observation.camera.centre.x,
+        observation.camera.corners,
+    )
+
+
+def _normalise_group_detector_factory(
+    detector_factory: TagDetectorFactory | CachedTagDetectorFactory | None,
+) -> CachedTagDetectorFactory:
+    if isinstance(detector_factory, CachedTagDetectorFactory):
+        return detector_factory
+    return CachedTagDetectorFactory(detector_factory)
+
+
+def _normalise_group_definition(
+    group_definition: object,
+) -> tuple[str, float]:
+    if isinstance(group_definition, Mapping):
+        if set(group_definition) != {'dictionary', 'marker_size_mm'}:
+            raise ValueError(
+                'fiducial group must contain only dictionary and marker_size_mm',
+            )
+        try:
+            dictionary = group_definition['dictionary']
+            marker_size_mm = group_definition['marker_size_mm']
+        except KeyError as ex:
+            raise ValueError(f'fiducial group is missing {ex.args[0]}') from ex
+    else:
+        dictionary = getattr(group_definition, 'dictionary', None)
+        marker_size_mm = getattr(group_definition, 'marker_size_mm', None)
+        if dictionary is None or marker_size_mm is None:
+            raise ValueError(
+                'group_definition must provide dictionary and marker_size_mm',
+            )
+    checked_dictionary = validate_tag_dictionary(dictionary)
+    checked_marker_size = _validate_observation_marker_size(marker_size_mm)
+    return checked_dictionary, checked_marker_size
+
+
+def _validate_observation_group(group: object) -> str:
+    if not isinstance(group, str) or len(group.strip()) == 0:
+        raise ValueError('fiducial group must be a non-empty string')
+    return group
+
+
+def _validate_observation_marker_size(marker_size_mm: object) -> float:
+    if not isinstance(marker_size_mm, Real) or isinstance(marker_size_mm, bool):
+        raise ValueError('marker_size_mm must be a finite positive number')
+    try:
+        checked_marker_size = float(marker_size_mm)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError('marker_size_mm must be a finite positive number') from None
+    if not math.isfinite(checked_marker_size) or checked_marker_size <= 0:
+        raise ValueError('marker_size_mm must be a finite positive number')
+    return checked_marker_size
+
+
+def _validate_observation_camera_slot(camera_slot: object) -> str:
+    if not isinstance(camera_slot, str) or len(camera_slot) == 0:
+        raise ValueError('camera_slot must be a non-empty string')
+    return camera_slot
+
+
+def _validate_observation_counter(value: object, field_name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f'{field_name} must be a non-negative integer')
+    return value
+
+
+def _validate_observation_timestamp(value: float | None) -> float:
+    checked_value = time.monotonic() if value is None else value
+    if not isinstance(checked_value, Real) or isinstance(checked_value, bool):
+        raise ValueError('received_monotonic_seconds must be finite')
+    try:
+        checked_float = float(checked_value)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError('received_monotonic_seconds must be finite') from None
+    if not math.isfinite(checked_float):
+        raise ValueError('received_monotonic_seconds must be finite')
+    return checked_float
+
+
+def _get_camera_to_projector_matrix(
+    camera_to_projector: object,
+) -> MatrixLike | HomographyPair:
+    matrix = getattr(camera_to_projector, 'camera_to_projector', None)
+    if matrix is None:
+        matrix = camera_to_projector
+    return matrix  # type: ignore[return-value]
+
+
+def _get_projector_to_surface_matrix(
+    projector_to_surface: object,
+) -> MatrixLike:
+    matrix = getattr(projector_to_surface, 'projector_to_surface', None)
+    if matrix is None:
+        homography = getattr(projector_to_surface, 'homography', None)
+        matrix = getattr(homography, 'projector_to_surface', None)
+    if matrix is None:
+        matrix = projector_to_surface
+    return matrix  # type: ignore[return-value]
 
 
 def _normalise_markers_strict(markers: object) -> tuple[DetectedMarker, ...]:
@@ -993,21 +1446,35 @@ __all__ = [
     'CachedTagDetectorFactory',
     'CameraCorrespondences',
     'DetectedMarker',
+    'FiducialIdentity',
+    'FiducialObservation',
+    'FiducialGroupDetectionError',
+    'GroupFiducialDetectionResult',
+    'GroupFiducialObservation',
+    'GroupTrackingError',
     'FiducialCorrespondence',
     'FiducialDetector',
     'MetricTargetCorrespondence',
     'MetricTargetCorrespondences',
+    'NamespacedFiducialObservation',
     'OpenCVArucoDetector',
     'PlanarTagObservation',
     'TagDetectorFactory',
     'assemble_camera_correspondences',
     'assemble_correspondences',
     'assemble_metric_correspondences',
+    'build_fiducial_observation',
+    'build_group_fiducial_observation',
+    'build_namespaced_fiducial_observation',
     'build_planar_tag_observation',
     'build_planar_tag_observations',
     'detect_and_assemble_correspondences',
     'detect_and_assemble_metric_correspondences',
+    'detect_configured_fiducial_observations',
+    'detect_fiducial_groups',
     'detect_fiducials',
+    'detect_group_fiducial_observations',
+    'detect_group_fiducials',
     'detect_metric_fiducials',
     'detect_tag_observations',
 ]

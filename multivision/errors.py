@@ -50,6 +50,16 @@ class FiducialDetectionError(MultiVisionError):
     """Raised when the fiducial detector cannot be initialised or run."""
 
 
+class FiducialGroupDetectionError(FiducialDetectionError):
+    """Raised when one configured fiducial group's detector is unavailable."""
+
+    code = 'FIDUCIAL_GROUP_DETECTION_FAILED'
+
+    def __init__(self, group: str, message: str) -> None:
+        self.group = group
+        super().__init__(f'Fiducial group {group!r}: {message}')
+
+
 class CalibrationError(MultiVisionError, ValueError):
     """Raised when correspondences cannot produce a trustworthy calibration."""
 

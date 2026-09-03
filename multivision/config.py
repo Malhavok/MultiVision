@@ -8,6 +8,7 @@ import tempfile
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 from multivision.errors import ConfigurationError
@@ -82,6 +83,36 @@ class ProjectorOutputDescriptor:
 
 
 @dataclass(frozen=True)
+class FiducialGroup:
+    dictionary: str
+    marker_size_mm: float
+
+    def __post_init__(self) -> None:
+        _validate_tag_dictionary(self.dictionary)
+        _validate_finite_positive_number(self.marker_size_mm, 'marker_size_mm')
+
+    @classmethod
+    def from_data(
+        cls: type['FiducialGroup'],
+        data: Mapping[str, Any],
+    ) -> 'FiducialGroup':
+        if not isinstance(data, Mapping):
+            raise ConfigurationError('fiducial group must be an object')
+        if set(data) != {'dictionary', 'marker_size_mm'}:
+            raise ConfigurationError(
+                'fiducial group must contain only dictionary and marker_size_mm',
+            )
+        try:
+            return cls(data['dictionary'], data['marker_size_mm'])
+        except KeyError as ex:
+            raise ConfigurationError(
+                f'fiducial group is missing {ex.args[0]}',
+            ) from ex
+        except (TypeError, ValueError) as ex:
+            raise ConfigurationError(str(ex)) from ex
+
+
+@dataclass(frozen=True)
 class Configuration:
     projector_resolution: Resolution = field(
         default_factory=lambda: Resolution(1920, 1080),
@@ -96,6 +127,14 @@ class Configuration:
     )
     overlay_limits: OverlayConfiguration = field(default_factory=OverlayConfiguration)
     tag_dictionary: str = DEFAULT_TAG_DICTIONARY
+    fiducial_groups: Mapping[str, FiducialGroup] = field(default_factory=dict)
+    fiducial_history_length: int = 8
+    fiducial_tracking_rate_hz: float = 30.0
+    fiducial_grace_period_seconds: float = 5.0
+    fiducial_protection_margin_mm: float = 5.0
+    max_batch_operations: int = 100
+    preview_mode: str = 'active'
+    preview_low_rate_hz: float = 10.0
 
     def __post_init__(self) -> None:
         _validate_resolution(self.projector_resolution, 'projector_resolution')
@@ -113,6 +152,46 @@ class Configuration:
             raise ConfigurationError('overlay_limits must be OverlayConfiguration')
         _validate_positive_integer(self.calibration_version, 'calibration_version')
         _validate_tag_dictionary(self.tag_dictionary)
+        object.__setattr__(
+            self,
+            'fiducial_groups',
+            _normalise_fiducial_groups(self.fiducial_groups),
+        )
+        _validate_bounded_positive_integer(
+            self.fiducial_history_length,
+            'fiducial_history_length',
+            32,
+        )
+        _validate_bounded_number(
+            self.fiducial_tracking_rate_hz,
+            'fiducial_tracking_rate_hz',
+            1.0,
+            60.0,
+        )
+        _validate_bounded_number(
+            self.fiducial_grace_period_seconds,
+            'fiducial_grace_period_seconds',
+            0.1,
+            60.0,
+        )
+        _validate_bounded_number(
+            self.fiducial_protection_margin_mm,
+            'fiducial_protection_margin_mm',
+            0.1,
+            1000.0,
+        )
+        _validate_bounded_positive_integer(
+            self.max_batch_operations,
+            'max_batch_operations',
+            1000,
+        )
+        _validate_preview_mode(self.preview_mode)
+        _validate_bounded_number(
+            self.preview_low_rate_hz,
+            'preview_low_rate_hz',
+            1.0,
+            15.0,
+        )
 
     @property
     def projector_output_descriptor(self) -> ProjectorOutputDescriptor:
@@ -140,6 +219,7 @@ class Configuration:
         )
         calibration_version = data.get('calibration_version', 1)
         tag_dictionary = data.get('tag_dictionary', DEFAULT_TAG_DICTIONARY)
+        fiducial_groups = _parse_fiducial_groups(data.get('fiducial_groups', {}))
 
         return cls(
             projector_resolution=projector_resolution,
@@ -149,6 +229,17 @@ class Configuration:
             overlay_limits=overlay_limits,
             calibration_version=calibration_version,
             tag_dictionary=tag_dictionary,
+            fiducial_groups=fiducial_groups,
+            fiducial_history_length=data.get('fiducial_history_length', 8),
+            fiducial_tracking_rate_hz=data.get('fiducial_tracking_rate_hz', 30.0),
+            fiducial_grace_period_seconds=data.get('fiducial_grace_period_seconds', 5.0),
+            fiducial_protection_margin_mm=data.get(
+                'fiducial_protection_margin_mm',
+                5.0,
+            ),
+            max_batch_operations=data.get('max_batch_operations', 100),
+            preview_mode=data.get('preview_mode', 'active'),
+            preview_low_rate_hz=data.get('preview_low_rate_hz', 10.0),
         )
 
     def to_data(self) -> dict[str, Any]:
@@ -198,6 +289,20 @@ class Configuration:
             'overlay_limits': self.overlay_limits.to_data(),
             'calibration_version': self.calibration_version,
             'tag_dictionary': self.tag_dictionary,
+            'fiducial_groups': {
+                group_name: {
+                    'dictionary': group.dictionary,
+                    'marker_size_mm': group.marker_size_mm,
+                }
+                for group_name, group in self.fiducial_groups.items()
+            },
+            'fiducial_history_length': self.fiducial_history_length,
+            'fiducial_tracking_rate_hz': self.fiducial_tracking_rate_hz,
+            'fiducial_grace_period_seconds': self.fiducial_grace_period_seconds,
+            'fiducial_protection_margin_mm': self.fiducial_protection_margin_mm,
+            'max_batch_operations': self.max_batch_operations,
+            'preview_mode': self.preview_mode,
+            'preview_low_rate_hz': self.preview_low_rate_hz,
         }
 
 
@@ -329,6 +434,38 @@ def _parse_metric_thresholds(data: Any) -> MetricCalibrationThresholds:
         ),
     }
     return MetricCalibrationThresholds(**values)
+
+
+def _parse_fiducial_groups(data: Any) -> dict[str, FiducialGroup]:
+    if not isinstance(data, Mapping):
+        raise ConfigurationError('fiducial_groups must be an object')
+
+    groups: dict[str, FiducialGroup] = {}
+    for group_name, group_data in data.items():
+        _validate_group_name(group_name)
+        groups[group_name] = FiducialGroup.from_data(group_data)
+    return groups
+
+
+def _normalise_fiducial_groups(
+    groups: Mapping[str, FiducialGroup],
+) -> Mapping[str, FiducialGroup]:
+    if not isinstance(groups, Mapping):
+        raise ConfigurationError('fiducial_groups must be an object')
+
+    normalised: dict[str, FiducialGroup] = {}
+    for group_name, group in groups.items():
+        _validate_group_name(group_name)
+        if isinstance(group, FiducialGroup):
+            normalised[group_name] = group
+            continue
+        if isinstance(group, Mapping):
+            normalised[group_name] = FiducialGroup.from_data(group)
+            continue
+        raise ConfigurationError(
+            f'fiducial_groups[{group_name!r}] must be a FiducialGroup',
+        )
+    return MappingProxyType(normalised)
 
 
 def _parse_overlay_configuration(data: Any) -> OverlayConfiguration:
@@ -483,6 +620,58 @@ def _validate_finite_non_negative_numbers(
             raise ConfigurationError(f'{field_name} must be finite')
         if field_value < 0:
             raise ConfigurationError(f'{field_name} must not be negative')
+
+
+def _validate_group_name(value: Any) -> None:
+    if not isinstance(value, str) or len(value.strip()) == 0:
+        raise ConfigurationError('fiducial group names must be non-empty strings')
+
+
+def _validate_bounded_positive_integer(value: Any, field_name: str, maximum: int) -> None:
+    _validate_positive_integer(value, field_name)
+    if value > maximum:
+        raise ConfigurationError(f'{field_name} must not exceed {maximum}')
+
+
+def _validate_bounded_number(
+    value: Any,
+    field_name: str,
+    minimum: float,
+    maximum: float,
+) -> None:
+    try:
+        is_finite = math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        is_finite = False
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not is_finite
+        or value < minimum
+        or value > maximum
+    ):
+        raise ConfigurationError(
+            f'{field_name} must be finite and between {minimum} and {maximum}',
+        )
+
+
+def _validate_finite_positive_number(value: Any, field_name: str) -> None:
+    try:
+        is_finite = math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        is_finite = False
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not is_finite
+        or value <= 0
+    ):
+        raise ConfigurationError(f'{field_name} must be a finite positive number')
+
+
+def _validate_preview_mode(value: Any) -> None:
+    if not isinstance(value, str) or value not in {'active', 'low_rate', 'off'}:
+        raise ConfigurationError('preview_mode must be active, low_rate or off')
 
 
 def _validate_tag_dictionary(value: Any) -> None:

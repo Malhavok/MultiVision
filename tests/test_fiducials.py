@@ -6,22 +6,27 @@ from typing import Any
 import cv2
 import numpy as np
 
+from multivision.config import FiducialGroup
 from multivision.errors import FiducialDetectionError
 from multivision.fiducials import (
     CachedTagDetectorFactory,
     DetectedMarker,
+    FiducialObservation,
     OpenCVArucoDetector,
     assemble_camera_correspondences,
     assemble_correspondences,
     assemble_metric_correspondences,
     build_planar_tag_observations,
     detect_and_assemble_correspondences,
+    detect_configured_fiducial_observations,
+    detect_group_fiducial_observations,
     detect_metric_fiducials,
     detect_tag_observations,
 )
 from multivision.geometry import Point2D
 from multivision.metric_target import METRIC_TARGET
 from multivision.pattern import (
+    APRILTAG_36H11,
     DICT_5X5_1000,
     build_calibration_pattern,
 )
@@ -79,6 +84,107 @@ class FiducialTest(unittest.TestCase):
         assert len(observations) == 1, f'{observations=}'
         assert observations[0].marker_id == 23, f'{observations=}'
         assert observations[0].projector is None
+
+    def test_configured_groups_are_namespaced_and_share_one_cached_detector(self) -> None:
+        created_dictionary_names: list[str] = []
+
+        class FakeDetector:
+            def detect(self, _frame: object) -> tuple[DetectedMarker, ...]:
+                return (
+                    DetectedMarker(7, _corners(10, 20)),
+                    DetectedMarker(7, _corners(40, 20)),
+                )
+
+        def make_detector(dictionary_name: str) -> FakeDetector:
+            created_dictionary_names.append(dictionary_name)
+            return FakeDetector()
+
+        result = detect_configured_fiducial_observations(
+            object(),
+            {
+                'cards': FiducialGroup(DICT_5X5_1000, 38.0),
+                'tokens': FiducialGroup(DICT_5X5_1000, 20.0),
+            },
+            make_detector,
+            ((1, 0.2, 0), (0.1, 1, 0), (0.001, 0.0005, 1)),
+            ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+            camera_slot='camera-2',
+            camera_lifecycle_generation=4,
+            frame_counter=19,
+            received_monotonic_seconds=12.5,
+        )
+
+        assert result.errors == (), f'{result=}'
+        assert created_dictionary_names == [DICT_5X5_1000], f'{created_dictionary_names=}'
+        assert len(result.observations) == 4, f'{result=}'
+        assert {(observation.group, observation.id) for observation in result.observations} == {
+            ('cards', 7),
+            ('tokens', 7),
+        }, f'{result=}'
+        assert all(
+            isinstance(observation, FiducialObservation)
+            and observation.marker_size_mm in {20.0, 38.0}
+            and observation.camera_slot == 'camera-2'
+            and observation.camera_lifecycle_generation == 4
+            and observation.frame_counter == 19
+            and observation.received_monotonic_seconds == 12.5
+            and observation.projector is not None
+            and observation.surface is not None
+            for observation in result.observations
+        ), f'{result=}'
+        assert result.observations[0].camera.corners == tuple(_corners(10, 20))
+
+    def test_group_detector_rejects_unknown_group_before_factory_and_isolates_failure(self) -> None:
+        calls: list[str] = []
+
+        def make_detector(dictionary_name: str) -> object:
+            calls.append(dictionary_name)
+            raise RuntimeError('dictionary unavailable')
+
+        with self.assertRaises(ValueError):
+            detect_group_fiducial_observations(
+                object(),
+                'unknown',
+                FiducialGroup(DICT_5X5_1000, 20.0),
+                make_detector,
+                configured_groups={'cards': FiducialGroup(DICT_5X5_1000, 20.0)},
+            )
+        assert calls == [], f'{calls=}'
+
+        class WorkingDetector:
+            def detect(self, _frame: object) -> tuple[DetectedMarker, ...]:
+                return (DetectedMarker(3, _corners(1, 1)),)
+
+        def mixed_factory(dictionary_name: str) -> object:
+            calls.append(dictionary_name)
+            if dictionary_name == APRILTAG_36H11:
+                raise RuntimeError('missing OpenCV dictionary')
+            return WorkingDetector()
+
+        result = detect_configured_fiducial_observations(
+            object(),
+            {
+                'broken': FiducialGroup(APRILTAG_36H11, 20.0),
+                'working': FiducialGroup(DICT_5X5_1000, 20.0),
+            },
+            mixed_factory,
+        )
+        assert [error.group for error in result.errors] == ['broken'], f'{result=}'
+        assert [observation.identity for observation in result.observations] == [
+            ('working', 3),
+        ], f'{result=}'
+
+        with self.assertRaises(ValueError):
+            detect_group_fiducial_observations(
+                object(),
+                'working',
+                FiducialGroup(DICT_5X5_1000, 99.0),
+                mixed_factory,
+                configured_groups={
+                    'working': FiducialGroup(DICT_5X5_1000, 20.0),
+                },
+            )
+        assert calls == [APRILTAG_36H11, DICT_5X5_1000], f'{calls=}'
 
     def test_planar_observation_detection_rejects_structural_evidence_failure(
         self,
@@ -223,6 +329,60 @@ class FiducialTest(unittest.TestCase):
         assert not second_thread.is_alive(), f'{second_thread=}'
         assert underlying_detector.maximum_active_count == 1, f'{underlying_detector=}'
         assert underlying_detector.call_count == 2, f'{underlying_detector=}'
+
+    def test_cached_detector_materialises_iterables_before_releasing_its_lock(self) -> None:
+        class LazyDetector:
+            def __init__(self) -> None:
+                self.active_count = 0
+                self.maximum_active_count = 0
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self._state_lock = threading.Lock()
+
+            def detect(self, _frame: object) -> Any:
+                def yield_detection() -> Any:
+                    with self._state_lock:
+                        self.active_count += 1
+                        self.maximum_active_count = max(
+                            self.maximum_active_count,
+                            self.active_count,
+                        )
+                        self.started.set()
+                    try:
+                        self.release.wait(timeout=1)
+                        yield DetectedMarker(1, _corners(1, 1))
+                    finally:
+                        with self._state_lock:
+                            self.active_count -= 1
+
+                return yield_detection()
+
+        underlying_detector = LazyDetector()
+        detector = CachedTagDetectorFactory(lambda _dictionary: underlying_detector)(
+            DICT_5X5_1000,
+        )
+        first_thread = threading.Thread(target=detector.detect, args=(object(),))
+        second_started = threading.Event()
+
+        def run_second_detection() -> None:
+            second_started.set()
+            detector.detect(object())
+
+        second_thread = threading.Thread(target=run_second_detection)
+        first_thread.start()
+        assert underlying_detector.started.wait(timeout=1)
+        second_thread.start()
+        assert second_started.wait(timeout=1)
+        second_thread.join(timeout=0.1)
+        assert second_thread.is_alive(), f'{second_thread=}'
+
+        underlying_detector.release.set()
+        first_thread.join(timeout=1)
+        second_thread.join(timeout=1)
+
+        assert not first_thread.is_alive(), f'{first_thread=}'
+        assert not second_thread.is_alive(), f'{second_thread=}'
+        assert underlying_detector.maximum_active_count == 1, f'{underlying_detector=}'
 
     def test_cached_detector_locks_are_independent_by_dictionary(self) -> None:
         class BlockingDetector:
