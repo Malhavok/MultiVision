@@ -1,60 +1,28 @@
-# Reusable harness configuration for this Python project.
-# Select a plan explicitly when running the harness, for example:
-# python /Users/malhavok/Coding/Harness/Pi/harness.py --config harness.toml --plan plans/plan1.md
+# Runtime 0.4 configuration for pi-harness.
 
-[models]
-solve = "openai-codex/gpt-5.6-luna"
-check = "openai-codex/gpt-5.6-luna"
-validate = "openai-codex/gpt-5.6-luna"
+[globals]
+timeout_minutes = 10
+max_attempts = 5
+timeout_threshold = 2
+heartbeat_interval_minutes = 30
 
-[prompts]
-solve = """Solve task {step_number} from file {plan_path}.
+[implementation.models]
+low_tier = "openai-codex/gpt-5.6-luna"
+mid_tier = "openai-codex/gpt-5.6-terra"
+high_tier = "openai-codex/gpt-5.6-sol"
 
-The task text is: "{step_text}"
+[review]
+passes = 1
 
-Read the relevant project documentation, repository instructions and any
-validation contract linked by the plan before editing. This is a Python
-project: use the advised .venv/bin/python and existing project commands.
-Work only on this task, preserve unrelated working-tree changes, and make the
-smallest change that fully satisfies the task. Keep external resources behind
-testable seams where practical. Do not modify the harness configuration, plan
-state or authoritative decision documents unless the task explicitly requires
-it, and do not claim unrun manual or external checks passed.
-"""
+[review.pyra.models]
+low_tier = "openai-codex/gpt-5.6-luna"
+mid_tier = "openai-codex/gpt-5.6-terra"
+high_tier = "openai-codex/gpt-5.6-sol"
 
-check = """Check whether task {step_number} from {plan_path} is fully done.
+[review.mythra.models]
+low_tier = "openai-codex/gpt-5.6-luna"
+mid_tier = "openai-codex/gpt-5.6-terra"
+high_tier = "openai-codex/gpt-5.6-sol"
 
-The task text is: "{step_text}"
-
-Read the relevant project documentation, validation contract, implementation
-and diff before deciding. If the task is incomplete, finish it with the
-smallest project-consistent change. Use the advised .venv/bin/python and run
-deterministic project checks. Do not expand scope, modify the harness
-configuration or authoritative decision documents unless required by the
-task, or claim unrun manual/external checks passed.
-
-Once the task is fully done, close it by running:
-python3 {plan_state_path} --plan {plan_path} --step {step_number} --mark-done
-"""
-
-[harness]
-max_solve_attempts = 5
-max_validate_attempts = 5
-keep_sessions = true
-run_timeout_minutes = 30
-
-# Validators run against every closed task in order. A task counts as complete
-# only after every validator id below has been recorded in its state.
-
-[[validators]]
-id = "complete"
-prompt = """Does the implementation fully meet task {step_number} from {plan_path}? Read the task, relevant project documentation, validation contract and resulting diff together. Check observable behaviour in the actual Python code and deterministic tests rather than accepting descriptions or placeholders."""
-
-[[validators]]
-id = "adversarial"
-model = "openai-codex/gpt-5.6-luna"
-prompt = """Act as Mythra, the independent adversarial counterpart. Reconstruct the task from the plan, validation contract, implementation and tests rather than trusting the solve/check result or other validators. Attack hidden assumptions, boundary cases, failure and recovery paths, ownership leaks, stale state, concurrency, external-resource identity, and claims that mocks or deterministic tests prove hardware behaviour. Distinguish concrete correctness defects from speculative improvements. Fix concrete defects with the smallest project-consistent change, and do not claim physical or external acceptance that was not actually observed."""
-
-[[validators]]
-id = "quality"
-prompt = """Review the changed Python work for minimal, readable quality. Remove unrelated edits, dead code, duplicate logic, speculative abstractions, debug output and unnecessary dependencies. Check typing, pathlib use, naming, project conventions, deterministic ordering, focused tests and clean boundaries around external resources."""
+[cleanup]
+passes = 3
