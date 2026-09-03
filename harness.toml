@@ -1,7 +1,7 @@
 # Runtime 0.4 configuration for pi-harness.
 
 [globals]
-timeout_minutes = 10
+timeout_minutes = 30
 max_attempts = 5
 timeout_threshold = 2
 heartbeat_interval_minutes = 30
