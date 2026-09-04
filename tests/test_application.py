@@ -81,6 +81,28 @@ class CameraCaptureAggregationTest(unittest.TestCase):
         assert noise.median_sigma_pixels > 0
 
 
+class CameraCalibrationCaptureTimingTest(unittest.TestCase):
+    def test_camera_calibration_waits_for_exposure_to_settle(self) -> None:
+        runtime = CalibrationSessionRuntime((0,))
+        service = MultiVisionService(
+            Configuration(),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+        )
+        status = runtime.get_status('camera-0')
+        correspondences = CameraCorrespondences((), 'camera-0')
+
+        with (
+            patch.object(service._calibration_pattern_presented, 'wait', return_value=True),
+            patch('multivision.application.time.sleep') as sleep,
+            patch('multivision.application.CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS', 0.0),
+            patch.object(service, '_get_correspondences', return_value=correspondences),
+        ):
+            selected = service._get_correspondences_for_operation(status, None)
+
+        assert selected == correspondences
+        sleep.assert_called_once_with(5.0)
+
+
 class FakeSessionRuntime:
     def __init__(self, capture_indexes: tuple[int, ...] = (0, 1)) -> None:
         self.registry = SessionCameraRegistry.from_devices(
