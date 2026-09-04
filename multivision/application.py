@@ -768,6 +768,40 @@ class MultiVisionService:
             self.configuration = replace(self.configuration, fiducial_groups=groups)
             self._invalidate_spatial_state()
 
+    def get_tracking_diagnostics(self) -> dict[str, object]:
+        """Return the current tracking worker and authority diagnostics."""
+        with self._camera_management_lock:
+            cameras = self._get_session_cameras()
+            camera_states: dict[str, CameraGeneration] = {}
+            camera_transforms: dict[str, MatrixLike] = {}
+            if cameras is not None:
+                camera_states, camera_transforms = self._get_tracking_camera_inputs_locked(
+                    cameras,
+                    self._projector_output_descriptor,
+                )
+            metric_record = self.metric_calibration_registry.get_record()
+            metric_usable = self.metric_calibration_registry.is_usable(
+                self._projector_output_descriptor,
+            )
+        tracking_thread = self._tracking_thread
+        return {
+            'thread_alive': tracking_thread is not None and tracking_thread.is_alive(),
+            'error': None if self._tracking_error is None else str(self._tracking_error),
+            'metric_record_present': metric_record is not None,
+            'metric_registry_usable': metric_usable,
+            'camera_states': {
+                slot: {
+                    'lifecycle_generation': state.lifecycle_generation,
+                    'calibration_generation': state.calibration_generation,
+                    'is_available': state.is_available,
+                    'is_open': state.is_open,
+                    'is_calibrated': state.is_calibrated,
+                }
+                for slot, state in sorted(camera_states.items())
+            },
+            'camera_transform_slots': sorted(camera_transforms),
+        }
+
     def get_benchmark_metrics(self) -> dict[str, object]:
         """Return process-local runtime counters for performance evidence."""
         return self._benchmark_metrics.snapshot()
@@ -1537,7 +1571,12 @@ class MultiVisionService:
                 self._projector_output_descriptor,
             ):
                 current_metric = self.metric_calibration_registry.get_record()
-            return current_metric is cycle.metric_calibration or current_metric == cycle.metric_calibration
+            if not (
+                current_metric is cycle.metric_calibration
+                or current_metric == cycle.metric_calibration
+            ):
+                return False
+            return True
 
     def get_camera_status(self, logical_name: str) -> CameraStatus:
         with self._camera_management_lock:
@@ -3300,7 +3339,6 @@ class MultiVisionService:
         calibration = session_camera.calibration
         if session_camera.calibration_status is not CalibrationStatus.CALIBRATED:
             self.overlay_registry.invalidate_camera(session_camera.slot_id)
-            self._invalidate_spatial_state()
             return session_camera.calibration_status
         if (
             isinstance(calibration, PersistedCalibration)
@@ -3313,7 +3351,6 @@ class MultiVisionService:
             )
         ):
             self.overlay_registry.invalidate_camera(session_camera.slot_id)
-            self._invalidate_spatial_state()
             return CalibrationStatus.STALE
         return session_camera.calibration_status
 

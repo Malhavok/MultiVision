@@ -174,6 +174,27 @@ def test_fiducial_groups_can_change_without_restarting_the_service() -> None:
     assert 'demo' not in service.get_fiducial_groups()
 
 
+def test_status_polling_does_not_clear_other_spatial_authority() -> None:
+    runtime = _Runtime()
+    service = _make_service(runtime, [])
+    authority = service.metric_calibration_registry.get_record()
+    assert authority is not None, f'{authority=}'
+    service._spatial_state = SpatialState.empty()._replace(
+        metric_calibration=authority,
+    )
+    runtime.registry.set_calibration(
+        'camera-0',
+        CalibrationStatus.UNCALIBRATED,
+        None,
+    )
+
+    status = runtime.get_status('camera-0')
+    assert service._get_calibration_status(status) is CalibrationStatus.UNCALIBRATED
+    assert service._spatial_state.metric_calibration is authority, (
+        f'{service._spatial_state=}'
+    )
+
+
 def test_tracking_worker_uses_retained_frames_and_all_configured_groups() -> None:
     runtime = _Runtime()
     detector_calls: list[str] = []

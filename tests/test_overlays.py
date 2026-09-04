@@ -588,8 +588,21 @@ def test_physical_dynamic_arrow_uses_metric_authority_for_projector_materialisat
     assert materialisation.segments[0].start.y == pytest.approx(expected_start.y), (
         f'{materialisation=}, {expected_start=}'
     )
-    assert materialisation.segments[0].end == target_projector, f'{materialisation=}'
     assert len(materialisation.polygons) == 1, f'{materialisation=}'
+    expected_head_base = Point2D(
+        (materialisation.polygons[0].points[1].x + materialisation.polygons[0].points[2].x)
+        / 2.0,
+        (materialisation.polygons[0].points[1].y + materialisation.polygons[0].points[2].y)
+        / 2.0,
+    )
+    assert materialisation.segments[0].end.x == pytest.approx(
+        expected_head_base.x,
+        abs=0.75,
+    ), f'{materialisation=}'
+    assert materialisation.segments[0].end.y == pytest.approx(
+        expected_head_base.y,
+        abs=0.75,
+    ), f'{materialisation=}'
     assert materialisation.polygons[0].points[0] == target_projector, (
         f'{materialisation=}'
     )

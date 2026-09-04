@@ -2878,8 +2878,12 @@ def materialise_arrow(
     )
     if 1 > limits.max_overlay_segments or 5 > limits.max_overlay_vertices:
         raise ValueError('Arrow exceeds the configured primitive budget')
-    projector_start, projector_end = _project_source_points(
-        (geometry.start, geometry.end),
+    source_head_base = Point2D(
+        (geometry.head[1].x + geometry.head[2].x) / 2.0,
+        (geometry.head[1].y + geometry.head[2].y) / 2.0,
+    )
+    projector_start, projector_end, projector_head_base = _project_source_points(
+        (geometry.start, geometry.end, source_head_base),
         geometry.geometry_space,
         metric_calibration,
     )
@@ -2890,7 +2894,7 @@ def materialise_arrow(
     )
     shaft = _clip_projector_segment(
         projector_start,
-        projector_end,
+        projector_head_base,
         bounds,
         geometry.style,
     )

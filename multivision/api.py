@@ -807,6 +807,13 @@ def create_app(
     def get_spatial_state() -> dict[str, Any]:
         return _spatial_state_to_data(owned_service.get_spatial_state())
 
+    @app.get('/diagnostics/tracking')
+    def get_tracking_diagnostics() -> dict[str, Any]:
+        get_diagnostics = getattr(owned_service, 'get_tracking_diagnostics', None)
+        if not callable(get_diagnostics):
+            return {'available': False}
+        return {'available': True, **get_diagnostics()}
+
     return app
 
 

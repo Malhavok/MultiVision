@@ -510,6 +510,8 @@ def _run_service_workloads(
             ),
         )
     diagnostics_after = _get_diagnostics(client)
+    # Do not leave the final batch on the projector after the measurement.
+    client.request('DELETE', '/overlays')
     service_run = {
         'preview_mode': preview_mode,
         'service_url': service_url,
