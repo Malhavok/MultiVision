@@ -173,6 +173,12 @@ may be discontinuous. Protection starts with the usable observation and does
 not wait for marker loss. Existing calibration-pattern and metric blank-capture
 exclusivity remains authoritative.
 
+Tracking keeps detection freshness separate from rendered pose updates. A
+candidate advances the rendered pose when it exceeds either
+`fiducial_update_deadband_mm` or `fiducial_update_deadband_degrees`. Sub-threshold motion is compared with the last
+published pose, not the previous frame, so small movements accumulate instead
+of being discarded forever.
+
 ## Preview, performance and claims
 
 Capture, retained-frame publication, tracking, calibration validity, projector

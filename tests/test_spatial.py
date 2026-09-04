@@ -50,6 +50,62 @@ class SpatialTrackerTest(unittest.TestCase):
         assert len(tracker.get_history('cards', 7, 'camera-0')) == 3
         assert len(tracker.get_history('cards', 7, 'camera-1')) == 3
 
+    def test_deadband_holds_rendered_pose_then_accumulates_motion(self) -> None:
+        clock = FakeClock()
+        tracker = SpatialTracker(
+            metric_calibration=_metric_calibration(),
+            update_deadband_mm=5.0,
+            update_deadband_degrees=10.0,
+            clock=clock,
+        )
+        first_state = tracker.update(
+            (_observation('cards', 1, 'camera-0', 1, 0.0, 100),),
+        )
+        held_state = tracker.update(
+            (_observation('cards', 1, 'camera-0', 2, 1.0, 104),),
+        )
+        moved_state = tracker.update(
+            (_observation('cards', 1, 'camera-0', 3, 2.0, 106),),
+        )
+
+        assert first_state.observations[('cards', 1)].surface.centre.x == 100, (
+            f'{first_state=}'
+        )
+        assert held_state.observations[('cards', 1)].surface.centre.x == 100, (
+            f'{held_state=}'
+        )
+        assert held_state.observations[('cards', 1)].frame_counter == 2, (
+            f'{held_state=}'
+        )
+        assert moved_state.observations[('cards', 1)].surface.centre.x == 106, (
+            f'{moved_state=}'
+        )
+
+    def test_deadband_updates_when_rotation_exceeds_threshold(self) -> None:
+        clock = FakeClock()
+        tracker = SpatialTracker(
+            metric_calibration=_metric_calibration(),
+            update_deadband_mm=5.0,
+            update_deadband_degrees=10.0,
+            clock=clock,
+        )
+        tracker.update(
+            (_observation('cards', 1, 'camera-0', 1, 0.0, 100),),
+        )
+        held_state = tracker.update(
+            (_observation('cards', 1, 'camera-0', 2, 1.0, 100, 9.0),),
+        )
+        rotated_state = tracker.update(
+            (_observation('cards', 1, 'camera-0', 3, 2.0, 100, 11.0),),
+        )
+
+        assert held_state.observations[('cards', 1)].surface.orientation_degrees == 0, (
+            f'{held_state=}'
+        )
+        assert abs(
+            rotated_state.observations[('cards', 1)].surface.orientation_degrees - 11,
+        ) < 1e-9, f'{rotated_state=}'
+
     def test_numeric_session_slot_ties_use_the_lowest_slot_id(self) -> None:
         clock = FakeClock(10)
         tracker = SpatialTracker(metric_calibration=_metric_calibration(), clock=clock)
@@ -382,12 +438,22 @@ def _observation(
     frame_counter: int,
     timestamp: float,
     x_pos: float,
+    orientation_degrees: float = 0.0,
 ) -> FiducialObservation:
-    corners = (
-        Point2D(x_pos - 5, 95),
-        Point2D(x_pos + 5, 95),
-        Point2D(x_pos + 5, 105),
-        Point2D(x_pos - 5, 105),
+    angle_radians = math.radians(orientation_degrees)
+    corners = tuple(
+        Point2D(
+            x_pos + math.cos(angle_radians) * x_offset
+            - math.sin(angle_radians) * y_offset,
+            100 + math.sin(angle_radians) * x_offset
+            + math.cos(angle_radians) * y_offset,
+        )
+        for x_offset, y_offset in (
+            (-5, -5),
+            (5, -5),
+            (5, 5),
+            (-5, 5),
+        )
     )
     return build_fiducial_observation(
         DetectedMarker(marker_id, corners),

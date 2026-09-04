@@ -136,6 +136,8 @@ class SpatialTracker:
         grace_period_seconds: float = 5.0,
         metric_calibration: object | None = None,
         protection_margin_mm: float = 5.0,
+        update_deadband_mm: float = 5.0,
+        update_deadband_degrees: float = 10.0,
         clock: Clock | None = None,
     ) -> None:
         _validate_positive_integer(history_length, 'history_length')
@@ -146,17 +148,25 @@ class SpatialTracker:
             protection_margin_mm,
             'protection_margin_mm',
         )
+        _validate_non_negative_number(update_deadband_mm, 'update_deadband_mm')
+        _validate_non_negative_number(
+            update_deadband_degrees,
+            'update_deadband_degrees',
+        )
         if clock is not None and not callable(clock):
             raise TypeError('clock must be callable')
 
         self._history_length = history_length
         self._grace_period_seconds = float(grace_period_seconds)
         self._protection_margin_mm = float(protection_margin_mm)
+        self._update_deadband_mm = float(update_deadband_mm)
+        self._update_deadband_degrees = float(update_deadband_degrees)
         self._clock = clock if clock is not None else _monotonic_seconds
         self._lock = threading.RLock()
         self._histories: dict[ObservationKey, deque[FiducialObservation]] = {}
         self._current_candidates: dict[ObservationKey, FiducialObservation] = {}
         self._last_selected: dict[FiducialIdentity, FiducialObservation] = {}
+        self._last_published: dict[FiducialIdentity, FiducialObservation] = {}
         self._camera_generations: dict[str, CameraGeneration] = {}
         self._metric_calibration = metric_calibration
         self._metric_signature = _calibration_signature(metric_calibration)
@@ -323,6 +333,7 @@ class SpatialTracker:
             self._histories.clear()
             self._current_candidates.clear()
             self._last_selected.clear()
+            self._last_published.clear()
             self._camera_generations.clear()
             self._detector_failures = ()
             self._set_metric_calibration_locked(metric_calibration)
@@ -520,6 +531,7 @@ class SpatialTracker:
         )
         for identity in selected_keys:
             self._last_selected.pop(identity, None)
+            self._last_published.pop(identity, None)
 
     def _publish_locked(
         self,
@@ -626,6 +638,7 @@ class SpatialTracker:
         )
         for identity in expired_identities:
             self._last_selected.pop(identity, None)
+            self._last_published.pop(identity, None)
 
     def _select_candidates_locked(
         self,
@@ -660,8 +673,25 @@ class SpatialTracker:
                         else _unwarmed_candidate_key
                     ),
                 )
-                selected[identity] = selected_candidate
-                self._last_selected[identity] = selected_candidate.observation
+                candidate_observation = selected_candidate.observation
+                previous_observation = self._last_published.get(identity)
+                published_observation = candidate_observation
+                if previous_observation is not None and not _pose_exceeds_deadband(
+                    previous_observation,
+                    candidate_observation,
+                    self._update_deadband_mm,
+                    self._update_deadband_degrees,
+                ):
+                    published_observation = _refresh_observation_metadata(
+                        previous_observation,
+                        candidate_observation,
+                    )
+                selected[identity] = _Candidate(
+                    published_observation,
+                    selected_candidate.history,
+                )
+                self._last_selected[identity] = published_observation
+                self._last_published[identity] = published_observation
                 continue
 
             retained_observation = self._last_selected.get(identity)
@@ -678,6 +708,48 @@ class SpatialTracker:
                     tuple(self._histories.get(key, ())),
                 )
         return selected
+
+
+def _pose_exceeds_deadband(
+    previous: FiducialObservation,
+    current: FiducialObservation,
+    deadband_mm: float,
+    deadband_degrees: float,
+) -> bool:
+    if (
+        previous.camera_slot != current.camera_slot
+        or previous.camera_lifecycle_generation != current.camera_lifecycle_generation
+        or previous.camera_calibration_generation != current.camera_calibration_generation
+    ):
+        return True
+    previous_surface = previous.surface
+    current_surface = current.surface
+    if previous_surface is None or current_surface is None:
+        return True
+    displacement_mm = math.hypot(
+        current_surface.centre.x - previous_surface.centre.x,
+        current_surface.centre.y - previous_surface.centre.y,
+    )
+    angle_delta = (
+        current_surface.orientation_degrees
+        - previous_surface.orientation_degrees
+    )
+    rotation_degrees = abs((angle_delta + 180.0) % 360.0 - 180.0)
+    return displacement_mm > deadband_mm or rotation_degrees > deadband_degrees
+
+
+def _refresh_observation_metadata(
+    previous: FiducialObservation,
+    current: FiducialObservation,
+) -> FiducialObservation:
+    return previous._replace(
+        marker_size_mm=current.marker_size_mm,
+        camera_slot=current.camera_slot,
+        camera_lifecycle_generation=current.camera_lifecycle_generation,
+        frame_counter=current.frame_counter,
+        received_monotonic_seconds=current.received_monotonic_seconds,
+        camera_calibration_generation=current.camera_calibration_generation,
+    )
 
 
 def calculate_stability_score(

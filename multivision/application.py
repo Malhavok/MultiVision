@@ -513,6 +513,8 @@ class MultiVisionService:
                 history_length=configuration.fiducial_history_length,
                 grace_period_seconds=configuration.fiducial_grace_period_seconds,
                 protection_margin_mm=configuration.fiducial_protection_margin_mm,
+                update_deadband_mm=configuration.fiducial_update_deadband_mm,
+                update_deadband_degrees=configuration.fiducial_update_deadband_degrees,
                 clock=effective_tracking_clock,
             )
         )

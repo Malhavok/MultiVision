@@ -132,6 +132,8 @@ class Configuration:
     fiducial_tracking_rate_hz: float = 30.0
     fiducial_grace_period_seconds: float = 5.0
     fiducial_protection_margin_mm: float = 5.0
+    fiducial_update_deadband_mm: float = 5.0
+    fiducial_update_deadband_degrees: float = 10.0
     max_batch_operations: int = 100
     preview_mode: str = 'active'
     preview_low_rate_hz: float = 10.0
@@ -179,6 +181,18 @@ class Configuration:
             'fiducial_protection_margin_mm',
             0.1,
             1000.0,
+        )
+        _validate_bounded_number(
+            self.fiducial_update_deadband_mm,
+            'fiducial_update_deadband_mm',
+            0.0,
+            1000.0,
+        )
+        _validate_bounded_number(
+            self.fiducial_update_deadband_degrees,
+            'fiducial_update_deadband_degrees',
+            0.0,
+            180.0,
         )
         _validate_bounded_positive_integer(
             self.max_batch_operations,
@@ -236,6 +250,14 @@ class Configuration:
             fiducial_protection_margin_mm=data.get(
                 'fiducial_protection_margin_mm',
                 5.0,
+            ),
+            fiducial_update_deadband_mm=data.get(
+                'fiducial_update_deadband_mm',
+                5.0,
+            ),
+            fiducial_update_deadband_degrees=data.get(
+                'fiducial_update_deadband_degrees',
+                10.0,
             ),
             max_batch_operations=data.get('max_batch_operations', 100),
             preview_mode=data.get('preview_mode', 'active'),
@@ -300,6 +322,8 @@ class Configuration:
             'fiducial_tracking_rate_hz': self.fiducial_tracking_rate_hz,
             'fiducial_grace_period_seconds': self.fiducial_grace_period_seconds,
             'fiducial_protection_margin_mm': self.fiducial_protection_margin_mm,
+            'fiducial_update_deadband_mm': self.fiducial_update_deadband_mm,
+            'fiducial_update_deadband_degrees': self.fiducial_update_deadband_degrees,
             'max_batch_operations': self.max_batch_operations,
             'preview_mode': self.preview_mode,
             'preview_low_rate_hz': self.preview_low_rate_hz,
