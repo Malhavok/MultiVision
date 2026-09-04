@@ -135,6 +135,15 @@ class CalibrationRequest(BaseModel):
     correspondences: list[CorrespondenceRequest] | None = None
 
 
+class FiducialGroupRequest(BaseModel):
+    """A session-local dictionary and physical size for one fiducial group."""
+
+    model_config = ConfigDict(extra='forbid', strict=True)
+
+    dictionary: str = Field(min_length=1)
+    marker_size_mm: float = Field(gt=0)
+
+
 class MetricCorrespondenceRequest(BaseModel):
     """One injected metric-target corner for deterministic tests."""
 
@@ -770,6 +779,29 @@ def create_app(
                 for group_name, group in groups.items()
             },
         }
+
+    @app.put('/fiducial-groups/{group_name}')
+    def set_fiducial_group(
+        group_name: Annotated[str, Path(min_length=1)],
+        request: FiducialGroupRequest,
+    ) -> dict[str, Any]:
+        group = owned_service.set_fiducial_group(
+            group_name,
+            request.dictionary,
+            request.marker_size_mm,
+        )
+        return {
+            'group': group_name,
+            'dictionary': group.dictionary,
+            'marker_size_mm': group.marker_size_mm,
+        }
+
+    @app.delete('/fiducial-groups/{group_name}')
+    def remove_fiducial_group(
+        group_name: Annotated[str, Path(min_length=1)],
+    ) -> dict[str, Any]:
+        owned_service.remove_fiducial_group(group_name)
+        return {'removed': group_name}
 
     @app.get('/spatial-state')
     def get_spatial_state() -> dict[str, Any]:

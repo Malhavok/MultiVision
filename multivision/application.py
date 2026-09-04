@@ -26,6 +26,7 @@ from multivision.camera import CameraRuntime
 from multivision.config import (
     CalibrationThresholds,
     Configuration,
+    FiducialGroup,
     ProjectorOutputDescriptor,
     load_configuration,
 )
@@ -738,8 +739,34 @@ class MultiVisionService:
             return spatial_state
 
     def get_fiducial_groups(self) -> dict[str, object]:
-        """Return a copy of the configured immutable group definitions."""
-        return dict(self.configuration.fiducial_groups)
+        """Return a copy of the current session-local group definitions."""
+        with self._camera_management_lock:
+            return dict(self.configuration.fiducial_groups)
+
+    def set_fiducial_group(
+        self,
+        group_name: str,
+        dictionary: str,
+        marker_size_mm: float,
+    ) -> FiducialGroup:
+        """Add or replace one tracking group without restarting the service."""
+        group = FiducialGroup(dictionary, marker_size_mm)
+        with self._camera_management_lock:
+            groups = dict(self.configuration.fiducial_groups)
+            groups[group_name] = group
+            self.configuration = replace(self.configuration, fiducial_groups=groups)
+            self._invalidate_spatial_state()
+            return group
+
+    def remove_fiducial_group(self, group_name: str) -> None:
+        """Remove one session-local tracking group and its observations."""
+        with self._camera_management_lock:
+            if group_name not in self.configuration.fiducial_groups:
+                raise KeyError(group_name)
+            groups = dict(self.configuration.fiducial_groups)
+            del groups[group_name]
+            self.configuration = replace(self.configuration, fiducial_groups=groups)
+            self._invalidate_spatial_state()
 
     def get_benchmark_metrics(self) -> dict[str, object]:
         """Return process-local runtime counters for performance evidence."""

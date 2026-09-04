@@ -5,7 +5,13 @@ ADRs 0001–0003 remain authoritative; this document does not amend them. The
 runtime remains game-agnostic, session-owned, and based on the existing camera
 → projector and metric calibration authorities.
 
-## Startup configuration
+## Group configuration
+
+`fiducial_groups` in the JSON file provides optional startup defaults, but group
+definitions are session-local and may be added, replaced or removed at runtime
+without restarting or recalibrating. The runtime API is `PUT
+/fiducial-groups/{group_name}` and `DELETE /fiducial-groups/{group_name}`; the
+CLI equivalents are `fiducial-groups set` and `fiducial-groups remove`.
 
 `fiducial_groups` is a JSON object keyed by a non-empty namespace. Every value
 has **exactly** these two fields:
@@ -21,10 +27,12 @@ has **exactly** these two fields:
 
 `dictionary` uses the canonical Plan6 detector dictionary validation and
 `marker_size_mm` is positive and finite. An empty object is valid and means
-that no fiducial namespace is configured. There is no default group, no
+that no startup namespace is configured. There is no default group, no
 per-group default dictionary or marker size, and no ID-only fallback. A
 fiducial identity is always `(group, id)`, so equal numeric IDs in different
-groups remain distinct. Unknown fields inside a group definition are rejected;
+groups remain distinct. Runtime registration still requires the dictionary and
+physical marker size explicitly; metric calibration supplies the coordinate
+transform, but does not silently infer or persist those group semantics. Unknown fields inside a group definition are rejected;
 unrelated top-level configuration fields continue to be preserved when the
 configuration file is updated.
 

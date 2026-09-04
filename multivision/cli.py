@@ -102,6 +102,20 @@ class MultiVisionClient:
     def get_fiducial_groups(self) -> ServiceResponse:
         return self.get('/fiducial-groups')
 
+    def set_fiducial_group(
+        self,
+        group_name: str,
+        dictionary: str,
+        marker_size_mm: float,
+    ) -> ServiceResponse:
+        return self.put(
+            f'/fiducial-groups/{_quote_path_component(group_name)}',
+            {'dictionary': dictionary, 'marker_size_mm': marker_size_mm},
+        )
+
+    def remove_fiducial_group(self, group_name: str) -> ServiceResponse:
+        return self.delete(f'/fiducial-groups/{_quote_path_component(group_name)}')
+
     def get_spatial_state(self) -> ServiceResponse:
         return self.get('/spatial-state')
 
@@ -471,6 +485,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help='inspect configured fiducial groups',
     )
     fiducial_groups_parser.set_defaults(command_handler='fiducial_groups')
+    fiducial_group_subparsers = fiducial_groups_parser.add_subparsers(
+        dest='fiducial_groups_command',
+    )
+    fiducial_groups_set_parser = fiducial_group_subparsers.add_parser(
+        'set',
+        help='add or replace a session-local fiducial group',
+    )
+    fiducial_groups_set_parser.add_argument('group_name', type=_parse_non_empty_argument)
+    fiducial_groups_set_parser.add_argument('--dictionary', required=True, type=_parse_non_empty_argument)
+    fiducial_groups_set_parser.add_argument('--marker-size-mm', required=True, type=_parse_finite_float)
+    fiducial_groups_set_parser.set_defaults(command_handler='fiducial_group_set')
+    fiducial_groups_remove_parser = fiducial_group_subparsers.add_parser(
+        'remove',
+        help='remove a session-local fiducial group',
+    )
+    fiducial_groups_remove_parser.add_argument('group_name', type=_parse_non_empty_argument)
+    fiducial_groups_remove_parser.set_defaults(command_handler='fiducial_group_remove')
     spatial_state_parser = subparsers.add_parser(
         'spatial-state',
         aliases=('spatial',),
@@ -632,6 +663,8 @@ def _run_command(
         'intensity_get': _intensity_get,
         'intensity_set': _intensity_set,
         'fiducial_groups': _fiducial_groups,
+        'fiducial_group_set': _fiducial_group_set,
+        'fiducial_group_remove': _fiducial_group_remove,
         'spatial_state': _spatial_state,
         'metric_target_generate': _metric_target_generate,
         'metric_calibrate': _metric_calibrate,
@@ -857,6 +890,24 @@ def _fiducial_groups(
     _arguments: argparse.Namespace,
 ) -> ServiceResponse:
     return client.get_fiducial_groups()
+
+
+def _fiducial_group_set(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.set_fiducial_group(
+        arguments.group_name,
+        arguments.dictionary,
+        arguments.marker_size_mm,
+    )
+
+
+def _fiducial_group_remove(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.remove_fiducial_group(arguments.group_name)
 
 
 def _spatial_state(

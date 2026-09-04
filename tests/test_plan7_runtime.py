@@ -160,6 +160,20 @@ def _make_service(
     return service
 
 
+def test_fiducial_groups_can_change_without_restarting_the_service() -> None:
+    runtime = _Runtime()
+    service = MultiVisionService(
+        Configuration(preview_mode='off'),
+        camera_runtime=runtime,  # type: ignore[arg-type]
+        sleep_inhibitor=_SleepInhibitor(),
+    )
+
+    service.set_fiducial_group('demo', 'DICT_5X5_1000', 25.4)
+    assert service.get_fiducial_groups()['demo'].marker_size_mm == 25.4
+    service.remove_fiducial_group('demo')
+    assert 'demo' not in service.get_fiducial_groups()
+
+
 def test_tracking_worker_uses_retained_frames_and_all_configured_groups() -> None:
     runtime = _Runtime()
     detector_calls: list[str] = []
