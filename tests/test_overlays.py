@@ -456,10 +456,10 @@ def test_dynamic_anchor_only_rotates_orientation_bearing_geometry() -> None:
     circle_geometry = build_circle(circle, spatial_state=state)
     text_geometry = build_text(text, spatial_state=state)
 
-    assert rectangle_geometry.angle_deg == 105.0, f'{rectangle_geometry=}'
-    assert grid_geometry.angle_deg == 105.0, f'{grid_geometry=}'
+    assert rectangle_geometry.angle_deg == -75.0, f'{rectangle_geometry=}'
+    assert grid_geometry.angle_deg == -75.0, f'{grid_geometry=}'
     assert circle_geometry.centre == Point2D(5, 5), f'{circle_geometry=}'
-    assert text_geometry.angle_deg == 105.0, f'{text_geometry=}'
+    assert text_geometry.angle_deg == -75.0, f'{text_geometry=}'
     assert tuple(request.model_dump() for request in requests) == before_resolution
 
 
@@ -604,6 +604,29 @@ def test_physical_dynamic_arrow_uses_metric_authority_for_projector_materialisat
         abs=0.75,
     ), f'{materialisation=}'
     assert materialisation.polygons[0].points[0] == target_projector, (
+        f'{materialisation=}'
+    )
+
+
+def test_arrow_tip_inset_retracts_head_from_declared_end() -> None:
+    request = ArrowRequest(
+        start={'type': 'projector', 'x': 100, 'y': 100, 'unit': 'px'},
+        end={'type': 'projector', 'x': 200, 'y': 100, 'unit': 'px'},
+        geometry_space='projector_px',
+        head_length={'value': 10, 'unit': 'px'},
+        head_width={'value': 8, 'unit': 'px'},
+        tip_inset={'value': 20, 'unit': 'px'},
+    )
+
+    geometry = build_arrow(request)
+    materialisation = materialise_arrow(request, Resolution(400, 300))
+
+    assert geometry.end == Point2D(200, 100), f'{geometry=}'
+    assert geometry.head[0] == Point2D(180, 100), f'{geometry=}'
+    assert materialisation.segments[0].end == Point2D(170, 100), (
+        f'{materialisation=}'
+    )
+    assert materialisation.polygons[0].points[0] == Point2D(180, 100), (
         f'{materialisation=}'
     )
 

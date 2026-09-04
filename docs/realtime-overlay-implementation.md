@@ -113,7 +113,9 @@ unresolved runtime state rather than deletion of the request.
 
 An arrow request is declarative and contains `kind: "arrow"`, independent
 `start` and `end` anchors, a style, positive bounded `head_length` and
-`head_width` in the declared geometry space, and an optional label. Its two
+`head_width` in the declared geometry space, an optional `tip_inset` and an
+optional label. `tip_inset` retracts the triangle tip towards the shaft start
+while retaining the declared end anchor as the semantic target. Its two
 anchors are resolved independently, including surface/projector/fiducial
 combinations and fiducials from different groups. Materialisation consists of
 one shaft segment and one triangle head. A zero-length resolved arrow is

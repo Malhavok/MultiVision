@@ -773,6 +773,7 @@ class ArrowRequest(OverlayRequest):
     geometry_space: Literal['projector_px', 'surface_mm']
     head_length: Quantity
     head_width: Quantity
+    tip_inset: Quantity | None = None
     label: str | None = None
 
     @field_validator('label')
@@ -790,6 +791,12 @@ class ArrowRequest(OverlayRequest):
         ):
             if quantity.value > MAX_ARROW_HEAD_DIMENSION:
                 raise ValueError(f'{field_name} exceeds the bounded arrow dimension')
+        if self.tip_inset is not None:
+            self.tip_inset.validate_for_space(self.geometry_space)
+            if self.tip_inset.value < 0:
+                raise ValueError('tip_inset must not be negative')
+            if self.tip_inset.value > MAX_ARROW_HEAD_DIMENSION:
+                raise ValueError('tip_inset exceeds the bounded arrow dimension')
         return self
 
 
@@ -2266,7 +2273,7 @@ def build_rotated_rect(
         metric_calibration,
     )
     centre = resolved_centre.position
-    angle_deg = request.angle_deg + resolved_centre.orientation_degrees
+    angle_deg = request.angle_deg - resolved_centre.orientation_degrees
     width = request.width.value
     height = request.height.value
     half_width = width / 2.0
@@ -2317,7 +2324,7 @@ def build_text(
     return TextGeometry(
         resolved_position.position,
         request.text,
-        request.angle_deg + resolved_position.orientation_degrees,
+        request.angle_deg - resolved_position.orientation_degrees,
         request.scale,
         request.style,
     )
@@ -2383,7 +2390,7 @@ def build_grid(
         metric_calibration,
     )
     origin = resolved_origin.position
-    angle_deg = request.angle_deg + resolved_origin.orientation_degrees
+    angle_deg = request.angle_deg - resolved_origin.orientation_degrees
     spacing = request.spacing.value
     width = request.extent.width.value
     height = request.extent.height.value
@@ -2490,13 +2497,20 @@ def build_arrow(
     direction_y = difference_y / length
     head_length = request.head_length.value
     head_width = request.head_width.value
+    tip_inset = 0.0 if request.tip_inset is None else request.tip_inset.value
+    if tip_inset >= length:
+        raise ValueError('tip_inset must be shorter than the arrow')
+    tip = Point2D(
+        end.x - direction_x * tip_inset,
+        end.y - direction_y * tip_inset,
+    )
     base = Point2D(
-        end.x - direction_x * head_length,
-        end.y - direction_y * head_length,
+        tip.x - direction_x * head_length,
+        tip.y - direction_y * head_length,
     )
     perpendicular = Point2D(-direction_y, direction_x)
     head = (
-        end,
+        tip,
         Point2D(
             base.x + perpendicular.x * head_width / 2.0,
             base.y + perpendicular.y * head_width / 2.0,
