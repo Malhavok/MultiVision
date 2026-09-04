@@ -430,7 +430,12 @@ def test_plan5_service_is_atomic_and_invalidates_only_required_dependencies() ->
     service.update_projector_descriptor(
         ProjectorOutputDescriptor(Resolution(300, 200), 'projector-replaced'),
     )
-    assert service.list_overlays() == []
+    overlays = service.list_overlays()
+    assert [entry.name for entry in overlays] == ['projector-only']
+    assert overlays[0].projector_output_descriptor == ProjectorOutputDescriptor(
+        Resolution(300, 200),
+        'projector-replaced',
+    )
 
 
 def test_plan5_api_is_strict_json_safe_and_keeps_legacy_point_boundary() -> None:

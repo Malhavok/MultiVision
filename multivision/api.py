@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
 
@@ -52,6 +54,7 @@ from multivision.fiducials import (
 from multivision.geometry import (
     Point2D,
     Polygon,
+    TagGeometry,
 )
 from multivision.metric import (
     MetricCalibrationRecord,
@@ -61,7 +64,10 @@ from multivision.metric import (
 )
 from multivision.metric_target import METRIC_TARGET
 from multivision.overlays import (
+    AnyOverlayRequest,
+    ArrowRequest,
     CircleRequest,
+    FiducialAnchor,
     GridRequest,
     LineRequest,
     OverlayEntry,
@@ -69,6 +75,8 @@ from multivision.overlays import (
     RectRequest,
     RulerRequest,
     TextRequest,
+    get_overlay_point_references,
+    normalise_overlay_intensity,
 )
 from multivision.persistence import PersistedCalibration
 from multivision.pattern import validate_tag_dictionary
@@ -77,6 +85,7 @@ from multivision.session import (
     FrameMetadata,
     SessionCamera,
 )
+from multivision.spatial import SpatialState
 from multivision.types import (
     CalibrationStatus,
     CameraStatus,
@@ -210,6 +219,67 @@ class PointRequest(BaseModel):
         return _validate_coordinate(value)
 
 
+OverlayPayload = Annotated[
+    AnyOverlayRequest,
+    Field(discriminator='kind'),
+]
+
+
+class CreateOverlayOperation(BaseModel):
+    """One strict create operation in an overlay transaction."""
+
+    model_config = ConfigDict(extra='forbid', strict=True)
+
+    op: Literal['create']
+    request: OverlayPayload
+
+
+class UpdateOverlayOperation(BaseModel):
+    """One strict complete replacement in an overlay transaction."""
+
+    model_config = ConfigDict(extra='forbid', strict=True)
+
+    op: Literal['update']
+    selector: str = Field(min_length=1)
+    request: OverlayPayload
+
+
+class RemoveOverlayOperation(BaseModel):
+    """One strict removal in an overlay transaction."""
+
+    model_config = ConfigDict(extra='forbid', strict=True)
+
+    op: Literal['remove']
+    selector: str = Field(min_length=1)
+
+
+OverlayOperation = Annotated[
+    CreateOverlayOperation | UpdateOverlayOperation | RemoveOverlayOperation,
+    Field(discriminator='op'),
+]
+
+
+class OverlayBatchRequest(BaseModel):
+    """A bounded ordered set of overlay operations."""
+
+    model_config = ConfigDict(extra='forbid', strict=True)
+
+    operations: list[OverlayOperation] = Field(min_length=1, max_length=1000)
+
+
+class OverlayIntensityRequest(BaseModel):
+    """A bounded ordinary-overlay presentation intensity."""
+
+    model_config = ConfigDict(extra='forbid', strict=True)
+
+    intensity: float
+
+    @field_validator('intensity', mode='before')
+    @classmethod
+    def validate_intensity(cls, value: Any) -> float:
+        return normalise_overlay_intensity(value)
+
+
 def _validate_tag_dictionary_query(value: str | None) -> str | None:
     if value is None:
         return None
@@ -291,6 +361,54 @@ def create_app(
         return _error_response('INVALID_REQUEST', str(exception), 422)
 
     app.add_exception_handler(TypeError, handle_boundary_error)
+
+    @app.exception_handler(RuntimeError)
+    async def handle_service_failure(
+        _request: Request,
+        exception: RuntimeError,
+    ) -> JSONResponse:
+        return _error_response('SERVICE_FAILURE', str(exception), 503)
+
+    @app.middleware('http')
+    async def record_benchmark_request_timing(
+        request: Request,
+        call_next: Any,
+    ) -> Response:
+        if request.url.path == '/diagnostics/benchmark':
+            return await call_next(request)
+        started_seconds = time.perf_counter()
+        started_cpu_seconds = time.thread_time()
+        try:
+            return await call_next(request)
+        finally:
+            record_timing = getattr(owned_service, 'record_benchmark_timing', None)
+            if callable(record_timing):
+                record_timing(
+                    'request_validation_and_dispatch',
+                    time.perf_counter() - started_seconds,
+                    max(0.0, time.thread_time() - started_cpu_seconds),
+                )
+
+    @app.get('/diagnostics/benchmark')
+    def get_benchmark_diagnostics() -> dict[str, Any]:
+        get_metrics = getattr(owned_service, 'get_benchmark_metrics', None)
+        if not callable(get_metrics):
+            return {
+                'schema_version': 1,
+                'available': False,
+                'counters': {},
+                'timings': {},
+            }
+        return {
+            'schema_version': 1,
+            'available': True,
+            'configuration': {
+                'max_batch_operations': owned_service.configuration.max_batch_operations,
+                'preview_mode': owned_service.configuration.preview_mode,
+                'preview_low_rate_hz': owned_service.configuration.preview_low_rate_hz,
+            },
+            **get_metrics(),
+        }
 
     @app.get('/health')
     def get_health() -> dict[str, Any]:
@@ -501,6 +619,41 @@ def create_app(
         owned_service.clear_overlay()
         return {'cleared': True}
 
+    @app.post('/overlays/batch')
+    def apply_overlay_batch(request: OverlayBatchRequest) -> dict[str, Any]:
+        operations = _overlay_operations_to_service(owned_service, request.operations)
+        entries = owned_service.apply_overlay_batch(operations)
+        global_intensity = owned_service.get_overlay_intensity()
+        return {
+            'overlays': [
+                _overlay_entry_to_data(
+                    entry,
+                    include_runtime=True,
+                    global_intensity=global_intensity,
+                )
+                for entry in entries
+            ],
+        }
+
+    @app.post('/overlays/arrow')
+    def create_arrow_overlay(request: ArrowRequest) -> dict[str, Any]:
+        _validate_configured_fiducial_groups(owned_service, request)
+        entry = owned_service.create_overlay(request)
+        return _overlay_entry_to_data(
+            entry,
+            include_runtime=True,
+            global_intensity=owned_service.get_overlay_intensity(),
+        )
+
+    @app.get('/overlays/intensity')
+    def get_overlay_intensity() -> dict[str, float]:
+        return {'intensity': owned_service.get_overlay_intensity()}
+
+    @app.put('/overlays/intensity')
+    def set_overlay_intensity(request: OverlayIntensityRequest) -> dict[str, float]:
+        intensity = owned_service.set_overlay_intensity(request.intensity)
+        return {'intensity': intensity}
+
     @app.post('/overlays/grid')
     def create_grid_overlay(request: GridRequest) -> dict[str, Any]:
         return _overlay_entry_to_data(owned_service.create_overlay(request))
@@ -535,10 +688,30 @@ def create_app(
 
     @app.get('/overlays')
     def list_overlay_state() -> list[dict[str, Any]]:
+        global_intensity = owned_service.get_overlay_intensity()
         return [
-            _overlay_entry_to_data(entry)
+            _overlay_entry_to_data(
+                entry,
+                global_intensity=global_intensity,
+            )
             for entry in owned_service.list_overlays()
         ]
+
+    @app.put('/overlays/id/{overlay_id}')
+    def replace_overlay_by_id(
+        overlay_id: Annotated[UUID4, Path()],
+        request: OverlayPayload,
+    ) -> dict[str, Any]:
+        if 'id' in request.model_fields_set and request.id != overlay_id:
+            raise ValueError('Overlay replacement id must match its path')
+        _validate_configured_fiducial_groups(owned_service, request)
+        replacement = request.model_copy(update={'id': overlay_id})
+        entry = owned_service.update_overlay(overlay_id, replacement)
+        return _overlay_entry_to_data(
+            entry,
+            include_runtime=True,
+            global_intensity=owned_service.get_overlay_intensity(),
+        )
 
     @app.post('/overlays/id/{overlay_id}/show')
     def show_overlay_by_id(
@@ -580,6 +753,23 @@ def create_app(
     def clear_overlays() -> dict[str, bool]:
         owned_service.clear_overlays()
         return {'cleared': True}
+
+    @app.get('/fiducial-groups')
+    def get_fiducial_groups() -> dict[str, Any]:
+        groups = owned_service.get_fiducial_groups()
+        return {
+            'groups': {
+                group_name: {
+                    'dictionary': group.dictionary,
+                    'marker_size_mm': group.marker_size_mm,
+                }
+                for group_name, group in groups.items()
+            },
+        }
+
+    @app.get('/spatial-state')
+    def get_spatial_state() -> dict[str, Any]:
+        return _spatial_state_to_data(owned_service.get_spatial_state())
 
     return app
 
@@ -962,11 +1152,81 @@ def _overlay_to_data(overlay: RedCircleOverlay) -> dict[str, Any]:
     return overlay.to_data()
 
 
-def _overlay_entry_to_data(entry: OverlayEntry) -> dict[str, Any]:
+def _tag_geometry_to_data(geometry: TagGeometry) -> dict[str, Any]:
+    return {
+        'corners': [[point.x, point.y] for point in geometry.corners],
+        'centre': [geometry.centre.x, geometry.centre.y],
+        'orientation_degrees': geometry.orientation_degrees,
+        'area_px': geometry.area_px,
+    }
+
+
+def _overlay_operations_to_service(
+    service: MultiVisionService,
+    operations: list[OverlayOperation],
+) -> tuple[dict[str, Any], ...]:
+    """Convert validated HTTP models to the service's one transaction shape."""
+    service_operations: list[dict[str, Any]] = []
+    for operation in operations:
+        if isinstance(operation, CreateOverlayOperation):
+            _validate_configured_fiducial_groups(service, operation.request)
+            service_operations.append(
+                {'op': 'create', 'request': operation.request},
+            )
+            continue
+        if isinstance(operation, RemoveOverlayOperation):
+            service_operations.append(
+                {'op': 'remove', 'selector': operation.selector},
+            )
+            continue
+
+        _validate_configured_fiducial_groups(service, operation.request)
+        target_id = _get_overlay_replacement_id(operation.selector)
+        if 'id' in operation.request.model_fields_set:
+            if target_id is not None and operation.request.id != target_id:
+                raise ValueError('Overlay replacement id must match its selector')
+        elif target_id is not None:
+            operation_request = operation.request.model_copy(update={'id': target_id})
+            operation = operation.model_copy(update={'request': operation_request})
+        service_operations.append(
+            {
+                'op': 'update',
+                'selector': operation.selector,
+                'request': operation.request,
+            },
+        )
+    return tuple(service_operations)
+
+
+def _get_overlay_replacement_id(selector: str) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(selector)
+    except ValueError:
+        return None
+
+
+def _validate_configured_fiducial_groups(
+    service: MultiVisionService,
+    request: AnyOverlayRequest,
+) -> None:
+    groups = getattr(getattr(service, 'configuration', None), 'fiducial_groups', None)
+    if groups is None:
+        return
+    for reference in get_overlay_point_references(request):
+        if isinstance(reference, FiducialAnchor) and reference.group not in groups:
+            raise ValueError(f'Unknown fiducial group {reference.group!r}')
+
+
+def _overlay_entry_to_data(
+    entry: OverlayEntry,
+    *,
+    include_runtime: bool = False,
+    global_intensity: float = 1.0,
+) -> dict[str, Any]:
     if not isinstance(entry, OverlayEntry):
         raise GeometryError('Overlay service returned an invalid overlay entry')
     request_data = entry.request.model_dump(mode='json')
-    return {
+    data: dict[str, Any] = {
         'id': str(entry.id),
         'name': entry.name,
         'kind': entry.kind,
@@ -978,6 +1238,105 @@ def _overlay_entry_to_data(entry: OverlayEntry) -> dict[str, Any]:
             entry.projector_output_descriptor,
         ),
     }
+    # Keep static compatibility responses small, while dynamic entries expose
+    # the runtime distinction needed to explain temporary marker loss.
+    effective_intensity = normalise_overlay_intensity(
+        global_intensity * entry.request.style.intensity,
+    )
+    if include_runtime or entry.is_dynamic:
+        data.update(
+            {
+                'dynamic': entry.is_dynamic,
+                'resolved': entry.is_resolved,
+                'unresolved_reason': entry.unresolved_reason,
+                'fiducial_dependencies': [
+                    {'group': group, 'id': marker_id}
+                    for group, marker_id in entry.fiducial_dependencies
+                ],
+                'effective_intensity': effective_intensity,
+            },
+        )
+    elif effective_intensity != 1.0:
+        data['effective_intensity'] = effective_intensity
+    return data
+
+
+def _spatial_state_to_data(spatial_state: SpatialState) -> dict[str, Any]:
+    if not isinstance(spatial_state, SpatialState):
+        raise GeometryError('Spatial service returned an invalid state')
+    observations = []
+    for identity in sorted(spatial_state.selected_observations):
+        observation = spatial_state.selected_observations[identity]
+        observations.append(
+            {
+                'group': identity.group,
+                'id': identity.id,
+                'camera_slot': observation.camera_slot,
+                'marker_size_mm': observation.marker_size_mm,
+                'frame_counter': observation.frame_counter,
+                'camera_lifecycle_generation': observation.camera_lifecycle_generation,
+                'camera_calibration_generation': observation.camera_calibration_generation,
+                'received_monotonic_seconds': observation.received_monotonic_seconds,
+                'camera': _tag_geometry_to_data(observation.camera),
+                'projector': (
+                    None
+                    if observation.projector is None
+                    else _tag_geometry_to_data(observation.projector)
+                ),
+                'surface': (
+                    None
+                    if observation.surface is None
+                    else _tag_geometry_to_data(observation.surface)
+                ),
+                'last_seen_monotonic_seconds': spatial_state.last_seen_monotonic_seconds.get(
+                    identity,
+                ),
+                'stability_score': _finite_or_none(
+                    spatial_state.stability_scores.get(identity),
+                ),
+            },
+        )
+    freshness = [
+        {
+            'group': identity.group,
+            'id': identity.id,
+            'last_seen_monotonic_seconds': timestamp,
+        }
+        for identity, timestamp in sorted(
+            spatial_state.last_seen_monotonic_seconds.items(),
+        )
+    ]
+    camera_generations = {
+        camera_slot: {
+            'lifecycle_generation': generation.lifecycle_generation,
+            'calibration_generation': generation.calibration_generation,
+            'is_available': generation.is_available,
+            'is_open': generation.is_open,
+            'is_calibrated': generation.is_calibrated,
+        }
+        for camera_slot, generation in sorted(
+            spatial_state.camera_generations.items(),
+        )
+    }
+    detector_failures = [
+        {
+            'group': getattr(failure, 'group', None),
+            'dictionary': getattr(failure, 'dictionary', None),
+            'code': getattr(failure, 'code', 'TRACKING_ERROR'),
+            'message': str(getattr(failure, 'message', failure)),
+        }
+        for failure in spatial_state.detector_failures
+    ]
+    return _json_safe(
+        {
+            'generation': spatial_state.generation,
+            'selected_observations': observations,
+            'freshness': freshness,
+            'camera_generations': camera_generations,
+            'detector_failures': detector_failures,
+            'metric_calibration_available': spatial_state.metric_calibration is not None,
+        },
+    )
 
 
 def _frame_response(frame: Frame, logical_name: str) -> Response:
@@ -1027,6 +1386,14 @@ def _encoded_image_response(frame_data: Any) -> Response | None:
     except Exception as ex:  # noqa: BLE001 (Encoded image data is an external value).
         raise FrameCaptureError('OpenCV returned malformed encoded image data') from ex
     return Response(content=encoded_data, media_type='image/jpeg')
+
+
+def _finite_or_none(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
 
 
 def _json_safe(value: Any) -> Any:
@@ -1093,9 +1460,14 @@ app = create_app()
 
 __all__ = [
     'CalibrationRequest',
+    'CreateOverlayOperation',
+    'RemoveOverlayOperation',
+    'UpdateOverlayOperation',
     'MetricCalibrationRequest',
     'MetricCorrespondenceRequest',
     'MetricRulerRequest',
+    'OverlayBatchRequest',
+    'OverlayIntensityRequest',
     'CameraAreaRequest',
     'CameraRenameRequest',
     'CorrespondenceRequest',

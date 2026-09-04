@@ -8,10 +8,14 @@ import statistics
 import threading
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from typing import NamedTuple
+from typing import (
+    Callable,
+    NamedTuple,
+)
 
+from multivision.benchmarking import BenchmarkMetrics, measure_timing
 from multivision.calibration import CalibrationMetrics, calibrate_homography
 from multivision.camera import CameraRuntime
 from multivision.config import (
@@ -39,6 +43,7 @@ from multivision.geometry import (
     Polygon,
     PreviewTransform,
     TagGeometry,
+    build_protected_projector_regions,
     build_tag_geometry,
     calculate_available_projector_area,
     project_point,
@@ -49,6 +54,7 @@ from multivision.fiducials import (
     CameraCorrespondences,
     FiducialCorrespondence,
     FiducialDetector,
+    GroupTrackingError,
     MetricTargetCorrespondence,
     MetricTargetCorrespondences,
     OpenCVArucoDetector,
@@ -56,6 +62,7 @@ from multivision.fiducials import (
     TagDetectorFactory,
     assemble_correspondences,
     detect_and_assemble_metric_correspondences,
+    detect_configured_fiducial_observations,
     detect_fiducials,
     detect_tag_observations,
 )
@@ -80,19 +87,31 @@ from multivision.metric import (
 from multivision.metric_target import METRIC_TARGET
 from multivision.overlays import (
     AnyOverlayRequest,
+    ArrowRequest,
     CircleRequest,
+    FiducialAnchor,
     GridRequest,
     LineRequest,
     OverlayEntry,
     OverlayRegistry,
     PointReference,
     ProjectorCoverageGridRequest,
+    ProjectorMaterialisation,
     RectRequest,
     RulerRequest,
     TextRequest,
     build_projector_coverage_grid_request,
     get_overlay_dependencies,
+    get_overlay_point_references,
+    is_dynamic_overlay_request,
     materialise_overlay,
+    materialise_presentation,
+    normalise_overlay_intensity,
+)
+from multivision.spatial import (
+    CameraGeneration,
+    SpatialState,
+    SpatialTracker,
 )
 from multivision.pattern import (
     CalibrationPattern,
@@ -128,6 +147,7 @@ METRIC_CAPTURE_WAIT_TIMEOUT_SECONDS = 5.0
 METRIC_CAPTURE_SETTLE_SECONDS = 3.0
 METRIC_CAPTURE_FRAME_COUNT = 3
 METRIC_CAPTURE_CANDIDATE_FRAME_COUNT = 15
+TRACKING_WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 CALIBRATION_PATTERN_EDGE_MARGIN_PIXELS = 24.0
 AREA_COLOURS = (
     (70, 190, 255),
@@ -155,6 +175,88 @@ class ProjectionStatus(NamedTuple):
 
     def to_data(self) -> dict[str, str]:
         return {'code': self.code, 'message': self.message}
+
+
+class CameraRenderSnapshot(NamedTuple):
+    """Immutable diagnostic and retained-frame input for one camera card."""
+
+    slot_id: str
+    logical_name: str
+    status: CameraStatus
+    camera_state: SessionCameraState
+    lifecycle_generation: int
+    frame: Frame | None = None
+    calibration_metrics: CalibrationMetrics | None = None
+
+
+class RenderSnapshot(NamedTuple):
+    """One complete, immutable input for a projector render."""
+
+    generation: int
+    registry_generation: int
+    spatial_generation: int
+    spatial_state: SpatialState
+    projector_output_descriptor: ProjectorOutputDescriptor
+    overlays: tuple[OverlayEntry, ...]
+    metric_generation: int = 0
+    registry_entries: tuple[OverlayEntry, ...] | None = None
+    global_overlay_intensity: float = 1.0
+    protected_projector_regions: tuple[tuple[Point2D, ...], ...] = ()
+    camera_snapshots: tuple[CameraRenderSnapshot, ...] = ()
+    projector_areas: tuple[CameraArea, ...] = ()
+    metric_state: MetricCalibrationStatus = MetricCalibrationStatus.UNCALIBRATED
+    metric_ruler: MetricRulerOverlay | None = None
+    point_overlay: RedCircleOverlay | None = None
+    calibration_pattern_visible: bool = False
+    metric_capture_active: bool = False
+    calibration_pattern: CalibrationPattern | None = None
+
+    @property
+    def camera_statuses(self) -> tuple[CameraStatus, ...]:
+        return tuple(camera.status for camera in self.camera_snapshots)
+
+    @property
+    def preview_cameras(self) -> tuple[CameraRenderSnapshot, ...]:
+        return self.camera_snapshots
+
+    @property
+    def areas(self) -> tuple[CameraArea, ...]:
+        return self.projector_areas
+
+    @property
+    def generic_overlays(self) -> tuple[OverlayEntry, ...]:
+        return self.overlays
+
+    @property
+    def registry_snapshot(self) -> tuple[OverlayEntry, ...]:
+        if self.registry_entries is not None:
+            return self.registry_entries
+        return self.overlays
+
+    @property
+    def resolved_overlays(self) -> tuple[OverlayEntry, ...]:
+        return self.overlays
+
+    @property
+    def protected_regions(self) -> tuple[tuple[Point2D, ...], ...]:
+        return self.protected_projector_regions
+
+    @property
+    def intensity(self) -> float:
+        return self.global_overlay_intensity
+
+
+class _TrackingCycle(NamedTuple):
+    """The short-lived, authority-tagged input for one tracking pass."""
+
+    tracking_generation: int
+    metric_generation: int
+    projector_output_descriptor: ProjectorOutputDescriptor
+    metric_calibration: object | None
+    camera_states: Mapping[str, CameraGeneration]
+    camera_transforms: Mapping[str, MatrixLike]
+    frames_by_camera: Mapping[str, Frame]
+    received_monotonic_seconds: float
 
 
 class TagObservation(NamedTuple):
@@ -227,6 +329,9 @@ class MultiVisionService:
         calibration_pattern: CalibrationPattern | None = None,
         point_service: PointOverlayService | None = None,
         sleep_inhibitor: SleepInhibitor | None = None,
+        tracking_clock: Callable[[], float] | None = None,
+        spatial_tracker: SpatialTracker | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         if calibration_store is not None and not isinstance(
             calibration_store,
@@ -252,7 +357,10 @@ class MultiVisionService:
             raise ValueError('configuration must be Configuration')
         self.configuration = configuration
         self._projector_output_descriptor = configuration.projector_output_descriptor
-        self.overlay_registry = OverlayRegistry(self._projector_output_descriptor)
+        self.overlay_registry = OverlayRegistry(
+            self._projector_output_descriptor,
+            max_batch_operations=configuration.max_batch_operations,
+        )
         self.metric_calibration_registry = MetricCalibrationRegistry(
             self._projector_output_descriptor,
         )
@@ -328,6 +436,38 @@ class MultiVisionService:
         self._spatial_capture_operation_lock = threading.RLock()
         self._metric_capture_generation = 0
         self._metric_blank_presented = threading.Event()
+        if tracking_clock is not None and clock is not None:
+            raise ValueError('Specify only one tracking clock')
+        effective_tracking_clock = tracking_clock or clock or time.monotonic
+        if not callable(effective_tracking_clock):
+            raise ValueError('tracking_clock must be callable')
+        self._tracking_clock = effective_tracking_clock
+        self._spatial_tracker = (
+            spatial_tracker
+            if spatial_tracker is not None
+            else SpatialTracker(
+                history_length=configuration.fiducial_history_length,
+                grace_period_seconds=configuration.fiducial_grace_period_seconds,
+                protection_margin_mm=configuration.fiducial_protection_margin_mm,
+                clock=effective_tracking_clock,
+            )
+        )
+        if not isinstance(self._spatial_tracker, SpatialTracker):
+            raise ValueError('spatial_tracker must be SpatialTracker')
+        self._tracking_control_lock = threading.RLock()
+        self._tracking_generation = 0
+        self._tracker_published_spatial_state: SpatialState | None = None
+        self._camera_calibration_generations: dict[str, int] = {}
+        self._camera_calibration_signatures: dict[str, object] = {}
+        self._tracking_stop_event = threading.Event()
+        self._tracking_thread: threading.Thread | None = None
+        self._benchmark_metrics = BenchmarkMetrics()
+        self._tracking_error: Exception | None = None
+        self._spatial_state = SpatialState.empty()
+        self._overlay_intensity = 1.0
+        self._render_state_lock = threading.RLock()
+        self._render_snapshot: RenderSnapshot | None = None
+        self._render_generation = 0
         self._is_running = False
         self._has_stopped = False
 
@@ -367,6 +507,7 @@ class MultiVisionService:
                 self._projector_output_descriptor,
             ):
                 self.overlay_registry.invalidate_metric()
+                self._invalidate_spatial_metric_state()
                 self._metric_ruler = None
             return self._metric_ruler
 
@@ -432,8 +573,9 @@ class MultiVisionService:
             status = self.metric_calibration_registry.get_status(
                 self._projector_output_descriptor,
             )
-            if status is MetricCalibrationStatus.STALE:
+            if status is not MetricCalibrationStatus.CALIBRATED:
                 self.overlay_registry.invalidate_metric()
+                self._invalidate_spatial_metric_state()
             return status, self.metric_calibration_registry.record
 
     def clear_metric_calibration(self) -> None:
@@ -442,6 +584,7 @@ class MultiVisionService:
             self._metric_capture_generation += 1
             self.overlay_registry.invalidate_metric()
             self.metric_calibration_registry.clear()
+            self._invalidate_spatial_metric_state()
             self._metric_ruler = None
 
     def create_projector_coverage_grid(
@@ -453,69 +596,450 @@ class MultiVisionService:
             raise ValueError('request must be ProjectorCoverageGridRequest')
         with self._camera_management_lock:
             metric_calibration = self._require_overlay_metric_calibration()
-            grid_request = build_projector_coverage_grid_request(
-                request,
-                metric_calibration,
-                self._projector_output_descriptor.projector_resolution,
-            )
-            return self.create_overlay(grid_request)
+            projector_resolution = self._projector_output_descriptor.projector_resolution
+        grid_request = build_projector_coverage_grid_request(
+            request,
+            metric_calibration,
+            projector_resolution,
+        )
+        return self.create_overlay(grid_request)
 
     def create_overlay(self, request: AnyOverlayRequest) -> OverlayEntry:
-        """Materialise and register one generic overlay atomically."""
-        if not isinstance(
-            request,
-            (
-                GridRequest,
-                CircleRequest,
-                RectRequest,
-                TextRequest,
-                LineRequest,
-                RulerRequest,
-            ),
-        ):
+        """Create one overlay through the same transaction as a batch."""
+        if not isinstance(request, (GridRequest, CircleRequest, RectRequest, TextRequest,
+                                    LineRequest, RulerRequest, ArrowRequest)):
             raise ValueError('request must be an overlay request')
-
+        entries = self.apply_overlay_batch(({'op': 'create', 'request': request},))
         with self._camera_management_lock:
-            request = self._canonicalise_overlay_camera_references(request)
-            # A projector-only request still observes the current registry, so stale
-            # dependencies cannot survive until the next renderable snapshot.
             self._invalidate_unusable_overlay_dependencies()
-            camera_dependencies, metric_dependency = get_overlay_dependencies(request)
-            camera_authorities = (
-                self._get_overlay_camera_authorities(camera_dependencies)
-                if len(camera_dependencies) > 0
-                else None
-            )
-            metric_calibration = (
-                self._require_overlay_metric_calibration()
-                if metric_dependency
-                else None
-            )
+        return entries[-1]
 
-            materialised_primitives = materialise_overlay(
-                request,
-                self._projector_output_descriptor.projector_resolution,
-                camera_authorities,
-                metric_calibration,
-                self.configuration.overlay_limits,
+    def apply_overlay_batch(self, operations: Sequence[object]) -> list[OverlayEntry]:
+        """Apply ordered overlay mutations with one bounded publication."""
+        with measure_timing(
+            self._benchmark_metrics,
+            'registry_candidate_build_publication',
+        ):
+            canonical_operations = self._canonicalise_overlay_operations(operations)
+            entries = self.overlay_registry.apply_batch(
+                canonical_operations,
+                materialise_request=self._materialise_overlay_request,
+                max_operations=self.configuration.max_batch_operations,
             )
-            return self.overlay_registry.create(request, materialised_primitives)
+        self._benchmark_metrics.increment(
+            'accepted_mutations',
+            len(canonical_operations),
+        )
+        self._benchmark_metrics.increment('published_transactions')
+        return entries
+
+    apply_overlays_batch = apply_overlay_batch
+
+    def update_overlay(
+        self,
+        selector: str | uuid.UUID,
+        request: AnyOverlayRequest,
+    ) -> OverlayEntry:
+        """Replace one complete overlay specification without changing its order."""
+        entries = self.apply_overlay_batch((
+            {'op': 'update', 'selector': selector, 'request': request},
+        ))
+        return next(entry for entry in entries if entry.id == request.id)
 
     def list_overlays(self) -> list[OverlayEntry]:
-        """Return usable generic overlays in their insertion order."""
+        """Return retained generic overlays in deterministic insertion order."""
         with self._camera_management_lock:
             self._invalidate_unusable_overlay_dependencies()
-            return self.overlay_registry.list()
+            self._invalidate_stale_spatial_authorities_locked()
+        self.get_spatial_state()
+        return list(self.overlay_registry.resolve(self._materialise_overlay_request))
+
+    @property
+    def spatial_state(self) -> SpatialState:
+        return self.get_spatial_state()
+
+    def get_spatial_state(self) -> SpatialState:
+        """Return the latest immutable spatial publication."""
+        with self._tracking_control_lock:
+            with self._render_state_lock:
+                spatial_state = self._spatial_state
+                tracker_state = self._tracker_published_spatial_state
+            if tracker_state is spatial_state:
+                refreshed_state = self._spatial_tracker.snapshot
+                if refreshed_state is not spatial_state:
+                    with self._render_state_lock:
+                        if self._spatial_state is spatial_state:
+                            self._spatial_state = refreshed_state
+                            self._tracker_published_spatial_state = refreshed_state
+                            spatial_state = refreshed_state
+            return spatial_state
+
+    def get_fiducial_groups(self) -> dict[str, object]:
+        """Return a copy of the configured immutable group definitions."""
+        return dict(self.configuration.fiducial_groups)
+
+    def get_benchmark_metrics(self) -> dict[str, object]:
+        """Return process-local runtime counters for performance evidence."""
+        return self._benchmark_metrics.snapshot()
+
+    def record_benchmark_timing(
+        self,
+        component: str,
+        elapsed_seconds: float,
+        cpu_seconds: float,
+        stalled: bool = False,
+    ) -> None:
+        """Accept display timings without coupling the renderer to benchmark code."""
+        self._benchmark_metrics.record_timing(
+            component,
+            elapsed_seconds,
+            cpu_seconds,
+            stalled,
+        )
+
+    @property
+    def spatial_tracker(self) -> SpatialTracker:
+        return self._spatial_tracker
+
+    @property
+    def tracking_thread(self) -> threading.Thread | None:
+        return self._tracking_thread
+
+    @property
+    def tracking_error(self) -> Exception | None:
+        return self._tracking_error
+
+    def run_tracking_cycle(self) -> SpatialState:
+        """Run one retained-frame tracking cycle without touching camera handles."""
+        return self._run_tracking_cycle()
+
+    update_spatial_tracking = run_tracking_cycle
+    track_once = run_tracking_cycle
+
+    @property
+    def overlay_intensity(self) -> float:
+        with self._render_state_lock:
+            return self._overlay_intensity
+
+    @property
+    def global_overlay_intensity(self) -> float:
+        return self.overlay_intensity
+
+    def get_overlay_intensity(self) -> float:
+        return self.overlay_intensity
+
+    def get_global_overlay_intensity(self) -> float:
+        return self.overlay_intensity
+
+    def set_overlay_intensity(self, intensity: object) -> float:
+        """Set the session-local ordinary-overlay presentation intensity."""
+        checked_intensity = normalise_overlay_intensity(intensity)
+        with self._render_state_lock:
+            self._overlay_intensity = checked_intensity
+        return checked_intensity
+
+    set_global_overlay_intensity = set_overlay_intensity
+
+    def update_spatial_state(self, spatial_state: SpatialState) -> SpatialState:
+        """Publish a complete spatial state for subsequent dynamic resolution."""
+        if not isinstance(spatial_state, SpatialState):
+            raise ValueError('spatial_state must be SpatialState')
+        with self._tracking_control_lock:
+            self._tracking_generation += 1
+            with self._render_state_lock:
+                self._spatial_state = spatial_state
+                self._tracker_published_spatial_state = None
+        return spatial_state
+
+    set_spatial_state = update_spatial_state
+
+    def _get_render_camera_statuses_locked(
+        self,
+        cameras: Sequence[SessionCamera] | None,
+    ) -> list[CameraStatus]:
+        """Read runtime status without falling back to a fresh camera frame."""
+        get_statuses = getattr(self.camera_runtime, 'get_statuses', None)
+        if callable(get_statuses):
+            return self.get_camera_statuses()
+        if cameras is None:
+            return []
+        get_status = getattr(self.camera_runtime, 'get_status', None)
+        statuses: list[CameraStatus] = []
+        for camera in cameras:
+            if callable(get_status):
+                status = get_status(camera.slot_id)
+                if not isinstance(status, CameraStatus):
+                    raise CameraUnavailableError(
+                        f'Camera {camera.slot_id!r} returned an invalid status',
+                    )
+                _validate_camera_status(status, camera.slot_id)
+                status = status._replace(
+                    calibration_status=self._get_calibration_status(status),
+                )
+            else:
+                status = CameraStatus(
+                    camera.slot_id,
+                    None if camera.device_info is None else camera.device_info.device_id,
+                    {
+                        SessionCameraState.OPEN: RuntimeStatus.AVAILABLE,
+                        SessionCameraState.CLOSED: RuntimeStatus.STOPPED,
+                        SessionCameraState.UNAVAILABLE: RuntimeStatus.UNAVAILABLE,
+                    }[camera.state],
+                    camera.calibration_status,
+                    None if camera.device_info is None else camera.device_info.native_resolution,
+                    0 if camera.frame_metadata is None else camera.frame_metadata.frame_counter,
+                    camera.error_message,
+                )
+            statuses.append(status)
+        return statuses
+
+    def _capture_render_camera_inputs_locked(
+        self,
+    ) -> tuple[
+        tuple[CameraRenderSnapshot, ...],
+        tuple[CameraArea, ...],
+        MetricCalibrationStatus,
+        MetricRulerOverlay | None,
+        RedCircleOverlay | None,
+        bool,
+        bool,
+    ]:
+        """Capture only retained diagnostic inputs for a complete render snapshot."""
+        cameras = self._get_session_cameras()
+        statuses = self._get_render_camera_statuses_locked(cameras)
+        statuses_by_slot = {status.logical_name: status for status in statuses}
+        latest_frames: Mapping[str, Frame] = {}
+        snapshot_latest_frames = getattr(
+            self.camera_runtime,
+            'snapshot_latest_frames',
+            None,
+        )
+        if callable(snapshot_latest_frames):
+            candidate_frames = snapshot_latest_frames()
+            if isinstance(candidate_frames, Mapping):
+                latest_frames = {
+                    slot_id: frame
+                    for slot_id, frame in candidate_frames.items()
+                    if isinstance(slot_id, str) and isinstance(frame, Frame)
+                }
+
+        camera_snapshots: list[CameraRenderSnapshot] = []
+        if cameras is None or len(cameras) == 0:
+            for status in statuses:
+                camera_snapshots.append(
+                    CameraRenderSnapshot(
+                        status.logical_name,
+                        status.logical_name,
+                        status,
+                        _get_camera_state_from_status(status),
+                        0,
+                        latest_frames.get(status.logical_name),
+                    ),
+                )
+        else:
+            for camera in cameras:
+                status = statuses_by_slot.get(camera.slot_id)
+                if status is None:
+                    continue
+                calibration_metrics = (
+                    camera.calibration.metrics
+                    if isinstance(camera.calibration, PersistedCalibration)
+                    else None
+                )
+                camera_snapshots.append(
+                    CameraRenderSnapshot(
+                        camera.slot_id,
+                        camera.display_name,
+                        status,
+                        camera.state,
+                        camera.lifecycle_generation,
+                        latest_frames.get(camera.slot_id),
+                        calibration_metrics,
+                    ),
+                )
+
+        get_metric_status = getattr(
+            self.metric_calibration_registry,
+            'get_status',
+            None,
+        )
+        if callable(get_metric_status):
+            metric_state = get_metric_status(self._projector_output_descriptor)
+        else:
+            metric_record = getattr(self.metric_calibration_registry, 'get_record', lambda: None)()
+            metric_state = getattr(
+                metric_record,
+                'state',
+                MetricCalibrationStatus.UNCALIBRATED,
+            )
+        if not isinstance(metric_state, MetricCalibrationStatus):
+            metric_state = MetricCalibrationStatus.UNCALIBRATED
+        metric_ruler = (
+            self._metric_ruler
+            if metric_state is MetricCalibrationStatus.CALIBRATED
+            else None
+        )
+        with self._calibration_capture_lock:
+            calibration_pattern_visible = (
+                self._calibration_pattern_hold or self._calibration_capture_count > 0
+            )
+        with self._metric_capture_lock:
+            metric_capture_active = self._metric_capture_count > 0
+        return (
+            tuple(camera_snapshots),
+            tuple(self._get_camera_areas_locked())
+            if cameras is not None and len(cameras) > 0
+            else (),
+            metric_state,
+            metric_ruler,
+            self.point_service.overlay,
+            calibration_pattern_visible,
+            metric_capture_active,
+        )
+
+    def get_render_snapshot(self) -> RenderSnapshot:
+        """Resolve retained requests against one spatial generation."""
+        with measure_timing(
+            self._benchmark_metrics,
+            'spatial_resolution_materialisation',
+        ):
+            return self._get_render_snapshot()
+
+    def _get_render_snapshot(self) -> RenderSnapshot:
+        """Resolve retained requests against one spatial generation."""
+        with self._camera_management_lock:
+            self._invalidate_unusable_overlay_dependencies()
+            self._invalidate_stale_spatial_authorities_locked()
+        for _attempt in range(2):
+            with self._camera_management_lock:
+                render_camera_inputs = self._capture_render_camera_inputs_locked()
+                descriptor = self._projector_output_descriptor
+                metric_generation = self._metric_capture_generation
+            (
+                camera_snapshots,
+                projector_areas,
+                metric_state,
+                metric_ruler,
+                point_overlay,
+                pattern_visible,
+                metric_capture_active,
+            ) = render_camera_inputs
+            spatial_state = self.get_spatial_state()
+            registry_generation = self.overlay_registry.generation
+            registry_entries = self.overlay_registry.snapshot()
+            source_overlays = self.overlay_registry.resolve(
+                lambda request: self._materialise_overlay_request(
+                    request,
+                    spatial_state,
+                    descriptor,
+                ),
+            )
+            protected_regions = _get_render_protection_regions(
+                spatial_state,
+                self.configuration.fiducial_protection_margin_mm,
+            )
+            with self._render_state_lock:
+                global_overlay_intensity = self._overlay_intensity
+            overlays = tuple(
+                entry._replace(
+                    materialised_primitives=materialise_presentation(
+                        entry.materialised_primitives,
+                        global_overlay_intensity,
+                        protected_regions,
+                    ),
+                )
+                for entry in source_overlays
+            )
+            snapshot: RenderSnapshot | None = None
+            with self._camera_management_lock:
+                self._invalidate_stale_spatial_authorities_locked()
+                with self._render_state_lock:
+                    if descriptor != self._projector_output_descriptor:
+                        continue
+                    if metric_generation != self._metric_capture_generation:
+                        continue
+                    if spatial_state is not self._spatial_state:
+                        continue
+                    if global_overlay_intensity != self._overlay_intensity:
+                        continue
+
+                    def publish_snapshot() -> None:
+                        nonlocal snapshot
+                        self._render_generation += 1
+                        snapshot = RenderSnapshot(
+                            self._render_generation,
+                            registry_generation,
+                            spatial_state.generation,
+                            spatial_state,
+                            descriptor,
+                            overlays,
+                            metric_generation,
+                            registry_entries,
+                            global_overlay_intensity,
+                            protected_regions,
+                            camera_snapshots,
+                            projector_areas,
+                            metric_state,
+                            metric_ruler,
+                            point_overlay,
+                            pattern_visible,
+                            metric_capture_active,
+                            self.calibration_pattern,
+                        )
+                        self._render_snapshot = snapshot
+
+                    if self.overlay_registry.publish_if_generation(
+                        registry_generation,
+                        publish_snapshot,
+                    ):
+                        assert snapshot is not None
+                        return snapshot
+        with self._camera_management_lock:
+            current_descriptor = self._projector_output_descriptor
+            current_metric_generation = self._metric_capture_generation
+        with self._render_state_lock:
+            current_spatial_state = self._spatial_state
+            current_overlay_intensity = self._overlay_intensity
+            previous_snapshot = self._render_snapshot
+        current_registry_generation = self.overlay_registry.generation
+        if previous_snapshot is not None and (
+            previous_snapshot.registry_generation == current_registry_generation
+            and previous_snapshot.spatial_state is current_spatial_state
+            and previous_snapshot.projector_output_descriptor == current_descriptor
+            and previous_snapshot.metric_generation == current_metric_generation
+            and previous_snapshot.global_overlay_intensity == current_overlay_intensity
+        ):
+            return previous_snapshot
+        raise RuntimeError('Authorities changed while assembling a render snapshot')
+
+    capture_render_snapshot = get_render_snapshot
+    capture_render_input = get_render_snapshot
+    get_render_input = get_render_snapshot
+    render_snapshot = get_render_snapshot
 
     def show_overlay(self, selector: str | uuid.UUID) -> OverlayEntry:
-        with self._camera_management_lock:
-            self._invalidate_unusable_overlay_dependencies()
-            return self.overlay_registry.show(selector)
+        return self._set_overlay_visibility(selector, True)
 
     def hide_overlay(self, selector: str | uuid.UUID) -> OverlayEntry:
+        return self._set_overlay_visibility(selector, False)
+
+    def _set_overlay_visibility(
+        self,
+        selector: str | uuid.UUID,
+        visible: bool,
+    ) -> OverlayEntry:
         with self._camera_management_lock:
             self._invalidate_unusable_overlay_dependencies()
-            return self.overlay_registry.hide(selector)
+            entry = self.overlay_registry.get(selector)
+        if entry.visible == visible:
+            return entry
+        request = entry.request.model_copy(update={'visible': visible})
+        entries = self.apply_overlay_batch(({
+            'op': 'update',
+            'selector': entry.id,
+            'request': request,
+        },))
+        return next(updated_entry for updated_entry in entries if updated_entry.id == entry.id)
 
     def remove_overlay(self, selector: str | uuid.UUID) -> OverlayEntry:
         with self._camera_management_lock:
@@ -602,14 +1126,33 @@ class MultiVisionService:
             except Exception:
                 self.camera_runtime.shutdown()
                 raise
+            self._tracking_stop_event = threading.Event()
+            self._tracking_error = None
+            self._tracking_thread = threading.Thread(
+                target=self._tracking_loop,
+                args=(self._tracking_stop_event,),
+                daemon=True,
+                name='multivision-fiducial-tracking',
+            )
             self._is_running = True
+            self._tracking_thread.start()
 
     def shutdown(self) -> None:
-        """Stop capture workers and release every camera handle."""
+        """Stop capture and tracking workers and release every camera handle."""
         with self._lifecycle_lock:
             if self._has_stopped:
                 return
             shutdown_error: Exception | None = None
+            self._invalidate_spatial_state()
+            tracking_thread = self._tracking_thread
+            self._tracking_stop_event.set()
+            if tracking_thread is not None:
+                tracking_thread.join(TRACKING_WORKER_SHUTDOWN_TIMEOUT_SECONDS)
+            if tracking_thread is not None and tracking_thread.is_alive():
+                shutdown_error = RuntimeError(
+                    'Fiducial tracking worker did not stop within '
+                    f'{TRACKING_WORKER_SHUTDOWN_TIMEOUT_SECONDS} seconds',
+                )
             try:
                 self.camera_runtime.shutdown()
             except Exception as ex:  # noqa: BLE001 (Cleanup must complete before surfacing errors).
@@ -624,6 +1167,288 @@ class MultiVisionService:
             if shutdown_error is not None:
                 raise shutdown_error
 
+    def _tracking_loop(self, stop_event: threading.Event) -> None:
+        interval_seconds = 1.0 / self.configuration.fiducial_tracking_rate_hz
+        next_run_seconds = time.monotonic()
+        while not stop_event.is_set():
+            wait_seconds = max(0.0, next_run_seconds - time.monotonic())
+            if stop_event.wait(wait_seconds):
+                return
+            next_run_seconds += interval_seconds
+            try:
+                self._run_tracking_cycle()
+            except Exception as ex:  # noqa: BLE001 (Tracking must not stop capture.)
+                self._tracking_error = ex
+            if next_run_seconds < time.monotonic() - interval_seconds:
+                next_run_seconds = time.monotonic()
+
+    def _run_tracking_cycle(self) -> SpatialState:
+        with measure_timing(self._benchmark_metrics, 'detection_tracking'):
+            return self._run_tracking_cycle_unmeasured()
+
+    def _run_tracking_cycle_unmeasured(self) -> SpatialState:
+        cycle = self._get_tracking_cycle()
+        if cycle is None:
+            return self.spatial_state
+        if not self._tracking_inputs_are_current(cycle):
+            return self.spatial_state
+
+        observations = []
+        detector_failures: list[object] = []
+        group_definitions = self.configuration.fiducial_groups
+        for camera_slot in sorted(cycle.frames_by_camera):
+            if cycle.frames_by_camera[camera_slot].frame_counter < 0:
+                continue
+            try:
+                result = detect_configured_fiducial_observations(
+                    cycle.frames_by_camera[camera_slot].data,
+                    group_definitions,
+                    self.tag_detector_factory,
+                    cycle.camera_transforms.get(camera_slot),
+                    metric_calibration=cycle.metric_calibration,
+                    camera_slot=camera_slot,
+                    camera_lifecycle_generation=cycle.camera_states[
+                        camera_slot
+                    ].lifecycle_generation,
+                    camera_calibration_generation=cycle.camera_states[
+                        camera_slot
+                    ].calibration_generation,
+                    frame_counter=cycle.frames_by_camera[camera_slot].frame_counter,
+                    received_monotonic_seconds=cycle.received_monotonic_seconds,
+                )
+            except Exception as ex:  # noqa: BLE001 (One bad frame must not kill tracking.)
+                detector_failures.extend(
+                    GroupTrackingError(
+                        group,
+                        definition.dictionary,
+                        'TRACKING_ERROR',
+                        str(ex),
+                    )
+                    for group, definition in group_definitions.items()
+                )
+                continue
+            observations.extend(result.observations)
+            detector_failures.extend(result.errors)
+
+        # Runtime-owned disconnects do not acquire the service lifecycle lock.
+        # Recheck their authority after detection, before publication.
+        if not self._tracking_inputs_are_current(cycle):
+            self._invalidate_spatial_state_for_tracking_generation(
+                cycle.tracking_generation,
+            )
+            return self.spatial_state
+
+        with self._tracking_control_lock:
+            if cycle.tracking_generation != self._tracking_generation:
+                return self.spatial_state
+            spatial_state = self._spatial_tracker.update(
+                observations,
+                detector_failures,
+                metric_calibration=cycle.metric_calibration,
+                camera_states=cycle.camera_states,
+                frames_by_camera=cycle.frames_by_camera,
+            )
+            if cycle.tracking_generation != self._tracking_generation:
+                return self.spatial_state
+            with self._render_state_lock:
+                self._spatial_state = spatial_state
+                self._tracker_published_spatial_state = spatial_state
+            return spatial_state
+
+    def _get_tracking_cycle(self) -> _TrackingCycle | None:
+        with self._camera_management_lock:
+            cameras = self._get_session_cameras()
+            if cameras is None:
+                return None
+            descriptor = self._projector_output_descriptor
+            camera_states, camera_transforms = (
+                self._get_tracking_camera_inputs_locked(cameras, descriptor)
+            )
+            metric_calibration = None
+            if self.metric_calibration_registry.is_usable(descriptor):
+                metric_calibration = self.metric_calibration_registry.get_record()
+
+        with self._render_state_lock:
+            metric_was_published = self._spatial_state.metric_calibration is not None
+        if metric_calibration is None and metric_was_published:
+            self._invalidate_spatial_metric_state()
+
+        frames_by_camera = self._get_tracking_frames(
+            tuple(
+                camera_slot
+                for camera_slot, state in camera_states.items()
+                if state.is_available and state.is_open
+            ),
+        )
+        if len(frames_by_camera) > 0:
+            self._benchmark_metrics.increment(
+                'tracking_frames',
+                len(frames_by_camera),
+            )
+            self._benchmark_metrics.increment('tracking_cycles_with_frames')
+        try:
+            received_monotonic_seconds = self._tracking_clock()
+        except Exception as ex:  # noqa: BLE001 (Injected clocks are a test boundary.)
+            raise ValueError('tracking_clock failed') from ex
+        if not is_finite_real(received_monotonic_seconds):
+            raise ValueError('tracking_clock must return a finite number')
+        with self._tracking_control_lock:
+            self._tracking_generation += 1
+            tracking_generation = self._tracking_generation
+        return _TrackingCycle(
+            tracking_generation,
+            self._metric_capture_generation,
+            descriptor,
+            metric_calibration,
+            camera_states,
+            camera_transforms,
+            frames_by_camera,
+            float(received_monotonic_seconds),
+        )
+
+    def _get_tracking_camera_inputs_locked(
+        self,
+        cameras: Sequence[SessionCamera],
+        descriptor: ProjectorOutputDescriptor,
+    ) -> tuple[dict[str, CameraGeneration], dict[str, MatrixLike]]:
+        camera_states: dict[str, CameraGeneration] = {}
+        camera_transforms: dict[str, MatrixLike] = {}
+        get_status = getattr(self.camera_runtime, 'get_status', None)
+        for camera in cameras:
+            status: CameraStatus | None = None
+            runtime_is_available = camera.state is SessionCameraState.OPEN
+            if callable(get_status):
+                try:
+                    candidate_status = get_status(camera.slot_id)
+                except Exception:  # noqa: BLE001 (Runtime status is a hardware boundary.)
+                    runtime_is_available = False
+                else:
+                    if isinstance(candidate_status, CameraStatus):
+                        try:
+                            _validate_camera_status(candidate_status, camera.slot_id)
+                        except CameraUnavailableError:
+                            runtime_is_available = False
+                        else:
+                            status = candidate_status
+                            runtime_is_available = (
+                                status.runtime_status is RuntimeStatus.AVAILABLE
+                            )
+                    else:
+                        runtime_is_available = False
+            is_open = camera.state is SessionCameraState.OPEN
+            calibration = camera.calibration
+            is_calibrated = (
+                is_open
+                and runtime_is_available
+                and _is_tracking_calibration_usable(
+                    camera,
+                    status,
+                    calibration,
+                    descriptor,
+                    self.configuration.calibration_version,
+                )
+            )
+            calibration_generation = self._get_camera_calibration_generation(
+                camera.slot_id,
+                calibration,
+            )
+            camera_states[camera.slot_id] = CameraGeneration(
+                camera.lifecycle_generation,
+                calibration_generation,
+                runtime_is_available,
+                is_open,
+                is_calibrated,
+            )
+            if not is_calibrated:
+                continue
+            try:
+                camera_transforms[camera.slot_id] = validate_homography(
+                    getattr(calibration, 'camera_to_projector'),
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return camera_states, camera_transforms
+
+    def _get_camera_calibration_generation(
+        self,
+        camera_slot: str,
+        calibration: object | None,
+    ) -> int:
+        signature = _camera_calibration_signature(calibration)
+        with self._tracking_control_lock:
+            previous_signature = self._camera_calibration_signatures.get(camera_slot)
+            if previous_signature is None and camera_slot not in self._camera_calibration_signatures:
+                self._camera_calibration_signatures[camera_slot] = signature
+                return self._camera_calibration_generations.get(camera_slot, 0)
+            if previous_signature == signature:
+                return self._camera_calibration_generations.get(camera_slot, 0)
+            next_generation = self._camera_calibration_generations.get(camera_slot, 0) + 1
+            self._camera_calibration_signatures[camera_slot] = signature
+            self._camera_calibration_generations[camera_slot] = next_generation
+            return next_generation
+
+    def _get_tracking_frames(
+        self,
+        requested_camera_slots: Sequence[str],
+    ) -> dict[str, Frame]:
+        requested = set(requested_camera_slots)
+        if len(requested) == 0:
+            return {}
+        snapshot_latest_frames = getattr(
+            self.camera_runtime,
+            'snapshot_latest_frames',
+            None,
+        )
+        frames: Mapping[str, object] | None = None
+        if callable(snapshot_latest_frames):
+            try:
+                candidate_frames = snapshot_latest_frames()
+            except Exception:  # noqa: BLE001 (A missing retained frame is recoverable.)
+                candidate_frames = None
+            if isinstance(candidate_frames, Mapping):
+                frames = candidate_frames
+        if frames is not None:
+            return {
+                camera_slot: frame
+                for camera_slot, frame in frames.items()
+                if camera_slot in requested and isinstance(frame, Frame)
+            }
+
+        snapshot = getattr(self.camera_runtime, 'snapshot', None)
+        if not callable(snapshot):
+            return {}
+        result: dict[str, Frame] = {}
+        for camera_slot in sorted(requested):
+            try:
+                frame = snapshot(camera_slot)
+            except Exception:  # noqa: BLE001 (A camera may lose its latest frame.)
+                continue
+            if isinstance(frame, Frame):
+                result[camera_slot] = frame
+        return result
+
+    def _tracking_inputs_are_current(self, cycle: _TrackingCycle) -> bool:
+        with self._camera_management_lock:
+            if cycle.projector_output_descriptor != self._projector_output_descriptor:
+                return False
+            if cycle.metric_generation != self._metric_capture_generation:
+                return False
+            cameras = self._get_session_cameras()
+            if cameras is None:
+                return False
+            current_states, _transforms = self._get_tracking_camera_inputs_locked(
+                cameras,
+                self._projector_output_descriptor,
+            )
+            if current_states != dict(cycle.camera_states):
+                return False
+            current_metric = None
+            if self.metric_calibration_registry.is_usable(
+                self._projector_output_descriptor,
+            ):
+                current_metric = self.metric_calibration_registry.get_record()
+            return current_metric is cycle.metric_calibration or current_metric == cycle.metric_calibration
+
     def get_camera_status(self, logical_name: str) -> CameraStatus:
         with self._camera_management_lock:
             resolved_slot = self._resolve_camera_reference(logical_name)
@@ -635,6 +1460,7 @@ class MultiVisionService:
             _validate_camera_status(runtime_status, resolved_slot)
             if runtime_status.runtime_status is not RuntimeStatus.AVAILABLE:
                 self.overlay_registry.invalidate_camera(resolved_slot)
+                self._invalidate_spatial_state()
             calibration_status = self._get_calibration_status(runtime_status)
             return runtime_status._replace(calibration_status=calibration_status)
 
@@ -663,6 +1489,7 @@ class MultiVisionService:
                     self.overlay_registry.invalidate_camera(
                         self._resolve_camera_reference(status.logical_name),
                     )
+                    self._invalidate_spatial_state()
                 calibration_status = self._get_calibration_status(status)
                 checked_statuses.append(status._replace(calibration_status=calibration_status))
             return checked_statuses
@@ -768,33 +1595,35 @@ class MultiVisionService:
             ):
                 raise FrameCaptureError('Camera returned malformed frame metadata')
             captured_at_seconds = float(frame.captured_at_seconds)
-
-            detector = self.tag_detector_factory(selected_dictionary)
-            camera_observations = detect_tag_observations(frame.data, detector)
-            projection_status = self._get_tag_projection_status(resolved_slot)
-            tags = tuple(
-                self._build_tag_observation(
-                    resolved_slot,
-                    observation,
-                    projection_status,
-                )
-                for observation in camera_observations
-            )
             if session_camera is not None:
                 camera_id = session_camera.slot_id
             elif status is not None:
                 camera_id = status.device_id
             else:
                 camera_id = None
-            return TagInspectionResult(
-                camera_reference,
-                camera_id,
-                selected_dictionary,
-                frame.frame_counter,
-                captured_at_seconds,
-                tags,
+
+        # Detection and projector geometry use the retained frame only – neither
+        # operation should hold the service-wide camera lifecycle lock.
+        detector = self.tag_detector_factory(selected_dictionary)
+        camera_observations = detect_tag_observations(frame.data, detector)
+        projection_status = self._get_tag_projection_status(resolved_slot)
+        tags = tuple(
+            self._build_tag_observation(
+                resolved_slot,
+                observation,
                 projection_status,
             )
+            for observation in camera_observations
+        )
+        return TagInspectionResult(
+            camera_reference,
+            camera_id,
+            selected_dictionary,
+            frame.frame_counter,
+            captured_at_seconds,
+            tags,
+            projection_status,
+        )
 
     def get_session_cameras(self) -> list[SessionCamera]:
         """Return the fixed, deterministically ordered session camera inventory."""
@@ -866,30 +1695,29 @@ class MultiVisionService:
     def close_camera(self, slot_id: str) -> SessionCamera:
         """Close one session slot and remove only its spatial ownership."""
         with self._camera_management_lock:
-            try:
-                camera = self.camera_runtime.close_camera(slot_id)
-                if not isinstance(camera, SessionCamera):
-                    raise SessionCameraError(
-                        'Camera runtime returned an invalid closed session camera',
-                    )
-                return camera
-            finally:
-                self.overlay_registry.invalidate_camera(slot_id)
-                self.point_service.clear_overlay_for_camera(slot_id)
+            # Reject an in-flight detector before the runtime releases its handle.
+            self.overlay_registry.invalidate_camera(slot_id)
+            self._invalidate_spatial_state()
+            self.point_service.clear_overlay_for_camera(slot_id)
+            camera = self.camera_runtime.close_camera(slot_id)
+            if not isinstance(camera, SessionCamera):
+                raise SessionCameraError(
+                    'Camera runtime returned an invalid closed session camera',
+                )
+            return camera
 
     def open_camera(self, slot_id: str) -> SessionCamera:
         """Reopen one closed session slot with fresh spatial state."""
         with self._camera_management_lock:
-            try:
-                camera = self.camera_runtime.open_camera(slot_id)
-                if not isinstance(camera, SessionCamera):
-                    raise SessionCameraError(
-                        'Camera runtime returned an invalid opened session camera',
-                    )
-                return camera
-            finally:
-                self.overlay_registry.invalidate_camera(slot_id)
-                self.point_service.clear_overlay_for_camera(slot_id)
+            self.overlay_registry.invalidate_camera(slot_id)
+            self._invalidate_spatial_state()
+            self.point_service.clear_overlay_for_camera(slot_id)
+            camera = self.camera_runtime.open_camera(slot_id)
+            if not isinstance(camera, SessionCamera):
+                raise SessionCameraError(
+                    'Camera runtime returned an invalid opened session camera',
+                )
+            return camera
 
     def update_projector_descriptor(
         self,
@@ -929,6 +1757,7 @@ class MultiVisionService:
             )
             self._metric_capture_generation += 1
             self.overlay_registry.invalidate_projector_output(checked_descriptor)
+            self._invalidate_spatial_state()
             self._metric_ruler = None
             self.point_service.clear_overlay()
             self._projector_output_descriptor = checked_descriptor
@@ -961,6 +1790,7 @@ class MultiVisionService:
                 capture_generation = self._metric_capture_generation
                 self.overlay_registry.invalidate_metric()
                 self.metric_calibration_registry.clear()
+                self._invalidate_spatial_metric_state()
                 self._metric_ruler = None
                 camera, calibration = self._require_metric_camera(logical_name)
                 camera_generation = camera.lifecycle_generation
@@ -1006,14 +1836,122 @@ class MultiVisionService:
                         raise CalibrationError(
                             'The selected camera changed during metric calibration',
                         )
-                    return self.metric_calibration_registry.register(
+                    record = self.metric_calibration_registry.register(
                         result,
                         self._projector_output_descriptor,
                         observation_camera_slot=camera.slot_id,
                         observation_camera_calibration=calibration,
                     )
+                    self._metric_capture_generation += 1
+                    # A detector that started before recalibration must not
+                    # republish against the newly registered metric authority.
+                    self._invalidate_spatial_metric_state()
+                    return record
             finally:
                 self._finish_metric_capture()
+
+    def _canonicalise_overlay_operations(
+        self,
+        operations: Sequence[object],
+    ) -> tuple[object, ...]:
+        if not isinstance(operations, Sequence) or isinstance(
+            operations,
+            (str, bytes, bytearray),
+        ):
+            raise ValueError('operations must be an ordered sequence')
+        canonical_operations: list[object] = []
+        for operation in operations:
+            if not isinstance(operation, Mapping):
+                canonical_operations.append(operation)
+                continue
+            operation_copy = dict(operation)
+            request_key = next(
+                (
+                    key
+                    for key in ('request', 'specification', 'spec', 'overlay')
+                    if key in operation_copy
+                ),
+                None,
+            )
+            request = operation_copy.get(request_key) if request_key is not None else None
+            if isinstance(request, (GridRequest, CircleRequest, RectRequest, TextRequest,
+                                    LineRequest, RulerRequest, ArrowRequest)):
+                self._validate_overlay_fiducial_groups(request)
+                operation_copy[request_key] = self._canonicalise_overlay_camera_references(
+                    request,
+                )
+            canonical_operations.append(operation_copy)
+        return tuple(canonical_operations)
+
+    def _validate_overlay_fiducial_groups(
+        self,
+        request: AnyOverlayRequest,
+    ) -> None:
+        for reference in get_overlay_point_references(request):
+            if (
+                isinstance(reference, FiducialAnchor)
+                and reference.group not in self.configuration.fiducial_groups
+            ):
+                raise ValueError(f'Unknown fiducial group {reference.group!r}')
+
+    def _materialise_overlay_request(
+        self,
+        request: AnyOverlayRequest,
+        spatial_state: SpatialState | None = None,
+        projector_output_descriptor: ProjectorOutputDescriptor | None = None,
+    ) -> ProjectorMaterialisation | None:
+        """Take short authority snapshots, then build geometry without camera locks."""
+        if not isinstance(request, (GridRequest, CircleRequest, RectRequest, TextRequest,
+                                    LineRequest, RulerRequest, ArrowRequest)):
+            raise ValueError('request must be an overlay request')
+        with self._camera_management_lock:
+            descriptor = projector_output_descriptor or self._projector_output_descriptor
+            current_spatial_state = spatial_state
+            if current_spatial_state is None:
+                with self._render_state_lock:
+                    current_spatial_state = self._spatial_state
+            camera_dependencies, metric_dependency = get_overlay_dependencies(request)
+            camera_authorities = (
+                self._get_overlay_camera_authorities(camera_dependencies)
+                if len(camera_dependencies) > 0
+                else None
+            )
+            metric_calibration = None
+            if metric_dependency:
+                state_metric_calibration = getattr(
+                    current_spatial_state,
+                    'metric_calibration',
+                    None,
+                )
+                if state_metric_calibration is not None:
+                    metric_calibration = _get_current_spatial_metric_calibration(
+                        current_spatial_state,
+                        descriptor,
+                    )
+                elif self.metric_calibration_registry.is_usable(descriptor):
+                    metric_calibration = self.metric_calibration_registry.get_record()
+        if metric_dependency and metric_calibration is None:
+            if is_dynamic_overlay_request(request):
+                return None
+            # Candidate construction must not invalidate already-published entries.
+            # Authority transitions perform that invalidation at their own boundary.
+            self._require_usable_metric_calibration()
+            raise InvalidCalibrationStateError(
+                'Metric calibration became unavailable while resolving the overlay',
+            )
+        try:
+            return materialise_overlay(
+                request,
+                descriptor.projector_resolution,
+                camera_authorities,
+                metric_calibration,
+                self.configuration.overlay_limits,
+                current_spatial_state,
+            )
+        except ValueError as ex:
+            if is_dynamic_overlay_request(request) and _is_unavailable_overlay_authority_error(ex):
+                return None
+            raise
 
     def _invalidate_unusable_overlay_dependencies(self) -> None:
         entries = self.overlay_registry.list()
@@ -1028,12 +1966,13 @@ class MultiVisionService:
             )
             for camera_id in sorted(camera_dependencies - camera_authorities.keys()):
                 self.overlay_registry.invalidate_camera(camera_id)
-        if any(entry.metric_dependency for entry in entries):
-            metric_is_usable = self.metric_calibration_registry.is_usable(
-                self._projector_output_descriptor,
-            )
-            if not metric_is_usable:
-                self.overlay_registry.invalidate_metric()
+                self._invalidate_spatial_state()
+        metric_is_usable = self.metric_calibration_registry.is_usable(
+            self._projector_output_descriptor,
+        )
+        if not metric_is_usable:
+            self.overlay_registry.invalidate_metric()
+            self._invalidate_spatial_metric_state()
 
     def _get_overlay_camera_authorities(
         self,
@@ -1056,13 +1995,37 @@ class MultiVisionService:
                 continue
             if camera.state is not SessionCameraState.OPEN:
                 continue
-            status = self.get_camera_status(camera.slot_id)
+            try:
+                status = self.camera_runtime.get_status(camera.slot_id)
+            except CameraUnavailableError:
+                continue
+            if not isinstance(status, CameraStatus):
+                continue
             if status.runtime_status is not RuntimeStatus.AVAILABLE:
                 continue
-            if status.calibration_status is not CalibrationStatus.CALIBRATED:
+            if camera.calibration_status is not CalibrationStatus.CALIBRATED:
                 continue
             calibration = camera.calibration
             if calibration is None:
+                continue
+            if isinstance(calibration, PersistedCalibration) and (
+                calibration.camera_id != camera.slot_id
+                or calibration.version != self.configuration.calibration_version
+                or calibration.camera_resolution != status.native_resolution
+                or calibration.projector_output_descriptor
+                != self._projector_output_descriptor
+            ):
+                continue
+            if (
+                getattr(calibration, 'projector_output_descriptor', None)
+                not in (None, self._projector_output_descriptor)
+            ):
+                continue
+            if (
+                status.native_resolution is not None
+                and getattr(calibration, 'camera_resolution', status.native_resolution)
+                != status.native_resolution
+            ):
                 continue
             try:
                 camera_to_projector = validate_homography(
@@ -1178,6 +2141,65 @@ class MultiVisionService:
             return request
         return request.model_copy(update=updates)
 
+    def _invalidate_stale_spatial_authorities_locked(self) -> None:
+        """Notice runtime-owned authority changes before resolving an overlay."""
+        with self._render_state_lock:
+            spatial_state = self._spatial_state
+        if len(spatial_state.camera_generations) > 0:
+            cameras = self._get_session_cameras()
+            if cameras is not None:
+                current_states, _transforms = self._get_tracking_camera_inputs_locked(
+                    cameras,
+                    self._projector_output_descriptor,
+                )
+                if current_states != dict(spatial_state.camera_generations):
+                    self._invalidate_spatial_state()
+                    return
+        if spatial_state.metric_calibration is not None and not self.metric_calibration_registry.is_usable(
+            self._projector_output_descriptor,
+        ):
+            self._invalidate_spatial_metric_state()
+
+    def _invalidate_spatial_state_for_tracking_generation(
+        self,
+        tracking_generation: int,
+    ) -> None:
+        with self._tracking_control_lock:
+            if tracking_generation != self._tracking_generation:
+                return
+            self._tracking_generation += 1
+            self._spatial_tracker.reset(None)
+            with self._render_state_lock:
+                spatial_state = self._spatial_state
+                self._spatial_state = SpatialState.empty()._replace(
+                    generation=spatial_state.generation + 1,
+                )
+                self._tracker_published_spatial_state = None
+
+    def _invalidate_spatial_state(self) -> None:
+        """Invalidate spatial evidence and reject every in-flight tracking pass."""
+        with self._tracking_control_lock:
+            self._tracking_generation += 1
+            self._spatial_tracker.reset(None)
+            with self._render_state_lock:
+                spatial_state = self._spatial_state
+                self._spatial_state = SpatialState.empty()._replace(
+                    generation=spatial_state.generation + 1,
+                )
+                self._tracker_published_spatial_state = None
+
+    def _invalidate_spatial_metric_state(self) -> None:
+        """Drop metric-dependent spatial evidence without retaining marker ghosts."""
+        with self._tracking_control_lock:
+            self._tracking_generation += 1
+            self._spatial_tracker.reset(None)
+            with self._render_state_lock:
+                spatial_state = self._spatial_state
+                self._spatial_state = SpatialState.empty()._replace(
+                    generation=spatial_state.generation + 1,
+                )
+                self._tracker_published_spatial_state = None
+
     def _require_overlay_metric_calibration(self) -> MetricCalibrationRecord:
         try:
             return self._require_usable_metric_calibration()
@@ -1185,6 +2207,7 @@ class MultiVisionService:
             # A failed metric transition must not leave old materialised
             # projector geometry available to the display.
             self.overlay_registry.invalidate_metric()
+            self._invalidate_spatial_metric_state()
             raise
 
     def _begin_metric_capture(self) -> None:
@@ -1364,6 +2387,7 @@ class MultiVisionService:
     def _clear_area_before_calibration(self, logical_name: str) -> None:
         resolved_slot = self._resolve_camera_reference(logical_name)
         self.overlay_registry.invalidate_camera(resolved_slot)
+        self._invalidate_spatial_state()
         session_camera = self._get_session_camera(resolved_slot)
         if session_camera is None or not session_camera.area_enabled:
             return
@@ -1813,6 +2837,7 @@ class MultiVisionService:
         calibration = session_camera.calibration
         if session_camera.calibration_status is not CalibrationStatus.CALIBRATED:
             self.overlay_registry.invalidate_camera(session_camera.slot_id)
+            self._invalidate_spatial_state()
             return session_camera.calibration_status
         if (
             isinstance(calibration, PersistedCalibration)
@@ -1825,6 +2850,7 @@ class MultiVisionService:
             )
         ):
             self.overlay_registry.invalidate_camera(session_camera.slot_id)
+            self._invalidate_spatial_state()
             return CalibrationStatus.STALE
         return session_camera.calibration_status
 
@@ -1936,6 +2962,7 @@ class MultiVisionService:
         calibration: PersistedCalibration,
     ) -> None:
         self.overlay_registry.invalidate_camera(slot_id)
+        self._invalidate_spatial_state()
         set_calibration = getattr(self.camera_runtime, 'set_calibration', None)
         if not callable(set_calibration):
             raise SessionCameraError(
@@ -2491,6 +3518,54 @@ def _metric_correspondences_by_corner(
     return result
 
 
+def _is_tracking_calibration_usable(
+    camera: SessionCamera,
+    status: CameraStatus | None,
+    calibration: object | None,
+    descriptor: ProjectorOutputDescriptor,
+    calibration_version: int,
+) -> bool:
+    if camera.state is not SessionCameraState.OPEN:
+        return False
+    if status is not None and (
+        status.runtime_status is not RuntimeStatus.AVAILABLE
+        or status.calibration_status is not CalibrationStatus.CALIBRATED
+    ):
+        return False
+    if camera.calibration_status is not CalibrationStatus.CALIBRATED or calibration is None:
+        return False
+    if (
+        getattr(calibration, 'projector_output_descriptor', None)
+        not in (None, descriptor)
+    ):
+        return False
+    if status is not None and status.native_resolution is not None:
+        if getattr(calibration, 'camera_resolution', status.native_resolution) != status.native_resolution:
+            return False
+    if isinstance(calibration, PersistedCalibration) and (
+        calibration.camera_id != camera.slot_id
+        or calibration.version != calibration_version
+    ):
+        return False
+    try:
+        validate_homography(getattr(calibration, 'camera_to_projector'))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _camera_calibration_signature(calibration: object | None) -> object:
+    if calibration is None:
+        return None
+    return (
+        getattr(calibration, 'camera_to_projector', None),
+        getattr(calibration, 'projector_output_descriptor', None),
+        getattr(calibration, 'camera_resolution', None),
+        getattr(calibration, 'version', None),
+        getattr(calibration, 'timestamp', None),
+    )
+
+
 def get_camera_area_colour(slot_id: str) -> tuple[int, int, int]:
     """Return the stable diagnostic colour assigned to a session slot."""
     prefix, separator, index = slot_id.rpartition('-')
@@ -2558,11 +3633,103 @@ def _projection_status_from_error(exception: Exception) -> ProjectionStatus:
     return ProjectionStatus(code, str(exception))
 
 
+def _get_render_protection_regions(
+    spatial_state: SpatialState,
+    protection_margin_mm: float,
+) -> tuple[tuple[Point2D, ...], ...]:
+    if len(spatial_state.protection_regions) > 0:
+        return tuple(
+            tuple(region)
+            for region in spatial_state.protection_regions.values()
+        )
+    footprints = spatial_state.projector_footprints
+    if len(footprints) == 0:
+        footprints = {
+            identity: observation.projector.corners
+            for identity, observation in spatial_state.selected_observations.items()
+            if observation.projector is not None
+        }
+    return build_protected_projector_regions(
+        footprints,
+        protection_margin_mm,
+        spatial_state.metric_calibration,
+    )
+
+
+def _spatial_state_has_data(spatial_state: SpatialState) -> bool:
+    return any(
+        len(mapping) > 0
+        for mapping in (
+            spatial_state.selected_observations,
+            spatial_state.last_seen_monotonic_seconds,
+            spatial_state.stability_scores,
+            spatial_state.projector_footprints,
+            spatial_state.protection_regions,
+            spatial_state.camera_generations,
+        )
+    ) or spatial_state.metric_calibration is not None or len(
+        spatial_state.detector_failures
+    ) > 0
+
+
+def _get_current_spatial_metric_calibration(
+    spatial_state: SpatialState,
+    projector_output_descriptor: ProjectorOutputDescriptor,
+) -> object | None:
+    metric_calibration = getattr(spatial_state, 'metric_calibration', None)
+    if metric_calibration is None:
+        return None
+    metric_descriptor = getattr(metric_calibration, 'projector_output_descriptor', None)
+    if metric_descriptor is not None and metric_descriptor != projector_output_descriptor:
+        return None
+    metric_state = getattr(metric_calibration, 'state', None)
+    metric_state_value = getattr(metric_state, 'value', metric_state)
+    if metric_state is not None and metric_state_value != MetricCalibrationStatus.CALIBRATED.value:
+        return None
+    is_usable = getattr(metric_calibration, 'is_usable', None)
+    if callable(is_usable) and is_usable() is not True:
+        return None
+    if is_usable is not None and not callable(is_usable) and is_usable is not True:
+        return None
+    return metric_calibration
+
+
+def _is_unavailable_overlay_authority_error(exception: ValueError) -> bool:
+    message = str(exception).lower()
+    return any(
+        phrase in message
+        for phrase in (
+            'unresolved',
+            'no camera',
+            'no usable',
+            'no projector',
+            'no surface',
+            'metric calibration is not usable',
+            'metric calibration has no',
+            'a usable metric calibration is required',
+            'arrow endpoints must be distinct',
+            'cannot be converted',
+            'projected safely',
+            'horizon',
+        )
+    )
+
+
+def _get_camera_state_from_status(status: CameraStatus) -> SessionCameraState:
+    if status.runtime_status is RuntimeStatus.STOPPED:
+        return SessionCameraState.CLOSED
+    if status.runtime_status is RuntimeStatus.UNAVAILABLE:
+        return SessionCameraState.UNAVAILABLE
+    return SessionCameraState.OPEN
+
+
 __all__ = [
     'AREA_COLOURS',
     'CameraArea',
+    'CameraRenderSnapshot',
     'MultiVisionService',
     'ProjectionStatus',
+    'RenderSnapshot',
     'TagInspectionResult',
     'TagObservation',
     'get_camera_area_colour',

@@ -493,6 +493,90 @@ def project_point(point: PointLike, matrix: MatrixLike) -> Point2D:
     return result
 
 
+def build_protected_projector_regions(
+    projector_footprints: object,
+    protection_margin_mm: float,
+    metric_calibration: object | None = None,
+) -> tuple[Polygon, ...]:
+    """Build immutable projector regions which ordinary presentation must avoid.
+
+    A calibrated metric pair expands the footprint in surface millimetres before
+    projecting it back.  If that pair is unavailable, the observed footprint is
+    deliberately left unexpanded rather than guessing a pixel scale.
+    """
+    try:
+        checked_margin_mm = float(protection_margin_mm)
+    except (TypeError, ValueError, OverflowError) as ex:
+        raise ValueError(
+            'protection_margin_mm must be finite and non-negative',
+        ) from ex
+    try:
+        is_finite_margin = is_finite_real(protection_margin_mm)
+    except OverflowError:
+        is_finite_margin = False
+    if not is_finite_margin or checked_margin_mm < 0:
+        raise ValueError('protection_margin_mm must be finite and non-negative')
+    state_value = projector_footprints
+    state_footprints = getattr(state_value, 'projector_footprints', None)
+    state_observations = getattr(state_value, 'selected_observations', None)
+    if isinstance(state_footprints, Mapping) and len(state_footprints) > 0:
+        projector_footprints = state_footprints
+    elif isinstance(state_observations, Mapping):
+        # A hand-built or older snapshot may not have materialised its footprint
+        # map yet – the selected observations remain the source of truth.
+        projector_footprints = state_observations
+    elif isinstance(state_footprints, Mapping):
+        projector_footprints = state_footprints
+    if metric_calibration is None:
+        metric_calibration = getattr(state_value, 'metric_calibration', None)
+    footprints = (
+        projector_footprints.values()
+        if isinstance(projector_footprints, Mapping)
+        else projector_footprints
+    )
+    metric_matrices = _get_protection_metric_matrices(metric_calibration)
+    regions: list[Polygon] = []
+    for footprint in footprints:
+        observed_geometry = getattr(footprint, 'projector', None)
+        if hasattr(footprint, 'projector'):
+            if observed_geometry is None:
+                continue
+            footprint = getattr(observed_geometry, 'corners', footprint)
+        elif isinstance(footprint, TagGeometry):
+            footprint = footprint.corners
+        try:
+            checked_footprint = tuple(coerce_point(point) for point in footprint)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if len(checked_footprint) < 3:
+            continue
+        try:
+            projector_region = validate_planar_corners(checked_footprint)
+        except ValueError:
+            projector_region = calculate_convex_hull(checked_footprint)
+        if len(projector_region) < 3:
+            continue
+        if metric_matrices is not None and checked_margin_mm > 0:
+            try:
+                surface_points = project_points_through_homography(
+                    projector_region,
+                    metric_matrices[0],
+                )
+                expanded_surface = _expand_convex_polygon_for_protection(
+                    surface_points,
+                    checked_margin_mm,
+                )
+                if expanded_surface is not None:
+                    projector_region = project_points_through_homography(
+                        expanded_surface,
+                        metric_matrices[1],
+                    )
+            except (InvalidHomographyError, TypeError, ValueError, OverflowError):
+                pass
+        regions.append(tuple(projector_region))
+    return tuple(regions)
+
+
 def intersect_polygon_with_bounds(
     polygon: RegionLike,
     bounds: BoundsLike,
@@ -707,6 +791,123 @@ def _coerce_resolution(
     return checked_resolution
 
 
+def _get_protection_metric_matrices(
+    metric_calibration: object | None,
+) -> tuple[MatrixLike, MatrixLike] | None:
+    if metric_calibration is None:
+        return None
+    record = metric_calibration
+    get_record = getattr(metric_calibration, 'get_record', None)
+    if callable(get_record):
+        record = get_record()
+    if record is None:
+        return None
+    if (
+        isinstance(record, Sequence)
+        and not isinstance(record, (str, bytes, bytearray))
+        and not hasattr(record, 'projector_to_surface')
+        and not hasattr(record, 'surface_to_projector')
+        and not hasattr(record, 'homography')
+    ):
+        try:
+            projector_to_surface = validate_homography(record)
+            return projector_to_surface, invert_homography(projector_to_surface)
+        except (InvalidHomographyError, TypeError, ValueError, OverflowError):
+            return None
+    try:
+        state = getattr(record, 'state', getattr(metric_calibration, 'state', None))
+        state_value = getattr(state, 'value', state)
+        if isinstance(state_value, str) and state_value != 'CALIBRATED':
+            return None
+        is_usable = getattr(metric_calibration, 'is_usable', None)
+        if callable(is_usable) and is_usable() is not True:
+            return None
+        if is_usable is not None and not callable(is_usable) and is_usable is not True:
+            return None
+    except Exception:  # noqa: BLE001 (Malformed calibration has no physical authority.)
+        return None
+    homography = getattr(record, 'homography', None)
+    if homography is not None:
+        record = homography
+    projector_to_surface = getattr(record, 'projector_to_surface', None)
+    surface_to_projector = getattr(record, 'surface_to_projector', None)
+    if projector_to_surface is None and surface_to_projector is None:
+        return None
+    try:
+        if projector_to_surface is None:
+            surface_to_projector = validate_homography(surface_to_projector)
+            projector_to_surface = invert_homography(surface_to_projector)
+        elif surface_to_projector is None:
+            projector_to_surface = validate_homography(projector_to_surface)
+            surface_to_projector = invert_homography(projector_to_surface)
+        return (
+            validate_homography(projector_to_surface),
+            validate_homography(surface_to_projector),
+        )
+    except (InvalidHomographyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _expand_convex_polygon_for_protection(
+    corners: Sequence[Point2D],
+    margin_mm: float,
+) -> Polygon | None:
+    if len(corners) < 3:
+        return None
+    signed_area_twice = sum(
+        corners[idx].x * corners[(idx + 1) % len(corners)].y
+        - corners[(idx + 1) % len(corners)].x * corners[idx].y
+        for idx in range(len(corners))
+    )
+    if not math.isfinite(signed_area_twice) or signed_area_twice == 0:
+        return None
+    winding = 1.0 if signed_area_twice > 0 else -1.0
+    offset_edges: list[tuple[Point2D, Point2D]] = []
+    for idx, start in enumerate(corners):
+        end = corners[(idx + 1) % len(corners)]
+        edge_x = end.x - start.x
+        edge_y = end.y - start.y
+        edge_length = math.hypot(edge_x, edge_y)
+        if not math.isfinite(edge_length) or edge_length == 0:
+            return None
+        outward = Point2D(winding * edge_y / edge_length, -winding * edge_x / edge_length)
+        offset = Point2D(outward.x * margin_mm, outward.y * margin_mm)
+        offset_edges.append(
+            (
+                Point2D(start.x + offset.x, start.y + offset.y),
+                Point2D(end.x + offset.x, end.y + offset.y),
+            ),
+        )
+    expanded: list[Point2D] = []
+    for idx in range(len(corners)):
+        previous_start, previous_end = offset_edges[idx - 1]
+        current_start, current_end = offset_edges[idx]
+        previous_direction = Point2D(
+            previous_end.x - previous_start.x,
+            previous_end.y - previous_start.y,
+        )
+        current_direction = Point2D(
+            current_end.x - current_start.x,
+            current_end.y - current_start.y,
+        )
+        denominator = _cross_product(previous_direction, current_direction)
+        if not math.isfinite(denominator) or abs(denominator) <= 1e-12:
+            return None
+        delta = Point2D(
+            current_start.x - previous_start.x,
+            current_start.y - previous_start.y,
+        )
+        factor = _cross_product(delta, current_direction) / denominator
+        point = Point2D(
+            previous_start.x + factor * previous_direction.x,
+            previous_start.y + factor * previous_direction.y,
+        )
+        if not is_finite_point(point):
+            return None
+        expanded.append(point)
+    return tuple(expanded)
+
+
 def _coerce_bounds(bounds: BoundsLike) -> CoordinateBounds | None:
     if isinstance(bounds, CoordinateBounds):
         return bounds if _is_valid_bounds(bounds) else None
@@ -915,6 +1116,7 @@ __all__ = [
     'RegionLike',
     'TagGeometry',
     'build_preview_transform',
+    'build_protected_projector_regions',
     'build_tag_geometry',
     'calculate_available_projector_area',
     'calculate_convex_hull',

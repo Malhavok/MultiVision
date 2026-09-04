@@ -6,7 +6,7 @@ import math
 import re
 import threading
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence, Set
 from dataclasses import dataclass
 from enum import Enum
 from typing import (
@@ -36,7 +36,10 @@ from multivision.geometry import (
     MatrixLike,
     Point2D,
     TagGeometry,
+    calculate_polygon_area,
     camera_to_projector as project_camera_point,
+    coerce_point,
+    is_point_in_region,
     project_point,
     project_tag_geometry,
     validate_homography,
@@ -418,6 +421,35 @@ class Quantity(BaseModel):
         return self
 
 
+MIN_OVERLAY_INTENSITY = 0.0
+MAX_OVERLAY_INTENSITY = 1.0
+
+
+def normalise_overlay_intensity(value: Any) -> float:
+    """Validate one presentation intensity in the inclusive public range."""
+    try:
+        if not is_finite_real(value):
+            raise ValueError('overlay intensity must be finite')
+        checked_value = float(value)
+    except (TypeError, ValueError, OverflowError) as ex:
+        raise ValueError('overlay intensity must be finite') from ex
+    if not MIN_OVERLAY_INTENSITY <= checked_value <= MAX_OVERLAY_INTENSITY:
+        raise ValueError('overlay intensity must be between 0.0 and 1.0')
+    return checked_value
+
+
+def apply_overlay_intensity_to_colour(
+    colour: tuple[int, int, int],
+    intensity: float,
+) -> tuple[int, int, int]:
+    """Apply intensity to colour only, retaining geometry and line width."""
+    checked_intensity = normalise_overlay_intensity(intensity)
+    return tuple(
+        min(255, max(0, round(channel * checked_intensity)))
+        for channel in colour
+    )
+
+
 class OverlayStyle(BaseModel):
     """The small immutable style vocabulary shared by generic overlays."""
 
@@ -426,6 +458,7 @@ class OverlayStyle(BaseModel):
     colour: tuple[int, int, int] = (255, 255, 255)
     fill: bool = False
     line_width_px: int = 1
+    intensity: float = 1.0
 
     @field_validator('colour', mode='before')
     @classmethod
@@ -446,6 +479,14 @@ class OverlayStyle(BaseModel):
         if value <= 0:
             raise ValueError('line_width_px must be positive')
         return value
+
+    @field_validator('intensity', mode='before')
+    @classmethod
+    def validate_intensity(
+        cls: type['OverlayStyle'],
+        value: Any,
+    ) -> float:
+        return normalise_overlay_intensity(value)
 
 
 class OverlayExtent(BaseModel):
@@ -896,8 +937,308 @@ class ProjectorMaterialisation(NamedTuple):
     labels: tuple[ProjectorLabel, ...] = ()
 
 
+def materialise_presentation(
+    materialisation: ProjectorMaterialisation,
+    global_intensity: float = 1.0,
+    protected_regions: Sequence[Sequence[PointLike]] = (),
+) -> ProjectorMaterialisation:
+    """Return a presentation-only copy with intensity and protection applied.
+
+    The supplied projector primitives are immutable source geometry.  Protected
+    regions are applied to the copy, so registry requests and resolved geometry
+    remain suitable for later frames and marker recovery.
+    """
+    if not isinstance(materialisation, ProjectorMaterialisation):
+        raise ValueError('materialisation must be ProjectorMaterialisation')
+    checked_global_intensity = normalise_overlay_intensity(global_intensity)
+    checked_regions = _normalise_protected_regions(protected_regions)
+    segments: list[ProjectorSegment] = []
+    for segment in materialisation.segments:
+        presentation_style = _presentation_style(segment.style, checked_global_intensity)
+        segments.extend(
+            _subtract_segment_from_protected_regions(
+                segment.start,
+                segment.end,
+                presentation_style,
+                checked_regions,
+            ),
+        )
+    polygons: list[ProjectorPolygon] = []
+    for polygon in materialisation.polygons:
+        if _polygon_intersects_protected_regions(polygon.points, checked_regions):
+            continue
+        polygons.append(
+            ProjectorPolygon(
+                polygon.points,
+                _presentation_style(polygon.style, checked_global_intensity),
+            ),
+        )
+    labels = tuple(
+        ProjectorLabel(
+            label.position,
+            label.text,
+            _presentation_style(label.style, checked_global_intensity),
+            label.angle_deg,
+            label.scale,
+        )
+        for label in materialisation.labels
+        if not _point_in_protected_regions(label.position, checked_regions)
+    )
+    return ProjectorMaterialisation(tuple(segments), tuple(polygons), labels)
+
+
+# Longer aliases make the presentation boundary discoverable without adding a
+# second implementation authority.
+materialise_overlay_presentation = materialise_presentation
+apply_overlay_presentation = materialise_presentation
+
+
+def _presentation_style(style: OverlayStyle, global_intensity: float) -> OverlayStyle:
+    if not isinstance(style, OverlayStyle):
+        raise ValueError('projector primitive styles must be OverlayStyle values')
+    effective_intensity = normalise_overlay_intensity(global_intensity * style.intensity)
+    return style.model_copy(
+        update={
+            'colour': apply_overlay_intensity_to_colour(style.colour, effective_intensity),
+            'intensity': 1.0,
+        },
+    )
+
+
+def _normalise_protected_regions(
+    protected_regions: Sequence[Sequence[PointLike]],
+) -> tuple[tuple[Point2D, ...], ...]:
+    if isinstance(protected_regions, Mapping):
+        protected_regions = tuple(protected_regions.values())
+    if isinstance(protected_regions, (str, bytes, bytearray)):
+        raise ValueError('protected_regions must be an ordered collection')
+    try:
+        region_values = tuple(protected_regions)
+    except TypeError as ex:
+        raise ValueError('protected_regions must be an ordered collection') from ex
+
+    regions: list[tuple[Point2D, ...]] = []
+    for region in region_values:
+        if isinstance(region, CoordinateBounds):
+            points = (
+                Point2D(region.left, region.top),
+                Point2D(region.right, region.top),
+                Point2D(region.right, region.bottom),
+                Point2D(region.left, region.bottom),
+            )
+        else:
+            if isinstance(region, (Mapping, Set, str, bytes, bytearray)):
+                raise ValueError('protected regions must contain polygons')
+            try:
+                points = tuple(
+                    Point2D(float(point[0]), float(point[1]))
+                    for point in region
+                )
+            except (IndexError, TypeError, ValueError, OverflowError) as ex:
+                raise ValueError('protected regions must contain polygons') from ex
+        if len(points) < 3 or any(
+            not is_finite_real(value)
+            for point in points
+            for value in point
+        ):
+            raise ValueError('protected regions must contain finite polygons')
+        if calculate_polygon_area(points) <= 0:
+            raise ValueError('protected regions must contain non-degenerate polygons')
+        regions.append(points)
+    return tuple(regions)
+
+
+def _subtract_segment_from_protected_regions(
+    start: Point2D,
+    end: Point2D,
+    style: OverlayStyle,
+    protected_regions: Sequence[Sequence[Point2D]],
+) -> tuple[ProjectorSegment, ...]:
+    difference = Point2D(end.x - start.x, end.y - start.y)
+    if difference == Point2D(0.0, 0.0):
+        return ()
+    parameters = [0.0, 1.0]
+    for region in protected_regions:
+        for idx, region_start in enumerate(region):
+            region_end = region[(idx + 1) % len(region)]
+            intersection = _segment_intersection_parameter(
+                start,
+                difference,
+                region_start,
+                Point2D(region_end.x - region_start.x, region_end.y - region_start.y),
+            )
+            if intersection is not None:
+                parameters.extend(intersection)
+    ordered_parameters = _unique_sorted_parameters(parameters)
+    output: list[ProjectorSegment] = []
+    for idx in range(len(ordered_parameters) - 1):
+        start_parameter = ordered_parameters[idx]
+        end_parameter = ordered_parameters[idx + 1]
+        if end_parameter - start_parameter <= 1e-12:
+            continue
+        midpoint_parameter = (start_parameter + end_parameter) / 2.0
+        midpoint = Point2D(
+            start.x + difference.x * midpoint_parameter,
+            start.y + difference.y * midpoint_parameter,
+        )
+        if _point_in_protected_regions(midpoint, protected_regions):
+            continue
+        output.append(
+            ProjectorSegment(
+                Point2D(start.x + difference.x * start_parameter, start.y + difference.y * start_parameter),
+                Point2D(start.x + difference.x * end_parameter, start.y + difference.y * end_parameter),
+                style,
+            ),
+        )
+    return tuple(output)
+
+
+def _segment_intersection_parameter(
+    start: Point2D,
+    difference: Point2D,
+    edge_start: Point2D,
+    edge_difference: Point2D,
+) -> tuple[float, ...] | None:
+    denominator = difference.x * edge_difference.y - difference.y * edge_difference.x
+    offset = Point2D(edge_start.x - start.x, edge_start.y - start.y)
+    if abs(denominator) <= 1e-12:
+        if abs(offset.x * difference.y - offset.y * difference.x) > 1e-9:
+            return None
+        length_squared = difference.x * difference.x + difference.y * difference.y
+        if length_squared == 0:
+            return None
+        first = (offset.x * difference.x + offset.y * difference.y) / length_squared
+        second_offset = Point2D(edge_start.x + edge_difference.x - start.x, edge_start.y + edge_difference.y - start.y)
+        second = (second_offset.x * difference.x + second_offset.y * difference.y) / length_squared
+        return tuple(value for value in (first, second) if 0.0 <= value <= 1.0)
+    segment_parameter = (
+        offset.x * edge_difference.y - offset.y * edge_difference.x
+    ) / denominator
+    edge_parameter = (
+        offset.x * difference.y - offset.y * difference.x
+    ) / denominator
+    if 0.0 <= segment_parameter <= 1.0 and 0.0 <= edge_parameter <= 1.0:
+        return (segment_parameter,)
+    return None
+
+
+def _unique_sorted_parameters(parameters: Sequence[float]) -> tuple[float, ...]:
+    ordered = sorted(min(1.0, max(0.0, value)) for value in parameters)
+    unique: list[float] = []
+    for value in ordered:
+        if len(unique) == 0 or abs(value - unique[-1]) > 1e-9:
+            unique.append(value)
+    return tuple(unique)
+
+
+def _point_in_protected_regions(
+    point: Point2D,
+    protected_regions: Sequence[Sequence[Point2D]],
+) -> bool:
+    return any(is_point_in_region(point, region) for region in protected_regions)
+
+
+def is_polygon_intersecting_protected_regions(
+    polygon: Sequence[PointLike],
+    protected_regions: Sequence[Sequence[PointLike]],
+) -> bool:
+    """Return whether a polygon would draw over a protected projector region."""
+    checked_polygon = tuple(coerce_point(point) for point in polygon)
+    checked_regions = _normalise_protected_regions(protected_regions)
+    if len(checked_polygon) < 3:
+        raise ValueError('polygon must contain at least three finite points')
+    return _polygon_intersects_protected_regions(checked_polygon, checked_regions)
+
+
+def is_circle_intersecting_protected_regions(
+    centre: PointLike,
+    radius: float,
+    protected_regions: Sequence[Sequence[PointLike]],
+) -> bool:
+    """Return whether a filled projector circle would touch protected output."""
+    checked_centre = coerce_point(centre)
+    try:
+        checked_radius = float(radius)
+    except (TypeError, ValueError, OverflowError) as ex:
+        raise ValueError('circle radius must be finite and non-negative') from ex
+    if not math.isfinite(checked_radius) or checked_radius < 0:
+        raise ValueError('circle radius must be finite and non-negative')
+    checked_regions = _normalise_protected_regions(protected_regions)
+    for region in checked_regions:
+        if is_point_in_region(checked_centre, region):
+            return True
+        if any(
+            math.hypot(
+                point.x - checked_centre.x,
+                point.y - checked_centre.y,
+            ) <= checked_radius
+            for point in region
+        ):
+            return True
+        for idx, segment_start in enumerate(region):
+            segment_end = region[(idx + 1) % len(region)]
+            if _distance_to_segment(
+                checked_centre,
+                segment_start,
+                segment_end,
+            ) <= checked_radius:
+                return True
+    return False
+
+
+def _distance_to_segment(
+    point: Point2D,
+    segment_start: Point2D,
+    segment_end: Point2D,
+) -> float:
+    difference_x = segment_end.x - segment_start.x
+    difference_y = segment_end.y - segment_start.y
+    length_squared = difference_x * difference_x + difference_y * difference_y
+    if length_squared == 0:
+        return math.hypot(
+            point.x - segment_start.x,
+            point.y - segment_start.y,
+        )
+    fraction = (
+        (point.x - segment_start.x) * difference_x
+        + (point.y - segment_start.y) * difference_y
+    ) / length_squared
+    fraction = min(1.0, max(0.0, fraction))
+    nearest_point = Point2D(
+        segment_start.x + fraction * difference_x,
+        segment_start.y + fraction * difference_y,
+    )
+    return math.hypot(
+        point.x - nearest_point.x,
+        point.y - nearest_point.y,
+    )
+
+
+def _polygon_intersects_protected_regions(
+    polygon: Sequence[Point2D],
+    protected_regions: Sequence[Sequence[Point2D]],
+) -> bool:
+    for region in protected_regions:
+        if any(is_point_in_region(point, region) for point in polygon):
+            return True
+        if any(is_point_in_region(point, polygon) for point in region):
+            return True
+        for idx, point in enumerate(polygon):
+            next_point = polygon[(idx + 1) % len(polygon)]
+            for region_idx, region_point in enumerate(region):
+                region_next = region[(region_idx + 1) % len(region)]
+                if _segment_intersection_parameter(
+                    point,
+                    Point2D(next_point.x - point.x, next_point.y - point.y),
+                    region_point,
+                    Point2D(region_next.x - region_point.x, region_next.y - region_point.y),
+                ) is not None:
+                    return True
+    return False
+
+
 class OverlayEntry(NamedTuple):
-    """One immutable generic overlay and the authorities it depends on."""
+    """One immutable declarative overlay and its last resolved presentation."""
 
     id: uuid.UUID
     name: str | None
@@ -909,68 +1250,241 @@ class OverlayEntry(NamedTuple):
     metric_dependency: bool
     projector_output_descriptor: ProjectorOutputDescriptor
     insertion_sequence: int
+    is_dynamic: bool = False
+    is_resolved: bool = True
+    unresolved_reason: str | None = None
+    fiducial_dependencies: tuple[tuple[str, int], ...] = ()
+
+    @property
+    def specification(self) -> AnyOverlayRequest:
+        """Return the immutable request retained by the registry."""
+        return self.request
+
+    @property
+    def resolved(self) -> bool:
+        return self.is_resolved
+
+    @property
+    def unresolved(self) -> bool:
+        return not self.is_resolved
+
+    @property
+    def dynamic(self) -> bool:
+        return self.is_dynamic
 
 
 class OverlayRegistry:
-    """Keep session-local generic overlays in deterministic insertion order."""
+    """Publish complete overlay candidates with a single atomic snapshot swap."""
 
     def __init__(
         self,
         projector_output_descriptor: ProjectorOutputDescriptor,
         *,
         id_factory: Callable[[], uuid.UUID | str] | None = None,
+        max_operations: int = 100,
+        max_batch_operations: int | None = None,
     ) -> None:
         _validate_projector_output_descriptor(projector_output_descriptor)
         if id_factory is not None and not callable(id_factory):
             raise ValueError('id_factory must be callable')
+        if max_batch_operations is not None:
+            max_operations = max_batch_operations
+        _validate_batch_limit(max_operations)
+        self._max_operations = max_operations
         self._projector_output_descriptor = projector_output_descriptor
         self._id_factory = id_factory
         self._entries: dict[uuid.UUID, OverlayEntry] = {}
         self._names: dict[str, uuid.UUID] = {}
         self._next_insertion_sequence = 0
+        self._generation = 0
         self._lock = threading.RLock()
+
+    @property
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def snapshot(self) -> tuple[OverlayEntry, ...]:
+        """Return one immutable registry view without exposing mutable indexes."""
+        with self._lock:
+            return tuple(self._entries.values())
 
     def create(
         self,
         request: AnyOverlayRequest,
         materialised_primitives: ProjectorMaterialisation,
     ) -> OverlayEntry:
-        """Add one request only after its complete materialisation has succeeded."""
-        if not isinstance(request, _OVERLAY_REQUEST_TYPES):
-            raise ValueError('request must be an overlay request')
+        """Compatibility wrapper for one atomic create operation."""
         if not isinstance(materialised_primitives, ProjectorMaterialisation):
             raise ValueError('materialised_primitives must be ProjectorMaterialisation')
-        _validate_projector_materialisation(materialised_primitives)
-        camera_dependencies, metric_dependency = get_overlay_dependencies(request)
+        entries = self.apply_batch(
+            ({'op': 'create', 'request': request},),
+            materialise_request=lambda _request: materialised_primitives,
+        )
+        return entries[-1]
+
+    def create_specification(
+        self,
+        request: AnyOverlayRequest,
+        materialise_request: Callable[[AnyOverlayRequest], ProjectorMaterialisation | None],
+    ) -> OverlayEntry:
+        """Create a request while allowing an unavailable dynamic authority."""
+        entries = self.apply_batch(
+            ({'op': 'create', 'request': request},),
+            materialise_request=materialise_request,
+        )
+        return entries[-1]
+
+    def update(
+        self,
+        selector: str | uuid.UUID,
+        request: AnyOverlayRequest,
+        materialise_request: Callable[[AnyOverlayRequest], ProjectorMaterialisation | None]
+        | None = None,
+    ) -> OverlayEntry:
+        """Replace one complete request while preserving its identity and order."""
+        entries = self.apply_batch(
+            ({'op': 'update', 'selector': selector, 'request': request},),
+            materialise_request=materialise_request,
+        )
+        return next(entry for entry in entries if entry.id == request.id)
+
+    def apply_batch(
+        self,
+        operations: Sequence[object],
+        *,
+        materialise_request: Callable[[AnyOverlayRequest], ProjectorMaterialisation | None]
+        | None = None,
+        max_operations: int | None = None,
+    ) -> list[OverlayEntry]:
+        """Validate and publish an ordered batch, or publish nothing at all.
+
+        Candidate construction deliberately happens outside ``_lock``.  The final
+        generation check makes a candidate based on an older registry impossible
+        to publish after a concurrent mutation.
+        """
+        if not isinstance(operations, Sequence) or isinstance(
+            operations,
+            (str, bytes, bytearray),
+        ):
+            raise ValueError('operations must be an ordered sequence')
+        operation_values = tuple(operations)
+        if max_operations is not None:
+            _validate_batch_limit(max_operations)
+        operation_limit = (
+            self._max_operations
+            if max_operations is None
+            else min(self._max_operations, max_operations)
+        )
+        if len(operation_values) > operation_limit:
+            raise ValueError('overlay batch exceeds the configured operation limit')
+        if len(operation_values) == 0:
+            raise ValueError('overlay batch must contain at least one operation')
+
         with self._lock:
-            overlay_id = self._make_overlay_id(request.id)
-            if overlay_id in self._entries:
-                raise ValueError(f'Overlay id {overlay_id} is already in use')
-            if request.name is not None and request.name in self._names:
-                raise ValueError(f'Overlay name {request.name!r} is already in use')
-            if overlay_id != request.id:
-                request = request.model_copy(update={'id': overlay_id})
-            entry = OverlayEntry(
-                overlay_id,
-                request.name,
-                request.kind,
-                request.visible,
-                request,
-                materialised_primitives,
-                camera_dependencies,
-                metric_dependency,
-                self._projector_output_descriptor,
-                self._next_insertion_sequence,
+            starting_generation = self._generation
+            starting_entries = tuple(self._entries.values())
+            starting_next_sequence = self._next_insertion_sequence
+            descriptor = self._projector_output_descriptor
+        candidate_entries, next_sequence = _apply_overlay_operations(
+            starting_entries,
+            starting_next_sequence,
+            descriptor,
+            operation_values,
+            materialise_request,
+            self._id_factory,
+        )
+        candidate_by_id = {entry.id: entry for entry in candidate_entries}
+        candidate_names = {
+            entry.name: entry.id
+            for entry in candidate_entries
+            if entry.name is not None
+        }
+        with self._lock:
+            if self._generation != starting_generation:
+                raise RuntimeError('Overlay registry changed while building the batch')
+            self._entries = candidate_by_id
+            self._names = candidate_names
+            self._next_insertion_sequence = next_sequence
+            self._generation += 1
+            return list(candidate_entries)
+
+    # These names keep the service boundary readable and make the transaction
+    # seam convenient for callers that describe the operation as a mutation.
+    apply_operations = apply_batch
+    batch = apply_batch
+
+    def publish_if_generation(
+        self,
+        generation: int,
+        publish: Callable[[], None],
+    ) -> bool:
+        """Run one publication callback while the registry generation is stable."""
+        if not isinstance(generation, int) or isinstance(generation, bool):
+            raise ValueError('generation must be an integer')
+        if not callable(publish):
+            raise ValueError('publish must be callable')
+        with self._lock:
+            if self._generation != generation:
+                return False
+            publish()
+            return True
+
+    def resolve(
+        self,
+        spatial_state_or_materialise_request: object,
+        materialise_request: Callable[
+            [AnyOverlayRequest, object],
+            ProjectorMaterialisation | None,
+        ]
+        | None = None,
+    ) -> tuple[OverlayEntry, ...]:
+        """Resolve one registry snapshot without publishing its materialisation.
+
+        The one-argument form is retained for the existing service seam.  The
+        two-argument form makes the spatial snapshot explicit for callers that
+        own resolution, while keeping all work outside the registry lock.
+        """
+        if materialise_request is None:
+            if not callable(spatial_state_or_materialise_request):
+                raise ValueError('resolve requires a materialisation callback')
+            materialise = spatial_state_or_materialise_request
+        else:
+            if not callable(materialise_request):
+                raise ValueError('materialise_request must be callable')
+            spatial_state = spatial_state_or_materialise_request
+
+            def materialise(request: AnyOverlayRequest) -> ProjectorMaterialisation | None:
+                return materialise_request(request, spatial_state)
+
+        entries = self.snapshot()
+        resolved_entries: list[OverlayEntry] = []
+        for entry in entries:
+            if not entry.is_dynamic:
+                resolved_entries.append(entry)
+                continue
+            materialisation = materialise(entry.request)
+            if materialisation is None:
+                resolved_entries.append(
+                    entry._replace(
+                        materialised_primitives=ProjectorMaterialisation(),
+                        is_resolved=False,
+                        unresolved_reason='spatial authority unavailable',
+                    ),
+                )
+                continue
+            _validate_projector_materialisation(materialisation)
+            resolved_entries.append(
+                entry._replace(
+                    materialised_primitives=materialisation,
+                    is_resolved=True,
+                    unresolved_reason=None,
+                ),
             )
-            self._entries[overlay_id] = entry
-            if entry.name is not None:
-                self._names[entry.name] = overlay_id
-            self._next_insertion_sequence += 1
-            return entry
+        return tuple(resolved_entries)
 
     def list(self) -> list[OverlayEntry]:
-        with self._lock:
-            return list(self._entries.values())
+        return list(self.snapshot())
 
     def get(self, selector: str | uuid.UUID) -> OverlayEntry:
         with self._lock:
@@ -984,28 +1498,25 @@ class OverlayRegistry:
 
     def remove(self, selector: str | uuid.UUID) -> OverlayEntry:
         with self._lock:
-            overlay_id = self._resolve_selector(selector)
-            entry = self._entries.pop(overlay_id)
-            if entry.name is not None:
-                del self._names[entry.name]
-            return entry
+            removed_entry = self._entries[self._resolve_selector(selector)]
+        self.apply_batch(({'op': 'remove', 'selector': selector},))
+        return removed_entry
 
     def clear(self) -> None:
         with self._lock:
-            self._entries.clear()
-            self._names.clear()
+            if len(self._entries) == 0:
+                return
+            self._entries = {}
+            self._names = {}
+            self._generation += 1
 
     def invalidate_camera(self, camera_id: str) -> None:
         if not isinstance(camera_id, str) or len(camera_id) == 0:
             raise ValueError('camera_id must be a non-empty string')
-        with self._lock:
-            self._remove_matching(
-                lambda entry: camera_id in entry.camera_dependencies,
-            )
+        self._invalidate_matching(lambda entry: camera_id in entry.camera_dependencies)
 
     def invalidate_metric(self) -> None:
-        with self._lock:
-            self._remove_matching(lambda entry: entry.metric_dependency)
+        self._invalidate_matching(lambda entry: entry.metric_dependency)
 
     def invalidate_projector_output(
         self,
@@ -1016,7 +1527,31 @@ class OverlayRegistry:
             if projector_output_descriptor == self._projector_output_descriptor:
                 return
             self._projector_output_descriptor = projector_output_descriptor
-            self._remove_matching(lambda _entry: True)
+            updated_entries = tuple(
+                entry._replace(
+                    materialised_primitives=ProjectorMaterialisation(),
+                    projector_output_descriptor=projector_output_descriptor,
+                    is_resolved=False,
+                    unresolved_reason='projector output changed',
+                )
+                if entry.is_dynamic
+                else entry._replace(
+                    projector_output_descriptor=projector_output_descriptor,
+                )
+                for entry in self._entries.values()
+                if entry.is_dynamic
+                or (
+                    len(entry.camera_dependencies) == 0
+                    and not entry.metric_dependency
+                )
+            )
+            self._entries = {entry.id: entry for entry in updated_entries}
+            self._names = {
+                entry.name: entry.id
+                for entry in updated_entries
+                if entry.name is not None
+            }
+            self._generation += 1
 
     def _set_visibility(
         self,
@@ -1026,11 +1561,20 @@ class OverlayRegistry:
         with self._lock:
             overlay_id = self._resolve_selector(selector)
             entry = self._entries[overlay_id]
-            if entry.visible == visible:
-                return entry
-            updated_entry = entry._replace(visible=visible)
-            self._entries[overlay_id] = updated_entry
-            return updated_entry
+        if entry.visible == visible:
+            return entry
+        updated_request = entry.request.model_copy(update={'visible': visible})
+        updated_entries = self.apply_batch(
+            ({'op': 'update', 'selector': overlay_id, 'request': updated_request},),
+            materialise_request=(
+                lambda _request: (
+                    entry.materialised_primitives
+                    if entry.is_resolved
+                    else None
+                )
+            ),
+        )
+        return next(item for item in updated_entries if item.id == overlay_id)
 
     def _make_overlay_id(self, request_id: uuid.UUID) -> uuid.UUID:
         overlay_id = request_id if self._id_factory is None else self._id_factory()
@@ -1052,27 +1596,237 @@ class OverlayRegistry:
             except ValueError:
                 overlay_id = self._names.get(selector)
                 if overlay_id is None:
-                    raise OverlayNotFoundError(
-                        f'Unknown overlay {selector!r}',
-                    ) from None
+                    raise OverlayNotFoundError(f'Unknown overlay {selector!r}') from None
         else:
             raise ValueError('overlay selector must be an id or name')
         if overlay_id not in self._entries:
-            raise OverlayNotFoundError(
-                f'Unknown overlay {selector!r}',
-            )
+            raise OverlayNotFoundError(f'Unknown overlay {selector!r}')
         return overlay_id
 
-    def _remove_matching(self, predicate: Callable[[OverlayEntry], bool]) -> None:
-        removed_ids = [
-            overlay_id
-            for overlay_id, entry in self._entries.items()
-            if predicate(entry)
-        ]
-        for overlay_id in removed_ids:
-            entry = self._entries.pop(overlay_id)
-            if entry.name is not None:
-                del self._names[entry.name]
+    def _invalidate_matching(self, predicate: Callable[[OverlayEntry], bool]) -> None:
+        while True:
+            with self._lock:
+                starting_generation = self._generation
+                entries = tuple(self._entries.values())
+            retained_entries = tuple(
+                entry._replace(
+                    materialised_primitives=ProjectorMaterialisation(),
+                    is_resolved=False,
+                    unresolved_reason='spatial authority unavailable',
+                )
+                if predicate(entry) and entry.is_dynamic
+                else entry
+                for entry in entries
+                if not predicate(entry) or entry.is_dynamic
+            )
+            if retained_entries == entries:
+                return
+            with self._lock:
+                if (
+                    self._generation != starting_generation
+                    or tuple(self._entries.values()) != entries
+                ):
+                    continue
+                self._entries = {entry.id: entry for entry in retained_entries}
+                self._names = {
+                    entry.name: entry.id
+                    for entry in retained_entries
+                    if entry.name is not None
+                }
+                self._generation += 1
+                return
+
+
+def _validate_batch_limit(value: object) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError('max_operations must be a positive integer')
+
+
+def _apply_overlay_operations(
+    starting_entries: tuple[OverlayEntry, ...],
+    next_sequence: int,
+    descriptor: ProjectorOutputDescriptor,
+    operations: tuple[object, ...],
+    materialise_request: Callable[[AnyOverlayRequest], ProjectorMaterialisation | None]
+    | None,
+    id_factory: Callable[[], uuid.UUID | str] | None,
+) -> tuple[list[OverlayEntry], int]:
+    candidate = list(starting_entries)
+    for operation in operations:
+        operation_name, selector, request = _normalise_overlay_operation(operation)
+        if operation_name == 'remove':
+            entry_index = _find_candidate_index(candidate, selector)
+            candidate.pop(entry_index)
+            continue
+        if not isinstance(request, _OVERLAY_REQUEST_TYPES):
+            raise ValueError('request must be an overlay request')
+        if operation_name == 'create':
+            overlay_id = request.id if id_factory is None else _make_batch_overlay_id(id_factory)
+            if overlay_id in {entry.id for entry in candidate}:
+                raise ValueError(f'Overlay id {overlay_id} is already in use')
+            if any(entry.name == request.name and request.name is not None for entry in candidate):
+                raise ValueError(f'Overlay name {request.name!r} is already in use')
+            if overlay_id != request.id:
+                request = request.model_copy(update={'id': overlay_id})
+            materialisation = _materialise_candidate_request(request, materialise_request)
+            candidate.append(
+                _make_overlay_entry(
+                    request,
+                    materialisation,
+                    descriptor,
+                    next_sequence,
+                ),
+            )
+            next_sequence += 1
+            continue
+        if operation_name != 'update':
+            raise ValueError(f'Unknown overlay operation {operation_name!r}')
+        entry_index = _find_candidate_index(candidate, selector)
+        existing = candidate[entry_index]
+        if request.id != existing.id:
+            raise ValueError('Overlay update request id must match its selector')
+        if any(
+            idx != entry_index and entry.name == request.name and request.name is not None
+            for idx, entry in enumerate(candidate)
+        ):
+            raise ValueError(f'Overlay name {request.name!r} is already in use')
+        if request == existing.request and not existing.is_dynamic:
+            materialisation = existing.materialised_primitives
+        elif request == existing.request and materialise_request is None:
+            materialisation = (
+                existing.materialised_primitives
+                if existing.is_resolved
+                else None
+            )
+        else:
+            materialisation = _materialise_candidate_request(
+                request,
+                materialise_request,
+            )
+        candidate[entry_index] = _make_overlay_entry(
+            request,
+            materialisation,
+            descriptor,
+            existing.insertion_sequence,
+        )
+    return candidate, next_sequence
+
+
+def _normalise_overlay_operation(
+    operation: object,
+) -> tuple[str, str | uuid.UUID | None, AnyOverlayRequest | None]:
+    if isinstance(operation, Mapping):
+        operation_name = operation.get(
+            'op',
+            operation.get('operation', operation.get('action', operation.get('type'))),
+        )
+        selector = operation.get(
+            'selector',
+            operation.get('target', operation.get('overlay_id', operation.get('id'))),
+        )
+        request = operation.get(
+            'request',
+            operation.get('specification', operation.get('spec')),
+        )
+    else:
+        operation_name = getattr(
+            operation,
+            'op',
+            getattr(operation, 'operation', getattr(operation, 'action', None)),
+        )
+        selector = getattr(
+            operation,
+            'selector',
+            getattr(operation, 'target', getattr(operation, 'overlay_id', None)),
+        )
+        request = getattr(
+            operation,
+            'request',
+            getattr(operation, 'specification', getattr(operation, 'spec', None)),
+        )
+    if not isinstance(operation_name, str):
+        raise ValueError('overlay operation must specify create, update or remove')
+    operation_name = operation_name.lower()
+    if operation_name not in {'create', 'update', 'remove'}:
+        raise ValueError(f'Unknown overlay operation {operation_name!r}')
+    if operation_name == 'remove':
+        if not isinstance(selector, (str, uuid.UUID)):
+            raise ValueError('remove operations require an overlay selector')
+        return operation_name, selector, None
+    return operation_name, selector, request
+
+
+def _find_candidate_index(
+    candidate: Sequence[OverlayEntry],
+    selector: str | uuid.UUID | None,
+) -> int:
+    if not isinstance(selector, (str, uuid.UUID)):
+        raise ValueError('overlay selector must be an id or name')
+    if isinstance(selector, uuid.UUID):
+        for idx, entry in enumerate(candidate):
+            if entry.id == selector:
+                return idx
+    else:
+        try:
+            overlay_id = uuid.UUID(selector)
+        except ValueError:
+            overlay_id = None
+        for idx, entry in enumerate(candidate):
+            if (overlay_id is not None and entry.id == overlay_id) or entry.name == selector:
+                return idx
+    raise OverlayNotFoundError(f'Unknown overlay {selector!r}')
+
+
+def _make_batch_overlay_id(factory: Callable[[], uuid.UUID | str]) -> uuid.UUID:
+    value = factory()
+    try:
+        checked_value = uuid.UUID(value) if isinstance(value, str) else value
+    except ValueError as ex:
+        raise ValueError('id_factory must return a UUID4') from ex
+    if not isinstance(checked_value, uuid.UUID) or checked_value.version != 4:
+        raise ValueError('Overlay ids must be UUID4 values')
+    return checked_value
+
+
+def _materialise_candidate_request(
+    request: AnyOverlayRequest,
+    materialise_request: Callable[[AnyOverlayRequest], ProjectorMaterialisation | None] | None,
+) -> ProjectorMaterialisation | None:
+    if materialise_request is None:
+        raise ValueError('materialise_request is required for a batch')
+    materialisation = materialise_request(request)
+    if materialisation is not None:
+        _validate_projector_materialisation(materialisation)
+    elif not is_dynamic_overlay_request(request):
+        raise ValueError('static overlay materialisation is unavailable')
+    return materialisation
+
+
+def _make_overlay_entry(
+    request: AnyOverlayRequest,
+    materialisation: ProjectorMaterialisation | None,
+    descriptor: ProjectorOutputDescriptor,
+    insertion_sequence: int,
+) -> OverlayEntry:
+    camera_dependencies, metric_dependency = get_overlay_dependencies(request)
+    fiducial_dependencies = get_overlay_fiducial_dependencies(request)
+    dynamic = is_dynamic_overlay_request(request)
+    return OverlayEntry(
+        request.id,
+        request.name,
+        request.kind,
+        request.visible,
+        request,
+        materialisation or ProjectorMaterialisation(),
+        camera_dependencies,
+        metric_dependency,
+        descriptor,
+        insertion_sequence,
+        dynamic,
+        materialisation is not None,
+        None if materialisation is not None else 'spatial authority unavailable',
+        fiducial_dependencies,
+    )
 
 
 def _validate_projector_materialisation(
@@ -1132,6 +1886,24 @@ def get_overlay_point_references(
     if isinstance(request, (LineRequest, RulerRequest, ArrowRequest)):
         return (request.start, request.end)
     raise ValueError('request must be an overlay request')
+
+
+def get_overlay_fiducial_dependencies(
+    request: AnyOverlayRequest,
+) -> tuple[tuple[str, int], ...]:
+    """Return marker identities referenced by a declarative request."""
+    dependencies: list[tuple[str, int]] = []
+    for reference in get_overlay_point_references(request):
+        if isinstance(reference, FiducialAnchor):
+            identity = (reference.group, reference.id)
+            if identity not in dependencies:
+                dependencies.append(identity)
+    return tuple(dependencies)
+
+
+def is_dynamic_overlay_request(request: AnyOverlayRequest) -> bool:
+    """Return whether resolving this request depends on changing spatial state."""
+    return len(get_overlay_fiducial_dependencies(request)) > 0
 
 
 def get_overlay_dependencies(
@@ -2718,7 +3490,9 @@ __all__ = [
     'ArrowGeometry',
     'ArrowRequest',
     'MAX_ARROW_HEAD_DIMENSION',
+    'MAX_OVERLAY_INTENSITY',
     'MAX_OVERLAY_LABEL_SCALE',
+    'MIN_OVERLAY_INTENSITY',
     'MIN_OVERLAY_LABEL_SCALE',
     'CircleRequest',
     'GeometrySpace',
@@ -2752,12 +3526,17 @@ __all__ = [
     'SourceSegment',
     'ProjectorLabel',
     'ProjectorMaterialisation',
+    'apply_overlay_intensity_to_colour',
     'ProjectorPolygon',
     'OverlayEntry',
     'OverlayRegistry',
     'ProjectorSegment',
     'get_overlay_dependencies',
+    'get_overlay_fiducial_dependencies',
+    'is_circle_intersecting_protected_regions',
+    'is_polygon_intersecting_protected_regions',
     'get_overlay_point_references',
+    'is_dynamic_overlay_request',
     'DEFAULT_CIRCLE_SAMPLE_COUNT',
     'build_circle',
     'build_grid',
@@ -2772,6 +3551,9 @@ __all__ = [
     'materialise_grid',
     'materialise_line',
     'materialise_overlay',
+    'materialise_overlay_presentation',
+    'materialise_presentation',
+    'normalise_overlay_intensity',
     'materialise_rect',
     'materialise_ruler',
     'materialise_text',

@@ -731,3 +731,268 @@ no duplicate transform or dictionary logic or unrelated scope has been added.
 These commands and the review verify software boundaries only; until the
 physical rows above contain actual observations, Plan6 hardware results remain
 **not established**.
+
+## Plan7 / ADR-0004 realtime overlay and spatial-anchor procedure
+
+This is a separate physical acceptance procedure for ADR-0004. Run it on the
+target Mac with the identified projector/display, at least two identified
+cameras and printed markers from every configured namespace. API responses,
+fake devices, screenshots and synthetic tests are software evidence only.
+Every result below remains `not exercised` until the actual projector/camera
+observation is recorded; an unavailable physical check is not a pass.
+
+### 1. Configure namespaces and record the hardware
+
+Before starting the service, create a private configuration with at least two
+non-empty namespaces. Use the same numeric ID in both namespaces so ID-only
+matching would be observable as an error. On macOS, `main.py` loads
+`$HOME/Library/Application Support/MultiVision/config.json`; merge these fields
+into that file while preserving unrelated settings, or use an equivalent
+configuration path in the service's construction seam. For example, use two
+supported marker families and replace the example sizes with measured values:
+
+```json
+{
+  "fiducial_groups": {
+    "cards": {"dictionary": "DICT_5X5_1000", "marker_size_mm": 38.0},
+    "tokens": {"dictionary": "DICT_APRILTAG_36h11", "marker_size_mm": 25.0}
+  },
+  "fiducial_history_length": 8,
+  "fiducial_tracking_rate_hz": 30.0,
+  "fiducial_grace_period_seconds": 5.0,
+  "fiducial_protection_margin_mm": 5.0,
+  "preview_mode": "active",
+  "preview_low_rate_hz": 10.0
+}
+```
+
+Print or prepare a `cards` marker and a `tokens` marker with the same numeric
+ID (for example, 17). Measure each marker with a ruler. Start the service
+with this configuration and query the running instance:
+
+```sh
+PYTHON="$PWD/.venv/bin/python"
+"$PYTHON" main.py
+# Run the remaining commands in a second terminal.
+"$PYTHON" -m multivision.cli cameras list
+"$PYTHON" -m multivision.cli fiducial-groups
+"$PYTHON" -m multivision.cli spatial-state
+```
+
+Confirm that the returned dictionary and `marker_size_mm` values match the
+physical markers. Identify each camera slot from its live preview, not its
+capture index, and record:
+
+```text
+namespace | dictionary | configured size (mm) | measured size (mm)
+marker group/id | camera slot | live physical camera/aim | projector/output identity
+```
+
+Do not call equal-ID coexistence a pass until both namespaces have been
+observed separately on the projector and in the camera views.
+
+### 2. Calibrate and verify stable cross-camera selection
+
+Calibrate two independently aimed cameras using the existing procedure above.
+Place a marker in their physical overlap and let both cameras observe it while
+moving it slowly. Query the running service repeatedly:
+
+```sh
+"$PYTHON" -m multivision.cli spatial-state
+```
+
+Record the selected `(group, id)`, selected slot, candidate slots, frame
+counter, monotonic freshness and physical location. Repeat with the equal ID
+in the other namespace and confirm that it does not select, move or relabel
+the first marker. The selected camera must remain the physically stable
+candidate over repeated observations; one frame or JSON alone is not evidence.
+If the cameras cannot physically overlap, record `not exercised`.
+
+### 3. Exercise fixed, surface and fiducial arrows
+
+Using coordinates appropriate to the calibrated surface, create a fixed
+projector-space arrow, a surface-to-fiducial arrow and a fiducial-to-fiducial
+arrow between the two namespaces. Keep all spaces and units explicit and use
+the actual group and ID:
+
+```sh
+FIXED='{"kind":"arrow","start":{"type":"projector","x":120,"y":120,"unit":"px"},"end":{"type":"projector","x":420,"y":260,"unit":"px"},"geometry_space":"projector_px","head_length":{"value":24,"unit":"px"},"head_width":{"value":16,"unit":"px"}}'
+SURFACE='{"kind":"arrow","start":{"type":"surface","x":120,"y":180,"unit":"mm"},"end":{"type":"fiducial","group":"cards","id":17},"geometry_space":"surface_mm","head_length":{"value":12,"unit":"mm"},"head_width":{"value":8,"unit":"mm"}}'
+CROSS_GROUP='{"kind":"arrow","start":{"type":"fiducial","group":"cards","id":17},"end":{"type":"fiducial","group":"tokens","id":17},"geometry_space":"surface_mm","head_length":{"value":12,"unit":"mm"},"head_width":{"value":8,"unit":"mm"}}'
+"$PYTHON" -m multivision.cli overlay arrow --spec-json "$FIXED"
+"$PYTHON" -m multivision.cli overlay arrow --spec-json "$SURFACE"
+"$PYTHON" -m multivision.cli overlay arrow --spec-json "$CROSS_GROUP"
+"$PYTHON" -m multivision.cli overlays list
+```
+
+Replace example coordinates and record returned IDs, physical shaft/head
+positions and dimensions. Move each marker independently and confirm only its
+dependent endpoint moves. A valid but unresolved dynamic request must remain
+stored while hidden; do not turn an unresolved response into a hardware pass.
+
+### 4. Verify marker-local offset and rotation
+
+Create a line from a marker centre to a second anchor on that marker with a
+measured local offset and `follow_rotation: true`:
+
+```sh
+LOCAL='{"kind":"line","start":{"type":"fiducial","group":"cards","id":17},"end":{"type":"fiducial","group":"cards","id":17,"local_offset":{"x":30,"y":0,"unit":"mm"},"follow_rotation":true},"geometry_space":"surface_mm","style":{"colour":"#00ff00"}}'
+"$PYTHON" -m multivision.cli overlay line --spec-json "$LOCAL"
+```
+
+Translate and rotate the physical marker through separated poses. Confirm on
+the projector that the offset remains 30 mm in the marker-local frame and that
+the line rotates with the marker. Record pose, slot, group/ID, measured offset,
+projected endpoints and unchanged declarative request. If physical measurement
+or rotation observation was not made, record `not exercised`.
+
+### 5. Verify the exact five-second hide and recovery
+
+With a dynamic arrow or local geometry visible, record the last usable
+observation time, then cover/remove only its marker without restarting the
+service. Observe before five seconds, at the configured five-second boundary
+and after it. The last pose may remain during grace; at expiry the dependent
+output must hide/become unresolved while the same overlay intent remains in
+`overlays list`. Restore the marker and confirm that the same overlay ID
+recovers automatically, without recreation or prediction:
+
+```sh
+"$PYTHON" -m multivision.cli spatial-state
+"$PYTHON" -m multivision.cli overlays list
+```
+
+Record monotonic timestamps, frame counters, visibility, freshness and the
+physical projector hide/recovery. Do not claim exact timing without that
+record.
+
+### 6. Verify one atomic multi-overlay transition
+
+Prepare three or more complete, uniquely identified requests, including one
+dynamic request, and submit them as one ordered batch. Keep each request as a
+JSON shell variable, including its UUID, then compose the operation document
+without quoting the embedded objects as strings:
+
+```sh
+REQUEST_A='{"kind":"line","id":"00000000-0000-4000-8000-000000000001","name":"batch-a","start":{"type":"projector","x":120,"y":120,"unit":"px"},"end":{"type":"projector","x":420,"y":260,"unit":"px"}}'
+REQUEST_B='{"kind":"circle","id":"00000000-0000-4000-8000-000000000002","name":"batch-b","centre":{"type":"surface","x":220,"y":180,"unit":"mm"},"geometry_space":"surface_mm","radius":{"value":35,"unit":"mm"}}'
+REQUEST_C='{"kind":"arrow","id":"00000000-0000-4000-8000-000000000003","name":"batch-dynamic","start":{"type":"surface","x":120,"y":180,"unit":"mm"},"end":{"type":"fiducial","group":"cards","id":17},"geometry_space":"surface_mm","head_length":{"value":12,"unit":"mm"},"head_width":{"value":8,"unit":"mm"}}'
+BATCH=$(printf '{"operations":[{"op":"create","request":%s},{"op":"create","request":%s},{"op":"create","request":%s}]}' "$REQUEST_A" "$REQUEST_B" "$REQUEST_C")
+printf '%s\n' "$BATCH" | "$PYTHON" -m multivision.cli overlays batch --spec-json -
+"$PYTHON" -m multivision.cli overlays list
+```
+
+Watch consecutive projector frames and record a single old-to-new coherent
+transition, with no intermediate subset. Submit an intentionally invalid batch
+and record that registry, list and projector state remain unchanged. A list
+response alone cannot establish visual atomicity.
+
+### 7. Verify intensity and protected readability
+
+Record visible endpoints, angles, physical lengths and arrow heads at global
+intensity `1.0`, then change only the global intensity:
+
+```sh
+"$PYTHON" -m multivision.cli overlays intensity set 1.0
+"$PYTHON" -m multivision.cli overlays intensity set 0.35
+"$PYTHON" -m multivision.cli overlays intensity get
+"$PYTHON" -m multivision.cli overlays list
+```
+
+Confirm physically that colour/opacity changes while geometry and requested
+physical size do not. This is not a projector-lamp brightness claim. Record
+both observations and any unmeasured field as `not exercised`.
+
+While a configured marker is visible and tracked, create an ordinary bright
+line or filled shape that would cross its footprint. Confirm that a visible
+gap/suppression protects the marker before loss, detection continues, and
+moving/removing the ordinary overlay does not change tracking. Record group/ID,
+camera slot, configured margin, observed footprint/gap, detection continuity
+and projector result. Do not infer protection from a marker that has already
+been lost.
+
+### 8. Exercise all preview modes and compare CPU
+
+Preview mode is startup-only. Repeat the same setup with otherwise identical
+configurations for `active`, `low_rate` and `off`, restarting between modes;
+do not mutate it through the CLI. In every mode leave capture, tracking,
+projector presentation and a dynamic overlay active. Record startup mode,
+live frame counters, spatial-state/tracking changes, projector behaviour and
+whether preview conversion/scaling/blitting occurred. An unrun mode remains
+`not exercised`.
+
+Measure CPU for the same workload in every mode using one fixed method (for
+example Activity Monitor or `ps`), interval and sample count:
+
+```text
+preview mode | process | interval/samples | CPU | tracking frames | preview conversion | projector stalls | result
+active       | _______ | _______________ | ___ | _______________ | _________________ | ________________ | not exercised
+low_rate     | _______ | _______________ | ___ | _______________ | _________________ | ________________ | not exercised
+off          | _______ | _______________ | ___ | _______________ | _________________ | ________________ | not exercised
+```
+
+Do not call preview a bottleneck or claim CPU improvement without these
+observations.
+
+### 9. Measure the running-service 30-mutation criterion
+
+Use an already-running service, not thirty cold CLI processes, and keep camera
+capture, active tracking, projector presentation and (for the acceptance
+criterion) normal active preview running. For comparison, the project-owned
+benchmark can drive separately started services for all three startup modes:
+
+```sh
+"$PYTHON" benchmarks/benchmark_realtime_overlays.py \
+  --service-url http://127.0.0.1:8000 --preview-mode active \
+  --mode-url low_rate=http://127.0.0.1:8001 \
+  --mode-url off=http://127.0.0.1:8002 \
+  --samples 30 --warmup-requests 2 \
+  > benchmark-realtime-overlays.json
+```
+
+Record the complete JSON, service/configuration identities, sample and warm-up
+counts, accepted and published single-mutation rates, batch throughput,
+tracking frames, HTTP/validation/registry/publication,
+spatial-resolution/materialisation, presentation, projector-stall and CPU
+components, plus the separate `cold_start` measurement. Only a real service
+reporting at least 30 accepted **and** published mutations per second with
+active runtime paths and no mutation-caused multi-frame stalls can satisfy the
+criterion. The injected benchmark, a registry microbenchmark, batch object
+count, CLI startup rate or missing diagnostics is not evidence of a pass.
+
+### 10. Final implementation-agent check and evidence boundary
+
+The final deterministic suite command is documented here and must be run
+separately from the physical record:
+
+```sh
+"$PWD/.venv/bin/python" -m pytest
+pi-harness validate --plan plans/plan7.md
+```
+
+Record exact output and return codes. These commands establish software and
+plan validity only; they do not establish physical marker readability,
+projector alignment, cross-camera selection, preview operation, CPU savings or
+realtime hardware performance.
+
+Inspect the final diff and confirm that ADR-0001, ADR-0002, ADR-0003 and
+`harness.toml` are unchanged; no second camera/projector or metric transform
+authority was added; and no broad camera-management lock is held during
+fiducial detection, geometry materialisation or rendering. Keep a final ledger
+of any evidence not actually collected:
+
+```text
+check | evidence recorded | result | remaining limitation
+namespaces/equal IDs | __________________ | not exercised | ______________
+stable cross-camera selection | ___________ | not exercised | ______________
+arrows/local offset/rotation | ____________ | not exercised | ______________
+five-second hide/recovery | ______________ | not exercised | ______________
+atomic transition | ______________________ | not exercised | ______________
+intensity/protection | ____________________ | not exercised | ______________
+preview/CPU comparison | _________________ | not exercised | ______________
+running-service 30 mutations | ____________ | not exercised | ______________
+```
+
+Do not claim ADR-0004 manual acceptance until the actual projector/camera
+observations and benchmark evidence are attached. The implementation-agent
+report may claim only the deterministic test and harness-validation results,
+and must list all unperformed physical checks.

@@ -24,12 +24,15 @@ from multivision.fiducials import (
 from multivision.config import Configuration
 from multivision.geometry import HomographyPair, Point2D
 from multivision.overlays import (
+    CircleRequest,
+    GridRequest,
     LineRequest,
     ProjectorMaterialisation,
 )
 from multivision.persistence import PersistedCalibration
 from multivision.service import PointOverlayService
 from multivision.session import FrameMetadata, SessionCameraRegistry
+from multivision.spatial import SpatialState
 from multivision.types import (
     CalibrationStatus,
     CameraStatus,
@@ -634,6 +637,67 @@ class MultiVisionServiceCameraManagementTest(unittest.TestCase):
         assert entry.camera_dependencies == ('camera-0',), f'{entry=}'
         assert entries == [entry], f'{entries=}'
 
+    def test_failed_overlay_create_does_not_prune_existing_entries(self) -> None:
+        runtime = CalibrationSessionRuntime()
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+        )
+        stale_request = LineRequest(
+            start={'space': 'camera_px', 'camera': 'camera-0', 'x': 1, 'y': 1},
+            end={'space': 'projector_px', 'x': 10, 'y': 10},
+        )
+        stale_entry = service.overlay_registry.create(
+            stale_request,
+            ProjectorMaterialisation(),
+        )
+        runtime.registry.mark_unavailable('camera-0', 'disconnected')
+
+        with self.assertRaisesRegex(ValueError, 'segment budget'):
+            service.create_overlay(
+                GridRequest(
+                    origin={'space': 'projector_px', 'x': 0, 'y': 0},
+                    geometry_space='projector_px',
+                    spacing={'value': 10, 'unit': 'px'},
+                    extent={
+                        'width': {'value': 100000, 'unit': 'px'},
+                        'height': {'value': 100000, 'unit': 'px'},
+                    },
+                ),
+            )
+
+        assert service.overlay_registry.list() == [stale_entry], f'{stale_entry=}'
+
+    def test_failed_metric_overlay_batch_does_not_mutate_existing_entries(self) -> None:
+        runtime = CalibrationSessionRuntime()
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+        )
+        stale_request = CircleRequest(
+            centre={'space': 'surface_mm', 'x': 10, 'y': 10, 'unit': 'mm'},
+            geometry_space='surface_mm',
+            radius={'value': 5, 'unit': 'mm'},
+        )
+        stale_entry = service.overlay_registry.create(
+            stale_request,
+            ProjectorMaterialisation(),
+        )
+
+        with self.assertRaises(InvalidCalibrationStateError):
+            service.apply_overlay_batch((
+                {
+                    'op': 'create',
+                    'request': CircleRequest(
+                        centre={'space': 'surface_mm', 'x': 20, 'y': 20, 'unit': 'mm'},
+                        geometry_space='surface_mm',
+                        radius={'value': 5, 'unit': 'mm'},
+                    ),
+                },
+            ))
+
+        assert service.overlay_registry.list() == [stale_entry], f'{stale_entry=}'
+
     def test_overlay_creation_prunes_stale_camera_dependencies(self) -> None:
         runtime = CalibrationSessionRuntime()
         service = MultiVisionService(
@@ -830,6 +894,122 @@ class MultiVisionServiceCameraManagementTest(unittest.TestCase):
         camera = runtime.registry.get('camera-0')
         assert camera.calibration_status is CalibrationStatus.UNCALIBRATED, f'{camera=}'
         assert camera.calibration is None, f'{camera=}'
+
+
+def test_metric_invalidation_clears_spatial_metric_authority() -> None:
+    service = MultiVisionService(Configuration(projector_resolution=Resolution(100, 80)))
+    spatial_state = SpatialState.empty()._replace(
+        metric_calibration=SimpleNamespace(state='CALIBRATED'),
+    )
+    service.update_spatial_state(spatial_state)
+
+    service.clear_metric_calibration()
+
+    assert service.spatial_state.metric_calibration is None
+    assert service.spatial_state.generation == spatial_state.generation + 1
+
+
+def test_service_registry_uses_configured_batch_limit_above_registry_default() -> None:
+    service = MultiVisionService(
+        Configuration(
+            projector_resolution=Resolution(100, 80),
+            max_batch_operations=101,
+        ),
+    )
+    operations = tuple(
+        {
+            'op': 'create',
+            'request': LineRequest(
+                name=f'line-{idx}',
+                start={'space': 'projector_px', 'x': 1, 'y': 1},
+                end={'space': 'projector_px', 'x': 10, 'y': 10},
+            ),
+        }
+        for idx in range(101)
+    )
+
+    entries = service.apply_overlay_batch(operations)
+
+    assert len(entries) == 101, f'{len(entries)=}'
+
+
+def test_service_batch_is_atomic_and_uses_configured_limit() -> None:
+    service = MultiVisionService(
+        Configuration(
+            projector_resolution=Resolution(100, 80),
+            max_batch_operations=2,
+        ),
+    )
+    first_request = LineRequest(
+        name='first',
+        start={'space': 'projector_px', 'x': 1, 'y': 1},
+        end={'space': 'projector_px', 'x': 10, 'y': 10},
+    )
+    second_request = LineRequest(
+        name='second',
+        start={'space': 'projector_px', 'x': 2, 'y': 2},
+        end={'space': 'projector_px', 'x': 20, 'y': 20},
+    )
+
+    service.apply_overlay_batch((
+        {'op': 'create', 'request': first_request},
+        {'op': 'create', 'request': second_request},
+    ))
+    before_failure = service.overlay_registry.snapshot()
+    before_generation = service.overlay_registry.generation
+
+    try:
+        service.apply_overlay_batch((
+            {'op': 'update', 'selector': first_request.id, 'request': first_request},
+            {'op': 'remove', 'selector': second_request.id},
+            {'op': 'remove', 'selector': first_request.id},
+        ))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('The operation limit did not reject the batch')
+
+    assert service.overlay_registry.snapshot() == before_failure
+    assert service.overlay_registry.generation == before_generation
+
+
+
+def test_failed_batch_does_not_prune_unrelated_stale_entries() -> None:
+    runtime = CalibrationSessionRuntime()
+    service = MultiVisionService(
+        Configuration(projector_resolution=Resolution(100, 80)),
+        camera_runtime=runtime,  # type: ignore[arg-type]
+    )
+    stale_request = LineRequest(
+        start={'space': 'camera_px', 'camera': 'camera-0', 'x': 1, 'y': 1},
+        end={'space': 'projector_px', 'x': 10, 'y': 10},
+    )
+    stale_entry = service.overlay_registry.create(
+        stale_request,
+        ProjectorMaterialisation(),
+    )
+    runtime.registry.mark_unavailable('camera-0', 'disconnected')
+
+    projector_request = LineRequest(
+        name='projector',
+        start={'space': 'projector_px', 'x': 1, 'y': 1},
+        end={'space': 'projector_px', 'x': 10, 'y': 10},
+    )
+    unavailable_camera_request = LineRequest(
+        start={'space': 'camera_px', 'camera': 'camera-0', 'x': 2, 'y': 2},
+        end={'space': 'projector_px', 'x': 10, 'y': 10},
+    )
+    try:
+        service.apply_overlay_batch((
+            {'op': 'create', 'request': projector_request},
+            {'op': 'create', 'request': unavailable_camera_request},
+        ))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('The unavailable camera should reject the batch')
+
+    assert service.overlay_registry.get(stale_entry.id) == stale_entry
 
 
 if __name__ == '__main__':

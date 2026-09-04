@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Any
 
@@ -236,6 +237,128 @@ class CliTest(unittest.TestCase):
             ('DELETE', 'http://service.test/overlays/id/overlay-1', None),
             ('DELETE', 'http://service.test/overlays', None),
         ], f'{requests=}'
+
+    def test_runtime_overlay_commands_accept_json_file_and_stdin_payloads(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            return ServiceResponse(200, 'application/json', b'{"ok": true}')
+
+        client = MultiVisionClient('http://service.test', request_sender=request_sender)
+        arrow_spec = {
+            'start': {'type': 'projector', 'x': 1, 'y': 2, 'unit': 'px'},
+            'end': {'type': 'projector', 'x': 20, 'y': 30, 'unit': 'px'},
+            'geometry_space': 'projector_px',
+            'head_length': {'value': 4, 'unit': 'px'},
+            'head_width': {'value': 2, 'unit': 'px'},
+        }
+        batch_spec = {
+            'operations': [
+                {'op': 'create', 'request': {'kind': 'line', 'name': 'first'}},
+                {'op': 'remove', 'selector': 'first'},
+            ],
+        }
+        replacement_spec = {
+            'kind': 'line',
+            'start': {'type': 'projector', 'x': 1, 'y': 2, 'unit': 'px'},
+            'end': {'type': 'projector', 'x': 20, 'y': 30, 'unit': 'px'},
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            batch_path = pathlib.Path(temporary_directory) / 'batch.json'
+            batch_path.write_text(json.dumps(batch_spec))
+            with redirect_stdout(io.StringIO()):
+                assert main(
+                    ['overlay', 'arrow', '--spec-json', json.dumps(arrow_spec)],
+                    client,
+                ) == 0
+                assert main(
+                    ['overlays', 'batch', '--spec-json', str(batch_path)],
+                    client,
+                ) == 0
+                with patch('sys.stdin', io.StringIO(json.dumps(batch_spec))):
+                    assert main(
+                        ['overlays', 'batch', '--spec-json', '-'],
+                        client,
+                    ) == 0
+                assert main(
+                    [
+                        'overlay',
+                        'replace',
+                        '--id',
+                        '123e4567-e89b-42d3-a456-426614174000',
+                        '--spec-json',
+                        json.dumps(replacement_spec),
+                    ],
+                    client,
+                ) == 0
+
+        assert [method for method, _url, _payload, _timeout in requests] == [
+            'POST', 'POST', 'POST', 'PUT',
+        ], f'{requests=}'
+        assert requests[0][1:] == (
+            'http://service.test/overlays/arrow',
+            arrow_spec,
+            30.0,
+        )
+        assert requests[1][2] == batch_spec, f'{requests=}'
+        assert requests[2][2] == batch_spec, f'{requests=}'
+        assert requests[3][1] == (
+            'http://service.test/overlays/id/123e4567-e89b-42d3-a456-426614174000'
+        )
+
+    def test_intensity_and_spatial_inspection_commands_delegate_to_http(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            return ServiceResponse(200, 'application/json', b'{"intensity": 0.5}')
+
+        client = MultiVisionClient('http://service.test', request_sender=request_sender)
+        commands = [
+            ['overlays', 'intensity', 'get'],
+            ['overlays', 'intensity', 'set', '--intensity', '0.5'],
+            ['fiducial-groups'],
+            ['spatial-state'],
+        ]
+        for command in commands:
+            with self.subTest(command=command), redirect_stdout(io.StringIO()):
+                assert main(command, client) == 0
+
+        assert [
+            (method, url, payload)
+            for method, url, payload, _timeout in requests
+        ] == [
+            ('GET', 'http://service.test/overlays/intensity', None),
+            ('PUT', 'http://service.test/overlays/intensity', {'intensity': 0.5}),
+            ('GET', 'http://service.test/fiducial-groups', None),
+            ('GET', 'http://service.test/spatial-state', None),
+        ], f'{requests=}'
+
+    def test_runtime_overlay_input_errors_do_not_reach_http(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+        client = MultiVisionClient(
+            request_sender=lambda method, url, payload, timeout: (
+                requests.append((method, url, payload, timeout))
+                or ServiceResponse(200, 'application/json', b'{}')
+            ),
+        )
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                main(['overlays', 'batch', '--spec-json', '{not-json}'], client)
+            with self.assertRaises(SystemExit):
+                main(['overlays', 'intensity', 'set', '--intensity', '2'], client)
+        assert requests == [], f'{requests=}'
 
     def test_projector_grid_command_delegates_physical_spacing_to_service(self) -> None:
         requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
@@ -738,6 +861,34 @@ class CliTest(unittest.TestCase):
 
         assert result.returncode == 0, f'{result.stdout=}, {result.stderr=}'
         assert result.stdout.strip() == 'False False False False False', f'{result.stdout=}'
+
+    def test_overlay_commands_do_not_load_geometry_or_detection_modules(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                '-c',
+                (
+                    'import sys; '
+                    'from multivision.cli import MultiVisionClient, ServiceResponse, main; '
+                    "spec = {'kind': 'line', "
+                    "'start': {'space': 'projector_px', 'x': 1, 'y': 2}, "
+                    "'end': {'space': 'projector_px', 'x': 3, 'y': 4}}; "
+                    "client = MultiVisionClient(request_sender=lambda *args: "
+                    "ServiceResponse(200, 'application/json', b'{}')); "
+                    "main(['overlay', 'line', '--spec-json', __import__('json').dumps(spec)], client); "
+                    "print('multivision.geometry' in sys.modules, "
+                    "'multivision.metric' in sys.modules, "
+                    "'multivision.camera' in sys.modules, "
+                    "'multivision.display' in sys.modules)"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, f'{result.stdout=}, {result.stderr=}'
+        assert result.stdout.splitlines()[-1] == 'False False False False', f'{result.stdout=}'
 
 
 if __name__ == '__main__':

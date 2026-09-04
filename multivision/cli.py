@@ -10,6 +10,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Callable, Sequence
 from typing import Any, NamedTuple
 
@@ -77,6 +78,39 @@ class MultiVisionClient:
 
     def delete(self, path: str) -> ServiceResponse:
         return self._request('DELETE', path)
+
+    def apply_overlay_batch(self, specification: dict[str, Any]) -> ServiceResponse:
+        return self.post('/overlays/batch', specification)
+
+    def create_arrow_overlay(self, specification: dict[str, Any]) -> ServiceResponse:
+        return self.post('/overlays/arrow', specification)
+
+    def replace_overlay(
+        self,
+        overlay_id: str,
+        specification: dict[str, Any],
+    ) -> ServiceResponse:
+        path_selector = _quote_path_component(overlay_id)
+        return self.put(f'/overlays/id/{path_selector}', specification)
+
+    def get_overlay_intensity(self) -> ServiceResponse:
+        return self.get('/overlays/intensity')
+
+    def set_overlay_intensity(self, intensity: float) -> ServiceResponse:
+        return self.put('/overlays/intensity', {'intensity': intensity})
+
+    def get_fiducial_groups(self) -> ServiceResponse:
+        return self.get('/fiducial-groups')
+
+    def get_spatial_state(self) -> ServiceResponse:
+        return self.get('/spatial-state')
+
+    def put(
+        self,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> ServiceResponse:
+        return self._request('PUT', path, payload)
 
     def _request(
         self,
@@ -289,7 +323,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     clear_parser = overlay_subparsers.add_parser('clear', help='clear the current overlay')
     clear_parser.set_defaults(command_handler='overlay_clear')
-    for overlay_kind in ('grid', 'circle', 'rect', 'text', 'line', 'ruler'):
+    for overlay_kind in ('grid', 'circle', 'rect', 'text', 'line', 'ruler', 'arrow'):
         create_overlay_parser = overlay_subparsers.add_parser(
             overlay_kind,
             help=f'create a {overlay_kind} overlay',
@@ -299,8 +333,8 @@ def _build_parser() -> argparse.ArgumentParser:
             grid_mode.add_argument(
                 '--spec-json',
                 dest='spec_json',
-                type=_parse_json_object,
-                help='validated overlay request as a JSON object',
+                type=_parse_json_object_or_stdin,
+                help='validated overlay request as a JSON object, file or - for stdin',
             )
             grid_mode.add_argument(
                 '--fill-projector',
@@ -323,14 +357,32 @@ def _build_parser() -> argparse.ArgumentParser:
             create_overlay_parser.add_argument(
                 '--spec-json',
                 required=True,
-                type=_parse_json_object,
-                help='validated overlay request as a JSON object',
+                type=_parse_json_object_or_stdin,
+                help='validated overlay request as a JSON object, file or - for stdin',
             )
         create_overlay_parser.set_defaults(
             command_handler='overlay_create',
             overlay_kind=overlay_kind,
             fill_projector=False,
         )
+    replace_parser = overlay_subparsers.add_parser(
+        'replace',
+        help='replace a generic overlay specification',
+    )
+    replace_parser.add_argument(
+        '--id',
+        dest='overlay_id',
+        required=True,
+        type=_parse_uuid_argument,
+    )
+    replace_parser.add_argument(
+        '--spec-json',
+        required=True,
+        type=_parse_json_object_or_stdin,
+        help='replacement overlay request as a JSON object, file or - for stdin',
+    )
+    replace_parser.set_defaults(command_handler='overlay_replace')
+
     for lifecycle_action in ('show', 'hide', 'remove'):
         lifecycle_parser = overlay_subparsers.add_parser(
             lifecycle_action,
@@ -366,6 +418,60 @@ def _build_parser() -> argparse.ArgumentParser:
         help='clear generic overlays',
     )
     overlays_clear_parser.set_defaults(command_handler='overlays_clear')
+    overlays_batch_parser = overlays_subparsers.add_parser(
+        'batch',
+        help='apply one ordered overlay mutation batch',
+    )
+    overlays_batch_parser.add_argument(
+        '--spec-json',
+        required=True,
+        type=_parse_json_object_or_stdin,
+        help='batch request as a JSON object, file or - for stdin',
+    )
+    overlays_batch_parser.set_defaults(command_handler='overlays_batch')
+
+    overlays_intensity_parser = overlays_subparsers.add_parser(
+        'intensity',
+        help='inspect or set global overlay intensity',
+    )
+    overlays_intensity_subparsers = overlays_intensity_parser.add_subparsers(
+        dest='intensity_command',
+        required=True,
+    )
+    overlays_intensity_get_parser = overlays_intensity_subparsers.add_parser(
+        'get',
+        help='show global overlay intensity',
+    )
+    overlays_intensity_get_parser.set_defaults(command_handler='intensity_get')
+    overlays_intensity_set_parser = overlays_intensity_subparsers.add_parser(
+        'set',
+        help='set global overlay intensity',
+    )
+    overlays_intensity_set_parser.add_argument(
+        'intensity_value',
+        nargs='?',
+        type=_parse_overlay_intensity,
+    )
+    overlays_intensity_set_parser.add_argument(
+        '--intensity',
+        '--value',
+        dest='intensity',
+        type=_parse_overlay_intensity,
+    )
+    overlays_intensity_set_parser.set_defaults(command_handler='intensity_set')
+
+    fiducial_groups_parser = subparsers.add_parser(
+        'fiducial-groups',
+        aliases=('groups',),
+        help='inspect configured fiducial groups',
+    )
+    fiducial_groups_parser.set_defaults(command_handler='fiducial_groups')
+    spatial_state_parser = subparsers.add_parser(
+        'spatial-state',
+        aliases=('spatial',),
+        help='inspect the current spatial tracking state',
+    )
+    spatial_state_parser.set_defaults(command_handler='spatial_state')
 
     metric_parser = subparsers.add_parser(
         'metric',
@@ -512,9 +618,15 @@ def _run_command(
         'point': _point,
         'overlay_clear': _overlay_clear,
         'overlay_create': _overlay_create,
+        'overlay_replace': _overlay_replace,
         'overlay_lifecycle': _overlay_lifecycle,
         'overlays_list': _overlays_list,
         'overlays_clear': _overlays_clear,
+        'overlays_batch': _overlays_batch,
+        'intensity_get': _intensity_get,
+        'intensity_set': _intensity_set,
+        'fiducial_groups': _fiducial_groups,
+        'spatial_state': _spatial_state,
         'metric_target_generate': _metric_target_generate,
         'metric_calibrate': _metric_calibrate,
         'metric_status': _metric_status,
@@ -658,7 +770,20 @@ def _overlay_create(
         }
         return client.post('/overlays/grid/projector-footprint', payload)
     spec = _validate_overlay_spec(arguments.overlay_kind, arguments.spec_json)
+    if arguments.overlay_kind == 'arrow':
+        return client.create_arrow_overlay(spec)
     return client.post(f'/overlays/{arguments.overlay_kind}', spec)
+
+
+def _overlay_replace(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    overlay_kind = arguments.spec_json.get('kind')
+    if not isinstance(overlay_kind, str):
+        raise ValueError('replacement overlay spec must contain a string kind')
+    specification = _validate_overlay_spec(overlay_kind, arguments.spec_json)
+    return client.replace_overlay(arguments.overlay_id, specification)
 
 
 def _overlay_lifecycle(
@@ -688,34 +813,108 @@ def _overlays_clear(
     return client.delete('/overlays')
 
 
+def _overlays_batch(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.apply_overlay_batch(arguments.spec_json)
+
+
+def _intensity_get(
+    client: MultiVisionClient,
+    _arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.get_overlay_intensity()
+
+
+def _intensity_set(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    intensity = arguments.intensity
+    if intensity is None:
+        intensity = arguments.intensity_value
+    if intensity is None:
+        raise ValueError('an intensity value is required')
+    return client.set_overlay_intensity(intensity)
+
+
+def _fiducial_groups(
+    client: MultiVisionClient,
+    _arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.get_fiducial_groups()
+
+
+def _spatial_state(
+    client: MultiVisionClient,
+    _arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.get_spatial_state()
+
+
 def _validate_overlay_spec(
     overlay_kind: str,
     spec: dict[str, Any],
 ) -> dict[str, Any]:
-    request_types: dict[str, type[Any]]
-    from multivision.overlays import (
-        CircleRequest,
-        GridRequest,
-        LineRequest,
-        RectRequest,
-        RulerRequest,
-        TextRequest,
-    )
-
-    request_types = {
-        'grid': GridRequest,
-        'circle': CircleRequest,
-        'rect': RectRequest,
-        'text': TextRequest,
-        'line': LineRequest,
-        'ruler': RulerRequest,
+    required_fields: dict[str, tuple[str, ...]] = {
+        'grid': ('origin', 'geometry_space', 'spacing', 'extent'),
+        'circle': ('centre', 'geometry_space', 'radius'),
+        'rect': ('centre', 'geometry_space', 'width', 'height'),
+        'text': ('position', 'text'),
+        'line': ('start', 'end'),
+        'ruler': ('start', 'end', 'measurement_space', 'unit'),
+        'arrow': ('start', 'end', 'geometry_space', 'head_length', 'head_width'),
     }
-    try:
-        request_types[overlay_kind].model_validate(spec)
-    except KeyError as ex:
-        raise ValueError(f'Unknown overlay kind: {overlay_kind}') from ex
-    except ValueError as ex:
-        raise ValueError(f'Invalid {overlay_kind} overlay spec: {ex}') from ex
+    fields = required_fields.get(overlay_kind)
+    if fields is None:
+        raise ValueError(f'Unknown overlay kind: {overlay_kind}')
+    missing_fields = [field for field in fields if field not in spec]
+    if len(missing_fields) > 0:
+        raise ValueError(
+            f'Invalid {overlay_kind} overlay spec: missing {missing_fields!r}',
+        )
+    for field_name in ('origin', 'centre', 'position', 'start', 'end'):
+        if field_name not in fields:
+            continue
+        anchor = spec[field_name]
+        if not isinstance(anchor, dict):
+            raise ValueError(
+                f'Invalid {overlay_kind} overlay spec: {field_name} must be an object',
+            )
+        if 'space' not in anchor and 'type' not in anchor:
+            raise ValueError(
+                f'Invalid {overlay_kind} overlay spec: {field_name} must identify a space',
+            )
+    for field_name in ('radius', 'spacing', 'width', 'height', 'head_length', 'head_width'):
+        if field_name not in fields:
+            continue
+        quantity = spec[field_name]
+        if not isinstance(quantity, dict):
+            raise ValueError(
+                f'Invalid {overlay_kind} overlay spec: {field_name} must be an object',
+            )
+        quantity_value = quantity.get('value')
+        if (
+            not _is_finite_cli_number(quantity_value)
+            or quantity_value <= 0
+            or not isinstance(quantity.get('unit'), str)
+        ):
+            raise ValueError(
+                f'Invalid {overlay_kind} overlay spec: {field_name} must be positive and finite',
+            )
+    style = spec.get('style')
+    if style is not None and not isinstance(style, dict):
+        raise ValueError(f'Invalid {overlay_kind} overlay spec: style must be an object')
+    if isinstance(style, dict) and 'intensity' in style:
+        intensity = style['intensity']
+        if (
+            not _is_finite_cli_number(intensity)
+            or not 0.0 <= intensity <= 1.0
+        ):
+            raise ValueError(
+                f'Invalid {overlay_kind} overlay spec: intensity must be between 0.0 and 1.0',
+            )
     return spec
 
 
@@ -1024,13 +1223,70 @@ def _central_difference(
 
 
 def _parse_json_object(value: str) -> dict[str, Any]:
+    if not isinstance(value, str):
+        raise argparse.ArgumentTypeError('must be a JSON object, file or - for stdin')
+    source = value
     try:
-        parsed_value = json.loads(value)
-    except (TypeError, json.JSONDecodeError) as ex:
-        raise argparse.ArgumentTypeError('must be valid JSON') from ex
+        parsed_value = json.loads(source)
+    except (TypeError, json.JSONDecodeError):
+        path_value = value[1:] if value.startswith('@') else value
+        path = pathlib.Path(path_value)
+        try:
+            is_file = len(path_value) > 0 and path.is_file()
+        except OSError:
+            is_file = False
+        if not is_file:
+            raise argparse.ArgumentTypeError(
+                'must be valid JSON, a readable file or - for stdin',
+            ) from None
+        try:
+            source = path.read_text()
+        except OSError as ex:
+            raise argparse.ArgumentTypeError(
+                f'could not read JSON payload file: {ex}',
+            ) from ex
+        try:
+            parsed_value = json.loads(source)
+        except (TypeError, json.JSONDecodeError) as ex:
+            raise argparse.ArgumentTypeError(
+                'JSON payload file must contain valid JSON',
+            ) from ex
     if not isinstance(parsed_value, dict):
         raise argparse.ArgumentTypeError('must be a JSON object')
+    _validate_json_numbers(parsed_value)
     return parsed_value
+
+
+def _parse_json_object_or_stdin(value: str) -> dict[str, Any]:
+    if value == '-':
+        try:
+            value = sys.stdin.read()
+        except OSError as ex:
+            raise argparse.ArgumentTypeError(
+                f'could not read JSON payload from stdin: {ex}',
+            ) from ex
+    return _parse_json_object(value)
+
+
+def _validate_json_numbers(value: Any) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise argparse.ArgumentTypeError('JSON numbers must be finite')
+    if isinstance(value, list):
+        for elem in value:
+            _validate_json_numbers(elem)
+        return
+    if isinstance(value, dict):
+        for elem in value.values():
+            _validate_json_numbers(elem)
+
+
+def _is_finite_cli_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
 
 
 def _parse_finite_float(value: str) -> float:
@@ -1048,6 +1304,25 @@ def _parse_positive_finite_float(value: str) -> float:
     if parsed_value <= 0:
         raise argparse.ArgumentTypeError('must be positive')
     return parsed_value
+
+
+def _parse_overlay_intensity(value: str) -> float:
+    parsed_value = _parse_finite_float(value)
+    if not 0.0 <= parsed_value <= 1.0:
+        raise argparse.ArgumentTypeError('must be between 0.0 and 1.0')
+    return parsed_value
+
+
+def _parse_uuid_argument(value: str) -> str:
+    if not isinstance(value, str) or len(value.strip()) == 0:
+        raise argparse.ArgumentTypeError('must be a UUID4')
+    try:
+        parsed_uuid = uuid.UUID(value.strip())
+    except (AttributeError, ValueError) as ex:
+        raise argparse.ArgumentTypeError('must be a UUID4') from ex
+    if parsed_uuid.version != 4:
+        raise argparse.ArgumentTypeError('must be a UUID4')
+    return value.strip()
 
 
 def _parse_quantity_argument(value: str) -> tuple[float, str]:

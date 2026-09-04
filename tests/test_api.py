@@ -9,9 +9,18 @@ from fastapi.testclient import TestClient
 from multivision.api import create_app
 from multivision.application import MultiVisionService
 from multivision.camera import CameraRuntime
-from multivision.config import Configuration, load_configuration, save_configuration
-from multivision.fiducials import FiducialCorrespondence
-from multivision.geometry import Point2D
+from multivision.config import (
+    Configuration,
+    FiducialGroup,
+    load_configuration,
+    save_configuration,
+)
+from multivision.fiducials import (
+    FiducialCorrespondence,
+    FiducialIdentity,
+    FiducialObservation,
+)
+from multivision.geometry import Point2D, build_tag_geometry
 from multivision.metric import (
     MetricCalibrationMetrics,
     MetricCalibrationResult,
@@ -730,6 +739,164 @@ class ApiTest(unittest.TestCase):
 
         assert response.status_code == 422
         assert response.json()['error']['code'] == 'REQUEST_VALIDATION_ERROR'
+
+    def test_batch_response_uses_one_global_intensity_snapshot(self) -> None:
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(100, 80)),
+        )
+        intensity_reads: list[float] = []
+
+        def get_intensity() -> float:
+            intensity_reads.append(0.25)
+            return intensity_reads[-1]
+
+        service.get_overlay_intensity = get_intensity  # type: ignore[method-assign]
+        line_request = {
+            'kind': 'line',
+            'start': {'type': 'projector', 'x': 1, 'y': 2, 'unit': 'px'},
+            'end': {'type': 'projector', 'x': 90, 'y': 70, 'unit': 'px'},
+        }
+
+        with TestClient(create_app(service, manage_lifecycle=False)) as client:
+            response = client.post(
+                '/overlays/batch',
+                json={
+                    'operations': [
+                        {'op': 'create', 'request': line_request},
+                        {'op': 'create', 'request': line_request},
+                    ],
+                },
+            )
+
+        assert response.status_code == 200, f'{response.text=}'
+        assert len(intensity_reads) == 1, f'{intensity_reads=}'
+        assert [
+            overlay['effective_intensity']
+            for overlay in response.json()['overlays']
+        ] == [0.25, 0.25]
+
+    def test_spatial_state_route_serialises_selected_unwarmed_observations(self) -> None:
+        configuration = Configuration(
+            projector_resolution=Resolution(100, 80),
+            fiducial_groups={'cards': FiducialGroup('DICT_5X5_1000', 10.0)},
+        )
+        service = MultiVisionService(configuration)
+        geometry = build_tag_geometry(
+            (
+                Point2D(10, 10),
+                Point2D(20, 10),
+                Point2D(20, 20),
+                Point2D(10, 20),
+            ),
+        )
+        identity = FiducialIdentity('cards', 4)
+        observation = FiducialObservation(
+            'cards',
+            4,
+            geometry,
+            geometry,
+            geometry,
+            10.0,
+            'camera-0',
+            0,
+            1,
+            0.0,
+        )
+        service.update_spatial_state(
+            service.get_spatial_state()._replace(
+                selected_observations={identity: observation},
+                last_seen_monotonic_seconds={identity: 0.0},
+                stability_scores={identity: float('inf')},
+            ),
+        )
+
+        with TestClient(create_app(service, manage_lifecycle=False)) as client:
+            response = client.get('/spatial-state')
+
+        assert response.status_code == 200, f'{response.text=}'
+        data = response.json()
+        assert data['selected_observations'][0]['group'] == 'cards', f'{data=}'
+        assert data['selected_observations'][0]['camera']['centre'] == [15.0, 15.0]
+        assert data['selected_observations'][0]['stability_score'] is None
+        json.dumps(data, allow_nan=False)
+
+    def test_adr_overlay_routes_commit_one_batch_and_replace_intensity(self) -> None:
+        configuration = Configuration(
+            projector_resolution=Resolution(100, 80),
+            fiducial_groups={'cards': FiducialGroup('DICT_5X5_1000', 10.0)},
+        )
+        service = MultiVisionService(configuration)
+        first_id = '123e4567-e89b-42d3-a456-426614174000'
+        second_id = '123e4567-e89b-42d3-a456-426614174001'
+        line_request = {
+            'kind': 'line',
+            'id': first_id,
+            'name': 'first',
+            'start': {'type': 'projector', 'x': 1, 'y': 2, 'unit': 'px'},
+            'end': {'type': 'projector', 'x': 90, 'y': 70, 'unit': 'px'},
+        }
+
+        with TestClient(create_app(service, manage_lifecycle=False)) as client:
+            batch_response = client.post(
+                '/overlays/batch',
+                json={
+                    'operations': [
+                        {'op': 'create', 'request': line_request},
+                        {
+                            'op': 'create',
+                            'request': {
+                                **line_request,
+                                'id': second_id,
+                                'name': 'second',
+                            },
+                        },
+                        {
+                            'op': 'remove',
+                            'selector': first_id,
+                        },
+                    ],
+                },
+            )
+            intensity_response = client.put(
+                '/overlays/intensity',
+                json={'intensity': 0.25},
+            )
+            replacement_response = client.put(
+                f'/overlays/id/{second_id}',
+                json={
+                    **line_request,
+                    'id': second_id,
+                    'name': 'replacement',
+                    'style': {'colour': '#ffffff', 'intensity': 0.5},
+                },
+            )
+            invalid_response = client.post(
+                '/overlays/arrow',
+                json={
+                    'start': {'type': 'fiducial', 'group': 'missing', 'id': 7},
+                    'end': {'type': 'projector', 'x': 1, 'y': 1, 'unit': 'px'},
+                    'geometry_space': 'projector_px',
+                    'head_length': {'value': 2, 'unit': 'px'},
+                    'head_width': {'value': 1, 'unit': 'px'},
+                },
+            )
+            groups_response = client.get('/fiducial-groups')
+            spatial_response = client.get('/spatial-state')
+
+        assert batch_response.status_code == 200, f'{batch_response.text=}'
+        assert [
+            overlay['id'] for overlay in batch_response.json()['overlays']
+        ] == [second_id], f'{batch_response.json()=}'
+        assert intensity_response.json() == {'intensity': 0.25}
+        assert replacement_response.status_code == 200
+        assert replacement_response.json()['effective_intensity'] == 0.125
+        assert invalid_response.status_code == 422
+        assert invalid_response.json()['error']['code'] == 'INVALID_REQUEST'
+        assert groups_response.json()['groups']['cards'] == {
+            'dictionary': 'DICT_5X5_1000',
+            'marker_size_mm': 10.0,
+        }
+        assert spatial_response.json()['selected_observations'] == []
 
 if __name__ == '__main__':
     unittest.main()

@@ -3,11 +3,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from multivision.application import CameraArea
+from multivision.application import CameraArea, CameraRenderSnapshot
 from multivision.calibration import CalibrationMetrics
 from multivision.config import ProjectorOutputDescriptor
 from multivision.display import (
     BLACK,
+    DARK_GREY,
+    METRIC_RULER_COLOUR,
     DisplayConfiguration,
     PygameDisplayRuntime,
     ProjectorRenderer,
@@ -19,6 +21,7 @@ from multivision.metric import MetricCalibrationStatus, build_metric_ruler
 from multivision.overlays import (
     OverlayStyle,
     ProjectorLabel,
+    apply_overlay_intensity_to_colour,
     ProjectorMaterialisation,
     ProjectorPolygon,
     ProjectorSegment,
@@ -249,6 +252,323 @@ class SessionDisplayService:
 
 
 class DisplayTest(unittest.TestCase):
+    def test_render_clears_stale_window_content_between_snapshot_frames(self) -> None:
+        pygame_module = FakePygame()
+        service = FakeCameraRuntime()
+        display_runtime = PygameDisplayRuntime(
+            service,
+            pygame_module=pygame_module,
+            frame_surface_converter=lambda _frame, _pygame: FakeSurface((1, 1)),
+        )
+
+        display_runtime.render_once()
+        service.statuses = []
+        display_runtime.render_once()
+
+        assert pygame_module.window_surface.fills == [DARK_GREY, DARK_GREY], (
+            f'{pygame_module.window_surface.fills=}'
+        )
+
+    def test_snapshot_preview_layouts_follow_stable_slot_order(self) -> None:
+        descriptor = ProjectorOutputDescriptor(Resolution(100, 80))
+        statuses = (
+            CameraStatus(
+                'zulu',
+                'device-0',
+                RuntimeStatus.AVAILABLE,
+                CalibrationStatus.CALIBRATED,
+                Resolution(640, 480),
+            ),
+            CameraStatus(
+                'alpha',
+                'device-1',
+                RuntimeStatus.AVAILABLE,
+                CalibrationStatus.CALIBRATED,
+                Resolution(640, 480),
+            ),
+        )
+        snapshot = SimpleNamespace(
+            overlays=(),
+            projector_output_descriptor=descriptor,
+            global_overlay_intensity=1.0,
+            protected_projector_regions=(),
+            camera_snapshots=(
+                CameraRenderSnapshot(
+                    'camera-0',
+                    'zulu',
+                    statuses[0],
+                    SessionCameraState.OPEN,
+                    0,
+                    Frame(object(), 1, 0.0),
+                ),
+                CameraRenderSnapshot(
+                    'camera-1',
+                    'alpha',
+                    statuses[1],
+                    SessionCameraState.OPEN,
+                    0,
+                    Frame(object(), 1, 0.0),
+                ),
+            ),
+            projector_areas=(),
+            metric_state=MetricCalibrationStatus.UNCALIBRATED,
+            metric_ruler=None,
+            point_overlay=None,
+            calibration_pattern_visible=False,
+            metric_capture_active=False,
+            calibration_pattern=None,
+        )
+
+        class SnapshotService:
+            def get_render_snapshot(self) -> object:
+                return snapshot
+
+        display_runtime = PygameDisplayRuntime(
+            SnapshotService(),  # type: ignore[arg-type]
+            DisplayConfiguration(
+                window_resolution=Resolution(1000, 700),
+                projector_resolution=Resolution(100, 80),
+            ),
+            pygame_module=FakePygame(),
+            frame_surface_converter=lambda _frame, _pygame: FakeSurface((1, 1)),
+            projector_output=FakeProjectorOutput(),
+        )
+        display_runtime.render_once()
+
+        assert display_runtime.preview_layouts['camera-0'].panel_bounds.left == 0
+        assert display_runtime.preview_layouts['camera-1'].panel_bounds.left == 500
+
+    def test_lifecycle_rebuild_resets_low_rate_preview_cadence(self) -> None:
+        pygame_module = FakePygame()
+        service = SessionDisplayService(1)
+        clock_seconds = [0.0]
+        converted_frames: list[Frame] = []
+        display_runtime = PygameDisplayRuntime(
+            service,  # type: ignore[arg-type]
+            DisplayConfiguration(
+                window_resolution=Resolution(500, 400),
+                preview_mode='low_rate',
+                preview_low_rate_hz=10.0,
+            ),
+            pygame_module=pygame_module,
+            frame_surface_converter=lambda frame, _pygame: (
+                converted_frames.append(frame) or FakeSurface((1, 1))
+            ),
+            preview_clock=lambda: clock_seconds[0],
+        )
+
+        display_runtime.render_once()
+        clock_seconds[0] = 0.01
+        service.registry.close('camera-0')
+        service.registry.open('camera-0')
+        display_runtime.render_once()
+
+        assert len(converted_frames) == 2, f'{converted_frames=}'
+
+    def test_snapshot_rendering_is_single_read_and_preview_mode_is_independent(self) -> None:
+        class SnapshotService:
+            projector_output_descriptor = ProjectorOutputDescriptor(Resolution(100, 80))
+            calibration_pattern = None
+            overlay = None
+
+            def __init__(self) -> None:
+                self.snapshot_calls = 0
+                self.forbidden_calls: list[str] = []
+                self.render_snapshot = SimpleNamespace(
+                    overlays=(),
+                    projector_output_descriptor=self.projector_output_descriptor,
+                    global_overlay_intensity=1.0,
+                    protected_projector_regions=(),
+                    camera_snapshots=(
+                        CameraRenderSnapshot(
+                            'camera-0',
+                            'overhead',
+                            CameraStatus(
+                                'camera-0',
+                                'device-0',
+                                RuntimeStatus.AVAILABLE,
+                                CalibrationStatus.CALIBRATED,
+                                Resolution(640, 480),
+                            ),
+                            SessionCameraState.OPEN,
+                            0,
+                            Frame(object(), 1, 0.0),
+                        ),
+                    ),
+                    projector_areas=(),
+                    metric_state=MetricCalibrationStatus.UNCALIBRATED,
+                    metric_ruler=None,
+                    point_overlay=None,
+                    calibration_pattern_visible=False,
+                    metric_capture_active=False,
+                    calibration_pattern=None,
+                )
+
+            def get_render_snapshot(self) -> object:
+                self.snapshot_calls += 1
+                return self.render_snapshot
+
+            def __getattr__(self, name: str) -> object:
+                if name in {
+                    'snapshot',
+                    'get_camera_statuses',
+                    'get_camera_areas',
+                    'get_calibration_metrics',
+                }:
+                    self.forbidden_calls.append(name)
+                    raise AssertionError(f'Unexpected display service call: {name}')
+                raise AttributeError(name)
+
+        for preview_mode, expected_conversion_count in (
+            ('active', 3),
+            ('low_rate', 2),
+            ('off', 0),
+        ):
+            service = SnapshotService()
+            clock_seconds = [0.0]
+            converted_frames: list[Frame] = []
+
+            def convert_frame(frame: Frame, _pygame: object) -> FakeSurface:
+                converted_frames.append(frame)
+                return FakeSurface((1, 1))
+
+            display_runtime = PygameDisplayRuntime(
+                service,  # type: ignore[arg-type]
+                DisplayConfiguration(
+                    window_resolution=Resolution(500, 400),
+                    projector_resolution=Resolution(100, 80),
+                    preview_mode=preview_mode,
+                    preview_low_rate_hz=10.0,
+                ),
+                pygame_module=FakePygame(),
+                frame_surface_converter=convert_frame,
+                projector_output=FakeProjectorOutput(),
+                preview_clock=lambda: clock_seconds[0],
+            )
+            display_runtime.render_once()
+            clock_seconds[0] = 0.01
+            display_runtime.render_once()
+            clock_seconds[0] = 0.11
+            display_runtime.render_once()
+
+            assert len(converted_frames) == expected_conversion_count, (
+                f'{preview_mode=}, {converted_frames=}'
+            )
+            assert service.snapshot_calls == 3, (
+                f'{preview_mode=}, {service.snapshot_calls=}'
+            )
+            assert service.forbidden_calls == [], f'{service.forbidden_calls=}'
+
+    def test_legacy_projector_layers_respect_protected_regions(self) -> None:
+        pygame_module = FakePygame()
+        renderer = ProjectorRenderer(pygame_module)
+        surface = FakeSurface((200, 100))
+        protected_regions = (
+            (
+                Point2D(40, 40),
+                Point2D(160, 40),
+                Point2D(160, 60),
+                Point2D(40, 60),
+            ),
+        )
+        area = CameraArea(
+            'camera-0',
+            'overhead',
+            True,
+            (Point2D(40, 40), Point2D(160, 40), Point2D(160, 60)),
+            (70, 190, 255),
+        )
+        ruler = build_metric_ruler(
+            (50.0, 50.0),
+            (150.0, 50.0),
+            'mm',
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            Resolution(200, 100),
+        )
+
+        renderer.render_areas(
+            surface,
+            [area],
+            protected_regions=protected_regions,
+        )
+        renderer.render_metric_ruler(
+            surface,
+            ruler,
+            protected_regions=protected_regions,
+        )
+        renderer.render_overlay(
+            surface,
+            RedCircleOverlay(
+                'overhead',
+                'overhead-device',
+                Point2D(1, 2),
+                Point2D(100, 50),
+            ),
+            protected_regions=protected_regions,
+        )
+
+        assert pygame_module.draw_calls == [], f'{pygame_module.draw_calls=}'
+
+    def test_global_intensity_applies_to_legacy_projector_layers(self) -> None:
+        area = CameraArea(
+            'camera-0',
+            'overhead',
+            True,
+            (Point2D(10, 10), Point2D(40, 10), Point2D(40, 30)),
+            (70, 190, 255),
+        )
+        area_pygame = FakePygame()
+        ProjectorRenderer(area_pygame).render_areas(
+            FakeSurface((100, 80)),
+            [area],
+            FakeFont(area_pygame.rendered_text),
+            intensity=0.5,
+        )
+        assert area_pygame.draw_calls[0][1][1] == apply_overlay_intensity_to_colour(
+            area.area_colour,
+            0.5,
+        ), f'{area_pygame.draw_calls=}'
+
+        ruler_pygame = FakePygame()
+        ruler = build_metric_ruler(
+            (20.0, 20.0),
+            (60.0, 20.0),
+            'mm',
+            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+            Resolution(100, 80),
+        )
+        ProjectorRenderer(ruler_pygame).render_metric_ruler(
+            FakeSurface((100, 80)),
+            ruler,
+            FakeFont(ruler_pygame.rendered_text),
+            intensity=0.5,
+        )
+        ruler_colour = apply_overlay_intensity_to_colour(
+            METRIC_RULER_COLOUR,
+            0.5,
+        )
+        assert len(ruler_pygame.draw_calls) > 0, f'{ruler_pygame.draw_calls=}'
+        assert all(
+            call[1][1] == ruler_colour
+            for call in ruler_pygame.draw_calls
+        ), f'{ruler_pygame.draw_calls=}'
+
+        overlay_pygame = FakePygame()
+        ProjectorRenderer(overlay_pygame).render_overlay(
+            FakeSurface((100, 80)),
+            RedCircleOverlay(
+                'overhead',
+                'overhead-device',
+                Point2D(20, 20),
+                Point2D(10, 10),
+            ),
+            intensity=0.5,
+        )
+        assert overlay_pygame.draw_calls[0][1][1] == apply_overlay_intensity_to_colour(
+            (255, 0, 0),
+            0.5,
+        ), f'{overlay_pygame.draw_calls=}'
+
     def test_renderer_preserves_overlay_layers_and_visibility(self) -> None:
         pygame_module = FakePygame()
         renderer = ProjectorRenderer(pygame_module)
@@ -1236,6 +1556,118 @@ class DisplayTest(unittest.TestCase):
         assert display_runtime.projector_surface.size == (300, 150)
         new_rendered_text = pygame_module.rendered_text[len(rendered_text_before_change):]
         assert '60.0 mm' not in new_rendered_text
+
+    def test_projector_output_rebuilds_when_snapshot_output_changes(self) -> None:
+        class SnapshotService:
+            def __init__(self) -> None:
+                self.projector_output_descriptor = ProjectorOutputDescriptor(
+                    Resolution(100, 80),
+                    'projector-a',
+                )
+                self.calibration_pattern_visible = False
+                self.created_outputs: list[FakeProjectorOutput] = []
+
+            def get_camera_statuses(self) -> list[CameraStatus]:
+                return []
+
+            def get_camera_areas(self) -> list[CameraArea]:
+                return []
+
+            def list_overlays(self) -> list[object]:
+                return []
+
+            def get_metric_status(self) -> MetricCalibrationStatus:
+                return MetricCalibrationStatus.UNCALIBRATED
+
+            @property
+            def metric_capture_active(self) -> bool:
+                return False
+
+            @property
+            def metric_ruler(self) -> None:
+                return None
+
+            @property
+            def overlay(self) -> None:
+                return None
+
+            def get_calibration_metrics(self, _logical_name: str) -> None:
+                return None
+
+            def snapshot(self, _logical_name: str) -> Frame:
+                return Frame(object(), 1, 0.0)
+
+            def point_from_preview(
+                self,
+                _logical_name: str,
+                _preview_point: Point2D,
+                _preview_transform: object,
+            ) -> None:
+                return None
+
+        service = SnapshotService()
+        outputs: list[FakeProjectorOutput] = []
+
+        def make_output(_pygame: object, _configuration: DisplayConfiguration) -> FakeProjectorOutput:
+            output = FakeProjectorOutput()
+            outputs.append(output)
+            return output
+
+        display_runtime = PygameDisplayRuntime(
+            service,  # type: ignore[arg-type]
+            DisplayConfiguration(projector_resolution=Resolution(100, 80)),
+            pygame_module=FakePygame(),
+            projector_output_factory=make_output,
+        )
+        display_runtime.render_once()
+        first_output = outputs[0]
+        service.projector_output_descriptor = ProjectorOutputDescriptor(
+            Resolution(120, 90),
+            'projector-b',
+        )
+        display_runtime.render_once()
+
+        assert len(outputs) == 2, f'{outputs=}'
+        assert first_output.shutdown_called, f'{first_output.shutdown_called=}'
+        assert display_runtime.projector_surface.size == (120, 90)
+
+    def test_malformed_render_snapshot_fails_closed_and_remains_retryable(self) -> None:
+        class SnapshotService:
+            projector_output_descriptor = ProjectorOutputDescriptor(Resolution(100, 80))
+
+            def __init__(self) -> None:
+                self.snapshots = [
+                    SimpleNamespace(
+                        overlays=(),
+                        projector_output_descriptor=self.projector_output_descriptor,
+                        camera_snapshots=None,
+                    ),
+                    SimpleNamespace(
+                        overlays=(),
+                        projector_output_descriptor=self.projector_output_descriptor,
+                        camera_snapshots=(),
+                    ),
+                ]
+
+            def get_render_snapshot(self) -> object:
+                return self.snapshots.pop(0)
+
+        service = SnapshotService()
+        pygame_module = FakePygame()
+        display_runtime = PygameDisplayRuntime(
+            service,  # type: ignore[arg-type]
+            pygame_module=pygame_module,
+            projector_output=FakeProjectorOutput(),
+        )
+
+        display_runtime.render_once()
+        assert any(
+            text.startswith('Render snapshot unavailable')
+            for text in pygame_module.rendered_text
+        ), f'{pygame_module.rendered_text=}'
+        display_runtime.render_once()
+
+        assert display_runtime.projector_surface.fills == [BLACK, BLACK]
 
     def test_projector_output_failure_does_not_stop_the_next_frame(self) -> None:
         class FlakyProjectorOutput(FakeProjectorOutput):

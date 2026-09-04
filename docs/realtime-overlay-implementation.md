@@ -187,6 +187,35 @@ coexistence, tracking across cameras, preview-mode operation on the target
 setup and measured running-service performance must be observed and recorded
 on the actual hardware. Unperformed checks remain unclaimed.
 
+The project-owned benchmark is run against an already-running service. The
+following command emits the deterministic smoke schema only and cannot pass
+the realtime target:
+
+```sh
+.venv/bin/python benchmarks/benchmark_realtime_overlays.py --injected
+```
+
+For manual evidence, start three otherwise identical services with startup
+preview modes `active`, `low_rate` and `off`, then drive all three endpoints in
+one report. The service must have capture, tracking and projector presentation
+active; the benchmark does not reduce those paths or change preview mode at
+runtime:
+
+```sh
+.venv/bin/python benchmarks/benchmark_realtime_overlays.py \
+  --service-url http://127.0.0.1:8000 --preview-mode active \
+  --mode-url low_rate=http://127.0.0.1:8001 \
+  --mode-url off=http://127.0.0.1:8002 \
+  --samples 30 --warmup-requests 2 \
+  > benchmark-realtime-overlays.json
+```
+
+The report keeps single-mutation accepted/published rate separate from atomic
+batch object throughput and records CLI process startup under `cold_start` for
+context only. A real-service result with missing diagnostics, inactive runtime
+paths or presentation stalls is evidence against the acceptance criterion,
+not a passing microbenchmark.
+
 ## ADR-0004 non-goals
 
 This implementation does not add:

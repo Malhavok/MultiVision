@@ -10,9 +10,11 @@ from multivision.geometry import (
     CoordinateBounds,
     Point2D,
     TagGeometry,
+    build_protected_projector_regions,
     build_tag_geometry,
     invert_homography,
     project_point,
+    project_tag_geometry,
 )
 from multivision.overlays import (
     ArrowRequest,
@@ -26,6 +28,8 @@ from multivision.overlays import (
     PointReference,
     ProjectorLabel,
     ProjectorMaterialisation,
+    ProjectorPolygon,
+    ProjectorSegment,
     Quantity,
     RectRequest,
     RulerRequest,
@@ -42,6 +46,7 @@ from multivision.overlays import (
     materialise_circle,
     materialise_grid,
     materialise_line,
+    materialise_presentation,
     materialise_rect,
     materialise_ruler,
     materialise_text,
@@ -51,6 +56,153 @@ from multivision.overlays import (
     ProjectorAnchor,
 )
 from multivision.types import Resolution
+
+
+def test_presentation_applies_compound_intensity_without_mutating_geometry() -> None:
+    style = OverlayStyle(colour='#ffffff', intensity=0.5)
+    source = ProjectorMaterialisation(
+        segments=(ProjectorSegment(Point2D(0, 20), Point2D(40, 20), style),),
+        labels=(ProjectorLabel(Point2D(20, 20), 'hidden', style),),
+    )
+    protected = ((Point2D(10, 10), Point2D(30, 10), Point2D(30, 30), Point2D(10, 30)),)
+
+    presented = materialise_presentation(source, 0.5, protected)
+
+    assert source.segments[0].start == Point2D(0, 20), f'{source=}'
+    assert len(presented.segments) == 2, f'{presented=}'
+    assert presented.segments[0].end == Point2D(10, 20), f'{presented=}'
+    assert presented.segments[1].start == Point2D(30, 20), f'{presented=}'
+    assert presented.segments[0].style.colour == (64, 64, 64), f'{presented=}'
+    assert presented.labels == (), f'{presented=}'
+
+
+def test_presentation_suppresses_filled_polygon_inside_protection() -> None:
+    style = OverlayStyle(colour='#ff0000', fill=True)
+    source = ProjectorMaterialisation(
+        polygons=(
+            ProjectorPolygon(
+                (Point2D(0, 0), Point2D(40, 0), Point2D(40, 40), Point2D(0, 40)),
+                style,
+            ),
+        ),
+    )
+    protected = ((Point2D(10, 10), Point2D(30, 10), Point2D(30, 30), Point2D(10, 30)),)
+
+    presented = materialise_presentation(source, 1.0, protected)
+
+    assert presented.polygons == (), f'{presented=}'
+    assert source.polygons[0].points[0] == Point2D(0, 0), f'{source=}'
+
+
+def test_protection_without_metric_calibration_does_not_invent_margin() -> None:
+    footprint = (
+        Point2D(10, 10),
+        Point2D(30, 12),
+        Point2D(28, 32),
+        Point2D(8, 30),
+    )
+
+    regions = build_protected_projector_regions({('cards', 4): footprint}, 5.0)
+
+    assert regions == (footprint,), f'{regions=}'
+
+
+def test_protection_uses_selected_observations_when_footprints_are_unmaterialised() -> None:
+    footprint = build_tag_geometry(
+        ((10, 10), (30, 10), (30, 30), (10, 30)),
+    )
+    state = SimpleNamespace(
+        projector_footprints={},
+        selected_observations={('cards', 4): SimpleNamespace(projector=footprint)},
+        metric_calibration=None,
+    )
+
+    regions = build_protected_projector_regions(state, 5.0)
+
+    assert regions == (footprint.corners,), f'{regions=}'
+
+
+def test_protection_accepts_a_raw_metric_homography() -> None:
+    footprint = (
+        Point2D(10, 10),
+        Point2D(30, 10),
+        Point2D(30, 30),
+        Point2D(10, 30),
+    )
+
+    regions = build_protected_projector_regions(
+        {('cards', 4): footprint},
+        5.0,
+        ((1, 0, 0), (0, 1, 0), (0, 0, 1)),
+    )
+
+    assert regions == (
+        (
+            Point2D(5, 5),
+            Point2D(35, 5),
+            Point2D(35, 35),
+            Point2D(5, 35),
+        ),
+    ), f'{regions=}'
+
+
+def test_protection_margin_follows_a_skewed_metric_transform() -> None:
+    footprint = (
+        Point2D(100, 100),
+        Point2D(200, 100),
+        Point2D(200, 200),
+        Point2D(100, 200),
+    )
+    projector_to_surface = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.002, 0.001, 1.0),
+    )
+
+    regions = build_protected_projector_regions(
+        {('cards', 4): footprint},
+        10.0,
+        projector_to_surface,
+    )
+
+    assert len(regions) == 1, f'{regions=}'
+    region = regions[0]
+    assert region[0].x == pytest.approx(84.8791418675), f'{region=}'
+    assert region[1].x == pytest.approx(221.5823464071), f'{region=}'
+    assert region[0].y == pytest.approx(85.9606356778), f'{region=}'
+    assert region != footprint, f'{region=}'
+    assert region[0].x != pytest.approx(90.0), f'{region=}'
+    assert region[1].x != pytest.approx(210.0), f'{region=}'
+
+
+def test_overlay_intensity_is_bounded() -> None:
+    for intensity in (-0.01, 1.01, float('nan'), float('inf'), 10**1000):
+        with pytest.raises(ValueError):
+            OverlayStyle(intensity=intensity)
+
+
+def test_presentation_rejects_invalid_protection_regions_and_accepts_bounds() -> None:
+    materialisation = ProjectorMaterialisation(
+        segments=(
+            ProjectorSegment(
+                Point2D(0, 10),
+                Point2D(40, 10),
+                OverlayStyle(),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError):
+        materialise_presentation(materialisation, protected_regions=(((1, 1),),))
+
+    presented = materialise_presentation(
+        materialisation,
+        protected_regions=(CoordinateBounds(10, 0, 30, 20),),
+    )
+
+    assert len(presented.segments) == 2, f'{presented=}'
+    assert presented.segments[0].end == Point2D(10, 10), f'{presented=}'
+    assert presented.segments[1].start == Point2D(30, 10), f'{presented=}'
 
 
 def test_rectangle_and_floating_text_materialise_rotated_scaled_labels() -> None:
@@ -322,6 +474,12 @@ def test_anchor_resolution_fails_closed_for_missing_and_expired_markers() -> Non
     assert resolve_anchor(anchor, 'projector_px', retained_state).position == Point2D(5, 5)
     with pytest.raises(ValueError, match='unresolved'):
         resolve_anchor(anchor, 'projector_px', unresolved_state)
+    with pytest.raises(ValueError, match='unresolved'):
+        resolve_anchor(
+            FiducialAnchor(type='fiducial', group='wrong-group', id=7),
+            'projector_px',
+            retained_state,
+        )
 
 
 def test_anchor_resolution_rejects_malformed_marker_quadrilaterals() -> None:
@@ -375,6 +533,66 @@ def test_anchor_units_and_arrow_failure_cases_are_explicit() -> None:
             head_length={'value': float('nan'), 'unit': 'px'},
             head_width={'value': 4, 'unit': 'px'},
         )
+
+
+def test_physical_dynamic_arrow_uses_metric_authority_for_projector_materialisation() -> None:
+    projector_to_surface = (
+        (1.0, 0.1, 20.0),
+        (0.05, 0.9, 10.0),
+        (0.001, 0.0005, 1.0),
+    )
+    surface_to_projector = invert_homography(projector_to_surface)
+    metric_calibration = SimpleNamespace(
+        state='CALIBRATED',
+        projector_to_surface=projector_to_surface,
+        surface_to_projector=surface_to_projector,
+    )
+    projector_geometry = build_tag_geometry(
+        ((100, 100), (140, 100), (140, 140), (100, 140)),
+    )
+    surface_geometry = project_tag_geometry(
+        projector_geometry,
+        projector_to_surface,
+    )
+    target_projector = Point2D(280, 180)
+    target_surface = project_point(target_projector, projector_to_surface)
+    state = SimpleNamespace(
+        metric_calibration=metric_calibration,
+        selected_observations={
+            ('cards', 4): SimpleNamespace(
+                projector=projector_geometry,
+                surface=surface_geometry,
+            ),
+        },
+    )
+    request = ArrowRequest(
+        start={'type': 'fiducial', 'group': 'cards', 'id': 4},
+        end={'type': 'surface', 'x': target_surface.x, 'y': target_surface.y, 'unit': 'mm'},
+        geometry_space='surface_mm',
+        head_length={'value': 20, 'unit': 'mm'},
+        head_width={'value': 12, 'unit': 'mm'},
+    )
+
+    materialisation = materialise_arrow(
+        request,
+        Resolution(640, 480),
+        metric_calibration=metric_calibration,
+        spatial_state=state,
+    )
+
+    expected_start = project_point(surface_geometry.centre, surface_to_projector)
+    assert len(materialisation.segments) == 1, f'{materialisation=}'
+    assert materialisation.segments[0].start.x == pytest.approx(expected_start.x), (
+        f'{materialisation=}, {expected_start=}'
+    )
+    assert materialisation.segments[0].start.y == pytest.approx(expected_start.y), (
+        f'{materialisation=}, {expected_start=}'
+    )
+    assert materialisation.segments[0].end == target_projector, f'{materialisation=}'
+    assert len(materialisation.polygons) == 1, f'{materialisation=}'
+    assert materialisation.polygons[0].points[0] == target_projector, (
+        f'{materialisation=}'
+    )
 
 
 def test_arrow_materialisation_handles_arbitrary_direction_and_clipping() -> None:

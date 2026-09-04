@@ -9,6 +9,8 @@ def main() -> None:
         service,
         DisplayConfiguration(
             projector_resolution=service.configuration.projector_resolution,
+            preview_mode=service.configuration.preview_mode,
+            preview_low_rate_hz=service.configuration.preview_low_rate_hz,
         ),
         calibration_pattern=service.calibration_pattern,
     )

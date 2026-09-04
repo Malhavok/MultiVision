@@ -74,6 +74,19 @@ class SpatialTrackerTest(unittest.TestCase):
             f'{second_state=}'
         )
 
+    def test_same_camera_candidates_at_one_time_use_the_highest_frame_counter(self) -> None:
+        tracker = SpatialTracker(metric_calibration=_metric_calibration(), clock=FakeClock())
+        state = tracker.update(
+            (
+                _observation('cards', 1, 'camera-0', 3, 0.0, 30),
+                _observation('cards', 1, 'camera-0', 4, 0.0, 40),
+            ),
+        )
+
+        selected_observation = state.observations[('cards', 1)]
+        assert selected_observation.frame_counter == 4, f'{state=}'
+        assert selected_observation.surface.centre == Point2D(40, 100), f'{state=}'
+
     def test_unwarmed_and_warmed_ties_use_the_specified_order(self) -> None:
         clock = FakeClock(10)
         tracker = SpatialTracker(metric_calibration=_metric_calibration(), clock=clock)
@@ -94,6 +107,60 @@ class SpatialTrackerTest(unittest.TestCase):
         )
         assert second_state.observations[('cards', 1)].camera_slot == 'camera-1', f'{second_state=}'
         assert second_state.stability_scores[('cards', 1)] == 0.0, f'{second_state=}'
+
+    def test_candidate_ties_prefer_newer_received_time_before_slot(self) -> None:
+        clock = FakeClock()
+        tracker = SpatialTracker(metric_calibration=_metric_calibration(), clock=clock)
+
+        tracker.update(
+            (
+                _observation('cards', 9, 'camera-0', 1, 0.0, 10),
+                _observation('cards', 9, 'camera-1', 1, 0.0, 20),
+            ),
+        )
+        clock.seconds = 1.0
+        tracker.update(
+            (
+                _observation('cards', 9, 'camera-0', 2, 1.0, 10),
+                _observation('cards', 9, 'camera-1', 2, 1.0, 20),
+            ),
+        )
+
+        clock.seconds = 3.0
+        newer_camera_state = tracker.update(
+            (
+                _observation('cards', 9, 'camera-0', 3, 2.0, 10),
+                _observation('cards', 9, 'camera-1', 3, 3.0, 20),
+            ),
+        )
+        assert newer_camera_state.observations[('cards', 9)].camera_slot == 'camera-1', (
+            f'{newer_camera_state=}'
+        )
+
+        equal_time_state = tracker.update(
+            (
+                _observation('cards', 9, 'camera-0', 4, 3.0, 10),
+                _observation('cards', 9, 'camera-1', 4, 3.0, 20),
+            ),
+        )
+        assert equal_time_state.observations[('cards', 9)].camera_slot == 'camera-0', (
+            f'{equal_time_state=}'
+        )
+
+
+        unwarmed_tracker = SpatialTracker(
+            metric_calibration=_metric_calibration(),
+            clock=FakeClock(11.0),
+        )
+        unwarmed_state = unwarmed_tracker.update(
+            (
+                _observation('cards', 10, 'camera-0', 1, 10.0, 10),
+                _observation('cards', 10, 'camera-1', 2, 11.0, 20),
+            ),
+        )
+        assert unwarmed_state.observations[('cards', 10)].camera_slot == 'camera-1', (
+            f'{unwarmed_state=}'
+        )
 
     def test_grace_has_no_prediction_and_recovers_at_the_boundary(self) -> None:
         clock = FakeClock()

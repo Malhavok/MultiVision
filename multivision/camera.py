@@ -367,6 +367,23 @@ class CameraRuntime:
                 )
             return frame
 
+    def snapshot_latest_frames(self) -> dict[str, Frame]:
+        """Return retained frames without opening handles or touching capture devices."""
+        with self._lifecycle_lock:
+            with self._lock:
+                return {
+                    logical_name: frame
+                    for logical_name, frame in self._latest_frames.items()
+                    if self._statuses.get(logical_name) is not None
+                    and self._statuses[logical_name].runtime_status
+                    is RuntimeStatus.AVAILABLE
+                }
+
+    # These aliases keep the snapshot-only runtime seam discoverable to callers
+    # that describe the operation as a latest-frame or frame-map snapshot.
+    snapshot_frames = snapshot_latest_frames
+    get_latest_frames = snapshot_latest_frames
+
     def get_consecutive_frames(
         self,
         logical_name: str,

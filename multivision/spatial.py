@@ -19,6 +19,7 @@ from multivision.fiducials import (
 from multivision.geometry import (
     Point2D,
     TagGeometry,
+    build_protected_projector_regions,
     build_tag_geometry,
     invert_homography,
     project_tag_geometry,
@@ -316,6 +317,19 @@ class SpatialTracker:
             self._set_metric_calibration_locked(metric_calibration)
             return self._publish_locked()
 
+    def reset(self, metric_calibration: object | None = None) -> SpatialState:
+        """Discard all temporal evidence while retaining an optional authority."""
+        with self._lock:
+            self._histories.clear()
+            self._current_candidates.clear()
+            self._last_selected.clear()
+            self._camera_generations.clear()
+            self._detector_failures = ()
+            self._set_metric_calibration_locked(metric_calibration)
+            return self._publish_locked()
+
+    invalidate = reset
+
     def update_camera_generation(
         self,
         camera_slot: str,
@@ -539,15 +553,18 @@ class SpatialTracker:
             for identity, candidate in selected_candidates.items()
             if candidate.observation.projector is not None
         }
-        protection_regions = {
-            identity: _build_protection_region(
-                candidate.observation,
-                self._metric_calibration,
+        protection_regions: dict[FiducialIdentity, tuple[Point2D, ...]] = {}
+        for identity, candidate in selected_candidates.items():
+            projector_geometry = candidate.observation.projector
+            if projector_geometry is None:
+                continue
+            regions = build_protected_projector_regions(
+                {identity: projector_geometry.corners},
                 self._protection_margin_mm,
+                self._metric_calibration,
             )
-            for identity, candidate in selected_candidates.items()
-            if candidate.observation.projector is not None
-        }
+            if len(regions) > 0:
+                protection_regions[identity] = regions[0]
         if not force and _snapshot_contents_match(
             self._snapshot,
             self._metric_calibration,
@@ -966,111 +983,6 @@ def _get_metric_matrix(
         if projector_to_surface is not None:
             return invert_homography(validate_homography(projector_to_surface))
     return None
-
-
-def _build_protection_region(
-    observation: FiducialObservation,
-    metric_calibration: object | None,
-    protection_margin_mm: float,
-) -> tuple[Point2D, ...]:
-    assert observation.projector is not None
-    if protection_margin_mm <= 0 or observation.surface is None:
-        return observation.projector.corners
-    surface_corners = observation.surface.corners
-    expanded_surface_corners = _expand_convex_polygon(
-        surface_corners,
-        protection_margin_mm,
-    )
-    if expanded_surface_corners is None:
-        return observation.projector.corners
-    try:
-        matrix = _get_metric_matrix(metric_calibration, 'surface_to_projector')
-    except Exception:  # noqa: (A changing calibration authority must fail closed.)
-        return observation.projector.corners
-    if matrix is None:
-        return observation.projector.corners
-    try:
-        expanded_geometry = project_tag_geometry(
-            build_tag_geometry(expanded_surface_corners),
-            matrix,
-        )
-    except (TypeError, ValueError):
-        return observation.projector.corners
-    return expanded_geometry.corners
-
-
-def _expand_convex_polygon(
-    corners: Sequence[Point2D],
-    margin_mm: float,
-) -> tuple[Point2D, ...] | None:
-    if margin_mm <= 0:
-        return tuple(corners)
-    if len(corners) < 3:
-        return None
-
-    signed_area_twice = sum(
-        corners[idx].x * corners[(idx + 1) % len(corners)].y
-        - corners[(idx + 1) % len(corners)].x * corners[idx].y
-        for idx in range(len(corners))
-    )
-    if not math.isfinite(signed_area_twice) or signed_area_twice == 0:
-        return None
-    winding = 1.0 if signed_area_twice > 0 else -1.0
-    offset_edges: list[tuple[Point2D, Point2D]] = []
-    for idx, start in enumerate(corners):
-        end = corners[(idx + 1) % len(corners)]
-        edge_x = end.x - start.x
-        edge_y = end.y - start.y
-        edge_length = math.hypot(edge_x, edge_y)
-        if not math.isfinite(edge_length) or edge_length == 0:
-            return None
-        outward = Point2D(
-            winding * edge_y / edge_length,
-            -winding * edge_x / edge_length,
-        )
-        offset = Point2D(
-            outward.x * margin_mm,
-            outward.y * margin_mm,
-        )
-        offset_edges.append(
-            (
-                Point2D(start.x + offset.x, start.y + offset.y),
-                Point2D(end.x + offset.x, end.y + offset.y),
-            )
-        )
-
-    expanded_corners: list[Point2D] = []
-    for idx in range(len(corners)):
-        previous_start, previous_end = offset_edges[idx - 1]
-        current_start, current_end = offset_edges[idx]
-        previous_direction = Point2D(
-            previous_end.x - previous_start.x,
-            previous_end.y - previous_start.y,
-        )
-        current_direction = Point2D(
-            current_end.x - current_start.x,
-            current_end.y - current_start.y,
-        )
-        denominator = _cross_vectors(previous_direction, current_direction)
-        if not math.isfinite(denominator) or abs(denominator) <= 1e-12:
-            return None
-        start_delta = Point2D(
-            current_start.x - previous_start.x,
-            current_start.y - previous_start.y,
-        )
-        intersection_factor = _cross_vectors(start_delta, current_direction) / denominator
-        intersection = Point2D(
-            previous_start.x + intersection_factor * previous_direction.x,
-            previous_start.y + intersection_factor * previous_direction.y,
-        )
-        if not _is_finite_point(intersection):
-            return None
-        expanded_corners.append(intersection)
-    return tuple(expanded_corners)
-
-
-def _cross_vectors(first: Point2D, second: Point2D) -> float:
-    return first.x * second.y - first.y * second.x
 
 
 def _observation_age_seconds(
