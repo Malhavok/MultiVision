@@ -266,7 +266,7 @@ class MetricApplicationTest(unittest.TestCase):
         with patch('multivision.application.calibrate_metric_homography', fake_estimator):
             record = service.calibrate_metric('camera-0', frames)
 
-        assert observed[0].correspondences[0].camera_position.x == 0.5 + 8.0
+        assert observed[0].correspondences[0].camera_position.x == 0.5 + 5.0
         assert record is service.metric_calibration
         assert record.state is MetricCalibrationStatus.CALIBRATED
         assert record.observation_camera_slot == 'camera-0'

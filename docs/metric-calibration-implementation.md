@@ -41,9 +41,10 @@ state is not persisted or trusted across process restarts.
 ## Target and validation boundary
 
 The printable calibration target is deterministic A4 portrait at exactly
-210 × 297 mm. It carries its format/version and supported marker-family
-metadata, known surface-mm marker corners, an orientation cue and a labelled
-exactly-100-mm reference segment. The generated artifact must instruct the
+210 × 297 mm. The current v2 layout uses 20 `DICT_APRILTAG_36h11` markers,
+40 mm each, in a 4 × 5 grid. It carries its format/version and
+supported marker-family metadata, known surface-mm marker corners, an
+orientation cue and a labelled exactly-100-mm reference segment. The generated artifact must instruct the
 operator to print at 100% / Actual size and warn against scaling; a generated
 file or synthetic test is not evidence of physical printer accuracy.
 

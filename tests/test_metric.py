@@ -420,7 +420,7 @@ class MetricTest(unittest.TestCase):
         assert result.correspondence_corner_count == 80, f'{result=}'
         assert result.unique_target_count == 20, f'{result=}'
         assert result.ransac_inlier_count == 80, f'{result=}'
-        expected_coverage = (202.0 - 8.0) * (285.0 - 40.0) / (210.0 * 297.0)
+        expected_coverage = (205.0 - 5.0) * (289.0 - 34.0) / (210.0 * 297.0)
         assert math.isclose(
             result.target_page_spatial_coverage,
             expected_coverage,
@@ -488,7 +488,7 @@ class MetricTest(unittest.TestCase):
         )
 
         assert observed_thresholds == [0.25], f'{observed_thresholds=}'
-        assert result.ransac_inlier_count == 79, f'{result=}'
+        assert result.ransac_inlier_count == 78, f'{result=}'
         assert result.inlier_ratio < 1.0, f'{result=}'
         assert result.max_fit_error_mm < 1.0, f'{result=}'
 
@@ -534,7 +534,9 @@ class MetricTest(unittest.TestCase):
                 Resolution(400, 400),
             )
 
-        malformed_target = METRIC_TARGET._replace(format_version=2)
+        malformed_target = METRIC_TARGET._replace(
+            format_version=METRIC_TARGET.format_version + 1,
+        )
         with self.assertRaises(CalibrationError):
             calibrate_metric_homography(
                 _build_metric_correspondences(identity, identity),
@@ -565,7 +567,7 @@ class MetricTest(unittest.TestCase):
         averaged = _average_metric_correspondences(frames, 1.1, 0.8, 'camera-0')
 
         assert averaged.camera_id == 'camera-0', f'{averaged=}'
-        assert averaged.correspondences[0].camera_position == Point2D(8.5, 40.0), (
+        assert averaged.correspondences[0].camera_position == Point2D(5.5, 34.0), (
             f'{averaged.correspondences[0]=}'
         )
         moving_frames = tuple(

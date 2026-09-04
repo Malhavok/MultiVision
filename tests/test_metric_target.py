@@ -62,18 +62,18 @@ class MetricTargetTest(unittest.TestCase):
 
     def test_layout_matches_declared_a4_geometry(self) -> None:
         target = METRIC_TARGET
-        x_step_mm = (180.0 - 8.0) / 3
-        y_step_mm = (263.0 - 40.0) / 4
+        x_step_mm = (165.0 - 5.0) / 3
+        y_step_mm = (249.0 - 34.0) / 4
 
         for marker_id, marker in enumerate(target.markers):
             y_idx, x_idx = divmod(marker_id, 4)
-            x_start_mm = 8.0 + x_idx * x_step_mm
-            y_start_mm = 40.0 + y_idx * y_step_mm
+            x_start_mm = 5.0 + x_idx * x_step_mm
+            y_start_mm = 34.0 + y_idx * y_step_mm
             expected_corners = (
                 Point2D(x_start_mm, y_start_mm),
-                Point2D(x_start_mm + 22.0, y_start_mm),
-                Point2D(x_start_mm + 22.0, y_start_mm + 22.0),
-                Point2D(x_start_mm, y_start_mm + 22.0),
+                Point2D(x_start_mm + 40.0, y_start_mm),
+                Point2D(x_start_mm + 40.0, y_start_mm + 40.0),
+                Point2D(x_start_mm, y_start_mm + 40.0),
             )
             assert marker.corners == expected_corners, f'{marker=}, {expected_corners=}'
             assert all(target.page_bounds.contains(point) for point in marker.corners), (
@@ -191,7 +191,9 @@ class MetricTargetTest(unittest.TestCase):
         )
 
     def test_validation_rejects_a_different_target_definition(self) -> None:
-        invalid_target = METRIC_TARGET._replace(format_version=2)
+        invalid_target = METRIC_TARGET._replace(
+            format_version=METRIC_TARGET_FORMAT_VERSION + 1,
+        )
 
         with self.assertRaises(ValueError):
             validate_metric_target(invalid_target)
@@ -218,10 +220,10 @@ class MetricTargetTest(unittest.TestCase):
         marker_images = root.findall('.//svg:image', namespaces)
         assert len(marker_images) == METRIC_TARGET_MARKER_COUNT, f'{marker_images=}'
         for marker, image in zip(METRIC_TARGET.markers, marker_images):
-            assert image.attrib['width'] == '22', f'{image.attrib=}'
-            assert image.attrib['height'] == '22', f'{image.attrib=}'
-            assert image.attrib['data-display-width-mm'] == '22', f'{image.attrib=}'
-            assert image.attrib['data-display-height-mm'] == '22', f'{image.attrib=}'
+            assert image.attrib['width'] == '40', f'{image.attrib=}'
+            assert image.attrib['height'] == '40', f'{image.attrib=}'
+            assert image.attrib['data-display-width-mm'] == '40', f'{image.attrib=}'
+            assert image.attrib['data-display-height-mm'] == '40', f'{image.attrib=}'
             assert float(image.attrib['x']) == marker.corners[0].x, f'{image.attrib=}'
             assert float(image.attrib['y']) == marker.corners[0].y, f'{image.attrib=}'
             encoded_image = image.attrib['href'].split(',', maxsplit=1)[1]
@@ -295,7 +297,9 @@ class MetricTargetTest(unittest.TestCase):
             )
 
     def test_svg_rejects_a_different_target_definition(self) -> None:
-        invalid_target = METRIC_TARGET._replace(format_version=2)
+        invalid_target = METRIC_TARGET._replace(
+            format_version=METRIC_TARGET_FORMAT_VERSION + 1,
+        )
 
         with self.assertRaises(ValueError):
             generate_metric_target_svg(invalid_target)
