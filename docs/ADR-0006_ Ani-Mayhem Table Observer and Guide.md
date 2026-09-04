@@ -195,6 +195,105 @@ The observer-to-Pyra transport is not part of MultiVision itself. MultiVision re
 
 Guide likewise remains an Ani-Mayhem-side adapter over MultiVision rather than a game-specific feature inside MultiVision.
 
+## Intended interaction flows
+
+These flows are not a complete Ani-Mayhem usage guide. They define the intended UX well enough to validate that Observer and Guide expose the right primitives.
+
+### Legal cards from hand
+
+Goal: show the player which cards are currently legal to play without recreating a projected hand UI.
+
+1. Pyra / Ani-Mayhem logic determines the subset of currently visible hand cards that are legal in the current phase.
+2. Guide highlights only those cards and updates the top bar with a short instruction such as `Choose a playable card`.
+3. The player physically moves one of the highlighted cards.
+4. Observer reports the card's movement / disappearance / reappearance at its new table position.
+5. Pyra interprets that physical change as the attempted play and either continues the flow or uses Guide to explain why additional placement is required.
+6. The cursor is only needed when the physical move itself does not uniquely identify the player's intent.
+
+Expected primitives:
+
+```text
+highlight(playable_hand_cards)
+top_bar("ACTION · Choose a playable card")
+```
+
+### Guided card movement
+
+Goal: show where a physical card should be moved without requiring permanent projected slots.
+
+1. Pyra decides that card A should be moved to target B or to a coarse destination area.
+2. Guide highlights card A and the destination.
+3. Guide draws an arrow from the current card position toward the destination.
+4. The player moves the card physically.
+5. Observer reports the card's new retained position once the movement exceeds the deadband.
+6. Pyra verifies the result from the observed state and clears the temporary guidance.
+
+Expected primitives:
+
+```text
+highlight(card_A)
+highlight(destination)
+arrow(card_A, destination)
+top_bar("Move this card here")
+```
+
+The destination does not need to be a permanently modelled slot. It may be another observed object, a coarse region, or a temporary projected target created for this interaction.
+
+### Combat target and card assignment
+
+Goal: make combat state visually legible while keeping all game pieces physical.
+
+1. Pyra determines which character is currently being attacked.
+2. Guide highlights that character distinctly and shows a combat instruction in the top bar.
+3. When combat cards must be associated with characters, Guide uses arrows and/or labels to show each intended association.
+4. The player places or moves the combat cards physically.
+5. Observer reports those movements and the resulting positions.
+6. Pyra uses the observed state to determine whether assignment is complete and proceeds to the next combat step.
+
+Expected primitives:
+
+```text
+highlight(target_character, style="target")
+arrow(combat_card_1, character_A)
+arrow(combat_card_2, character_B)
+label(combat_card_1, "A")
+label(combat_card_2, "B")
+top_bar("COMBAT · Assign combat cards")
+```
+
+The exact visual style is a Guide implementation detail; the semantic meaning is not.
+
+### Damage calculation focus
+
+Goal: make it obvious which physical cards currently contribute to a combat calculation.
+
+1. Pyra identifies the character, combat card(s), equipment, powers, or other cards participating in the current calculation.
+2. Guide visually suppresses unrelated objects and emphasizes the participating set.
+3. Optional labels may explain roles such as `attacker`, `defender`, `weapon`, or `modifier`.
+4. Pyra performs / explains the calculation while the relevant physical components remain visually grouped by projection.
+5. Guide restores the normal table view after the calculation is resolved.
+
+Expected primitives:
+
+```text
+dim_except(participating_objects)
+highlight(participating_objects)
+label(modifier_card, "+2")
+top_bar("COMBAT · Damage calculation")
+```
+
+### Interaction principle
+
+Across these flows, the preferred sequence is:
+
+```text
+observe -> reason -> guide -> physical action -> observe
+```
+
+Physical state is authoritative. Projection communicates intent and context; it does not replace the physical game state.
+
+If an action can be inferred unambiguously from the observed physical change, no explicit cursor confirmation is required.
+
 ## Testing
 
 No synthetic camera / fake-table renderer is required by this ADR.
