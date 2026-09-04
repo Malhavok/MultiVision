@@ -84,6 +84,27 @@ class CliTest(unittest.TestCase):
             ('DELETE', 'http://service.test/overlay', None),
         ]
 
+    def test_full_calibration_is_one_http_command(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload, timeout_seconds))
+            return ServiceResponse(200, 'application/json', b'{"ok": true}')
+
+        client = MultiVisionClient('http://service.test', request_sender=request_sender)
+
+        assert main(['full-calibration'], client) == 0
+        assert requests[0][:3] == (
+            'POST',
+            'http://service.test/calibration/full',
+            None,
+        )
+
     def test_tag_list_delegates_to_http_and_url_encodes_request_values(self) -> None:
         requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
 

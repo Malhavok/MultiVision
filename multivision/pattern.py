@@ -19,11 +19,12 @@ from multivision.types import (
 
 
 APRILTAG_36H11 = 'DICT_APRILTAG_36h11'
+PROJECTOR_CALIBRATION_MARKER_FAMILY = 'DICT_APRILTAG_36h10'
 APRILTAG_FAMILIES = frozenset(
     {
         'DICT_APRILTAG_16h5',
         'DICT_APRILTAG_25h9',
-        'DICT_APRILTAG_36h10',
+        PROJECTOR_CALIBRATION_MARKER_FAMILY,
         APRILTAG_36H11,
     },
 )
@@ -364,6 +365,7 @@ def _coerce_finite_float(value: object, field_name: str) -> float:
 
 __all__ = [
     'APRILTAG_36H11',
+    'PROJECTOR_CALIBRATION_MARKER_FAMILY',
     'APRILTAG_FAMILIES',
     'DEFAULT_TAG_DICTIONARY',
     'DICT_5X5_1000',

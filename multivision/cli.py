@@ -276,6 +276,11 @@ def _build_parser() -> argparse.ArgumentParser:
     calibrate_parser = subparsers.add_parser('calibrate', help='calibrate one or all cameras')
     calibrate_parser.add_argument('--camera', dest='camera', default=None)
     calibrate_parser.set_defaults(command_handler='calibrate')
+    full_calibration_parser = subparsers.add_parser(
+        'full-calibration',
+        help='calibrate and verify all available cameras in one pattern run',
+    )
+    full_calibration_parser.set_defaults(command_handler='full_calibration')
 
     calibration_parser = subparsers.add_parser('calibration', help='inspect calibration')
     calibration_subparsers = calibration_parser.add_subparsers(
@@ -610,6 +615,7 @@ def _run_command(
         'cameras_area': _cameras_area,
         'tags_list': _tags_list,
         'calibrate': _calibrate,
+        'full_calibration': _full_calibration,
         'calibration_verify': _calibration_verify,
         'calibration_status': _calibration_status,
         'calibration_pattern_show': _calibration_pattern_show,
@@ -704,6 +710,13 @@ def _tags_list(
 def _calibrate(client: MultiVisionClient, arguments: argparse.Namespace) -> ServiceResponse:
     payload = None if arguments.camera is None else {'camera': arguments.camera}
     return client.post('/calibration', payload)
+
+
+def _full_calibration(
+    client: MultiVisionClient,
+    _arguments: argparse.Namespace,
+) -> ServiceResponse:
+    return client.post('/calibration/full')
 
 
 def _calibration_verify(

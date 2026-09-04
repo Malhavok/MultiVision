@@ -1,6 +1,6 @@
 # ADR-0005: Full Camera Calibration Workflow
 
-**Status:** Proposed
+**Status:** Accepted
 **System:** MultiVision
 **Scope:** One-shot camera/projector calibration for mixed wide and zoom cameras
 **Decision type:** Calibration workflow / quality gates
@@ -107,14 +107,24 @@ per-camera verification, explicit global/local calibration statuses and a
 transparent partial-result report. It must not copy a master homography into
 other cameras or widen a one-tag camera's valid region by assumption.
 
-## 6. Open implementation details
+## 6. Settled implementation details
 
-The implementation plan must settle:
-
-- the exact tag-count, coverage and stability thresholds for each acceptance
-  level;
-- the representation of global versus local valid regions;
-- whether a local one-tag result is enabled by default or requires an explicit
-  option;
-- the concrete command/API name and response schema; and
-- the candidate dense-pattern layouts to test on the target hardware.
+- The master gate requires `ceil(0.8 * pattern_tag_count)` complete tags — 16
+  tags for the default 20-tag pattern — plus the configured capture-noise,
+  coverage, inlier and reprojection thresholds.
+- The existing convex-hull `valid_region` is retained. A global result uses the
+  normal configured thresholds; a local result uses the observed tag-cluster
+  hull, so it cannot silently claim whole-table coverage.
+- Local fallback is enabled by default in `full-calibration`. One complete tag
+  is labelled `local_low_confidence`; two or more tags that do not meet the
+  global gate are labelled `local`.
+- The service endpoint is `POST /calibration/full`; the CLI command is
+  `multivision full-calibration`. It returns the selected master, the master
+  gate result, and an independent status, scope, record, and error for every
+  camera.
+- Projector calibration uses `DICT_APRILTAG_36h10`; the printed metric target
+  continues to use `DICT_APRILTAG_36h11`. This prevents a metric sheet from
+  being mistaken for the projected pattern.
+- Dense-pattern layout changes remain a hardware experiment. No layout change
+  is accepted without measuring pixels per tag, complete-corner detection,
+  temporal stability and useful coverage on the installed cameras.

@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import (
     Callable,
@@ -16,7 +17,11 @@ from typing import (
 )
 
 from multivision.benchmarking import BenchmarkMetrics, measure_timing
-from multivision.calibration import CalibrationMetrics, calibrate_homography
+from multivision.calibration import (
+    CalibrationMetrics,
+    CalibrationResult,
+    calibrate_homography,
+)
 from multivision.camera import CameraRuntime
 from multivision.config import (
     CalibrationThresholds,
@@ -115,6 +120,7 @@ from multivision.spatial import (
 )
 from multivision.pattern import (
     CalibrationPattern,
+    PROJECTOR_CALIBRATION_MARKER_FAMILY,
     build_calibration_pattern,
     validate_tag_dictionary,
 )
@@ -126,6 +132,7 @@ from multivision.persistence import (
 from multivision.service import PointOverlayService, RedCircleOverlay
 from multivision.session import SessionCamera
 from multivision.types import (
+    CalibrationScope,
     CalibrationStage,
     CalibrationStatus,
     CameraStatus,
@@ -167,6 +174,51 @@ class CameraArea(NamedTuple):
     area_enabled: bool
     available_area: Polygon | None
     area_colour: tuple[int, int, int]
+
+
+class FullCalibrationCameraResult(NamedTuple):
+    """The independently verified outcome for one camera in a full run."""
+
+    camera: str
+    status: CalibrationStatus
+    calibration_scope: CalibrationScope | None
+    calibration: PersistedCalibration | None
+    error: str | None = None
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            'camera': self.camera,
+            'status': self.status.value,
+            'calibration_scope': (
+                None
+                if self.calibration_scope is None
+                else self.calibration_scope.value
+            ),
+            'calibration': (
+                None
+                if self.calibration is None
+                else self.calibration.to_data()
+            ),
+            'error': self.error,
+        }
+
+
+class FullCalibrationResult(NamedTuple):
+    """One-shot calibration report, including the session master quality gate."""
+
+    master_camera: str | None
+    master_gate_passed: bool
+    cameras: Mapping[str, FullCalibrationCameraResult]
+
+    def to_data(self) -> dict[str, object]:
+        return {
+            'master_camera': self.master_camera,
+            'master_gate_passed': self.master_gate_passed,
+            'cameras': {
+                camera: result.to_data()
+                for camera, result in self.cameras.items()
+            },
+        }
 
 
 class ProjectionStatus(NamedTuple):
@@ -246,6 +298,13 @@ class RenderSnapshot(NamedTuple):
     @property
     def intensity(self) -> float:
         return self.global_overlay_intensity
+
+
+class _CalibrationCapture(NamedTuple):
+    """A stable correspondence burst and its measured capture noise."""
+
+    correspondences: CameraCorrespondences
+    noise: _CameraCaptureNoise | None
 
 
 class _TrackingCycle(NamedTuple):
@@ -427,11 +486,13 @@ class MultiVisionService:
         )
         self._lifecycle_lock = threading.RLock()
         self._camera_management_lock = threading.RLock()
+        self._detector_lock = threading.RLock()
         self._calibration_capture_count = 0
         self._calibration_capture_lock = threading.RLock()
         self._last_camera_capture_noise: _CameraCaptureNoise | None = None
         self._calibration_pattern_presented = threading.Event()
         self._calibration_pattern_hold = False
+        self._calibration_master_camera: str | None = None
         self._metric_capture_count = 0
         self._metric_capture_lock = threading.RLock()
         # Camera-pattern and metric-blank handshakes must never overlap.
@@ -1706,6 +1767,8 @@ class MultiVisionService:
                 raise SessionCameraError(
                     'Camera runtime returned an invalid closed session camera',
                 )
+            if self._calibration_master_camera == camera.slot_id:
+                self._calibration_master_camera = None
             return camera
 
     def open_camera(self, slot_id: str) -> SessionCamera:
@@ -1727,6 +1790,18 @@ class MultiVisionService:
         output_identity: str = 'default',
     ) -> ProjectorOutputDescriptor:
         """Change the active output and invalidate all dependent geometry."""
+        with self._spatial_capture_operation_lock:
+            return self._update_projector_descriptor_locked(
+                projector_output_descriptor,
+                output_identity,
+            )
+
+    def _update_projector_descriptor_locked(
+        self,
+        projector_output_descriptor: ProjectorOutputDescriptor | Resolution,
+        output_identity: str = 'default',
+    ) -> ProjectorOutputDescriptor:
+        """Apply an output change while spatial capture is excluded."""
         if isinstance(projector_output_descriptor, Resolution):
             checked_descriptor = ProjectorOutputDescriptor(
                 projector_output_descriptor,
@@ -1764,6 +1839,7 @@ class MultiVisionService:
             self.point_service.clear_overlay()
             self._projector_output_descriptor = checked_descriptor
             self.calibration_pattern = updated_calibration_pattern
+            self._calibration_master_camera = None
             self.configuration = replace(
                 self.configuration,
                 projector_resolution=checked_descriptor.projector_resolution,
@@ -2009,6 +2085,10 @@ class MultiVisionService:
                 continue
             calibration = camera.calibration
             if calibration is None:
+                continue
+            if isinstance(calibration, PersistedCalibration) and (
+                calibration.calibration_scope != CalibrationScope.GLOBAL.value
+            ):
                 continue
             if isinstance(calibration, PersistedCalibration) and (
                 calibration.camera_id != camera.slot_id
@@ -2323,6 +2403,266 @@ class MultiVisionService:
             for status in statuses
         }
 
+    def full_calibrate(self) -> FullCalibrationResult:
+        """Calibrate and freshly verify every available camera in one run."""
+        with self._spatial_capture_operation_lock:
+            statuses = self._get_available_statuses()
+            if len(statuses) == 0:
+                raise CameraUnavailableError('No configured camera is available for calibration')
+            workflow_pattern = self.calibration_pattern
+            workflow_descriptor = self._projector_output_descriptor
+            workflow_version = self.configuration.calibration_version
+            for status in statuses:
+                self._clear_area_before_calibration(status.logical_name)
+
+            with self._calibration_capture_lock:
+                self._calibration_pattern_presented.clear()
+                self._calibration_capture_count += 1
+            try:
+                if not self._calibration_pattern_presented.wait(
+                    CALIBRATION_PATTERN_WAIT_TIMEOUT_SECONDS,
+                ):
+                    raise CalibrationError(
+                        'The calibration pattern was not presented by the main-thread display',
+                    )
+                time.sleep(CALIBRATION_PATTERN_SETTLE_SECONDS)
+                captures = self._capture_calibration_bursts(statuses, allow_local=True)
+                if (
+                    self.calibration_pattern != workflow_pattern
+                    or self._projector_output_descriptor != workflow_descriptor
+                    or self.configuration.calibration_version != workflow_version
+                ):
+                    raise CalibrationError(
+                        'Projector calibration authority changed during capture',
+                    )
+                candidates: dict[str, tuple[CameraStatus, int, PersistedCalibration, CalibrationScope, _CalibrationCapture]] = {}
+                reports: dict[str, FullCalibrationCameraResult] = {}
+                for status in statuses:
+                    capture = captures.get(status.logical_name)
+                    if not isinstance(capture, _CalibrationCapture):
+                        reports[status.logical_name] = FullCalibrationCameraResult(
+                            status.logical_name,
+                            CalibrationStatus.UNCALIBRATED,
+                            None,
+                            None,
+                            captures.get(status.logical_name, 'No calibration burst was captured'),
+                        )
+                        continue
+                    try:
+                        result = calibrate_homography(
+                            capture.correspondences,
+                            self.calibration_pattern,
+                            self.configuration.calibration_thresholds,
+                            camera_resolution=status.native_resolution,
+                        )
+                        scope = CalibrationScope.GLOBAL
+                    except CalibrationError as global_error:
+                        local_thresholds = replace(
+                            self.configuration.calibration_thresholds,
+                            min_unique_tags=1,
+                            min_spatial_coverage=0.0,
+                        )
+                        try:
+                            result = calibrate_homography(
+                                capture.correspondences,
+                                self.calibration_pattern,
+                                local_thresholds,
+                                camera_resolution=status.native_resolution,
+                            )
+                        except CalibrationError as local_error:
+                            reports[status.logical_name] = FullCalibrationCameraResult(
+                                status.logical_name,
+                                CalibrationStatus.UNCALIBRATED,
+                                None,
+                                None,
+                                f'{global_error}; local fallback failed: {local_error}',
+                            )
+                            continue
+                        scope = (
+                            CalibrationScope.LOCAL_LOW_CONFIDENCE
+                            if result.metrics.unique_tag_count == 1
+                            else CalibrationScope.LOCAL
+                        )
+                    result = _attach_camera_capture_noise(result, capture.noise)
+                    session_camera = self._get_session_camera(status.logical_name)
+                    if session_camera is None or status.native_resolution is None:
+                        reports[status.logical_name] = FullCalibrationCameraResult(
+                            status.logical_name,
+                            CalibrationStatus.UNCALIBRATED,
+                            scope,
+                            None,
+                            'Camera metadata changed during calibration',
+                        )
+                        continue
+                    record = PersistedCalibration.from_result(
+                        result,
+                        status.native_resolution,
+                        self._projector_output_descriptor.projector_resolution,
+                        version=self.configuration.calibration_version,
+                        projector_output_descriptor=self._projector_output_descriptor,
+                        camera_id=session_camera.slot_id,
+                        calibration_scope=scope.value,
+                    )
+                    candidates[status.logical_name] = (
+                        status,
+                        session_camera.lifecycle_generation,
+                        record,
+                        scope,
+                        capture,
+                    )
+                    reports[status.logical_name] = FullCalibrationCameraResult(
+                        status.logical_name,
+                        CalibrationStatus.UNVERIFIED,
+                        scope,
+                        record,
+                    )
+
+                verification_statuses = tuple(
+                    status
+                    for status in statuses
+                    if status.logical_name in candidates
+                )
+                expected = {
+                    status.logical_name: candidates[status.logical_name][2]
+                    for status in verification_statuses
+                }
+                verification_captures = self._capture_calibration_bursts(
+                    verification_statuses,
+                    expected_calibrations=expected,
+                    allow_local=True,
+                )
+                accepted: dict[str, FullCalibrationCameraResult] = {}
+                for logical_name in expected:
+                    status, lifecycle_generation, record, scope, _capture = candidates[
+                        logical_name
+                    ]
+                    verification_capture = verification_captures.get(logical_name)
+                    if not isinstance(verification_capture, _CalibrationCapture):
+                        reports[logical_name] = FullCalibrationCameraResult(
+                            logical_name,
+                            CalibrationStatus.STALE,
+                            scope,
+                            record,
+                            str(verification_capture),
+                        )
+                        continue
+                    verification_thresholds = self.configuration.calibration_thresholds
+                    if scope is not CalibrationScope.GLOBAL:
+                        verification_thresholds = replace(
+                            verification_thresholds,
+                            min_unique_tags=1,
+                            min_spatial_coverage=0.0,
+                        )
+                    verification_registry = CalibrationRegistry(
+                        {record.camera_id: record},
+                        calibration_version=self.configuration.calibration_version,
+                        projector_resolution=self._projector_output_descriptor.projector_resolution,
+                        projector_output_descriptor=self._projector_output_descriptor,
+                    )
+                    verified_status = verification_registry.verify(
+                        record.camera_id,
+                        verification_capture.correspondences,
+                        camera_resolution=status.native_resolution,
+                        projector_resolution=self._projector_output_descriptor.projector_resolution,
+                        thresholds=_derive_verification_thresholds(
+                            record,
+                            verification_thresholds,
+                            verification_capture.noise,
+                        ),
+                        pattern=self.calibration_pattern,
+                        projector_output_descriptor=self._projector_output_descriptor,
+                    )
+                    if verified_status is not CalibrationStatus.CALIBRATED:
+                        reports[logical_name] = FullCalibrationCameraResult(
+                            logical_name,
+                            CalibrationStatus.STALE,
+                            scope,
+                            record,
+                            'Fresh calibration verification did not pass',
+                        )
+                        continue
+                    try:
+                        with self._camera_management_lock:
+                            current_camera = self._get_session_camera(logical_name)
+                            if (
+                                current_camera is None
+                                or current_camera.lifecycle_generation != lifecycle_generation
+                            ):
+                                raise CalibrationError(
+                                    'Camera changed during calibration verification',
+                                )
+                            if (
+                                self.calibration_pattern != workflow_pattern
+                                or self._projector_output_descriptor != workflow_descriptor
+                                or self.configuration.calibration_version != workflow_version
+                            ):
+                                raise CalibrationError(
+                                    'Projector calibration authority changed during publication',
+                                )
+                            self.calibration_store.save(record)
+                            self._set_session_calibration(
+                                current_camera.slot_id,
+                                CalibrationStatus.CALIBRATED,
+                                record,
+                            )
+                    except Exception as ex:  # noqa: BLE001 (report one-camera publication failures).
+                        reports[logical_name] = FullCalibrationCameraResult(
+                            logical_name,
+                            CalibrationStatus.STALE,
+                            scope,
+                            record,
+                            str(ex),
+                        )
+                        continue
+                    accepted[logical_name] = FullCalibrationCameraResult(
+                        logical_name,
+                        CalibrationStatus.CALIBRATED,
+                        scope,
+                        record,
+                    )
+                    reports[logical_name] = accepted[logical_name]
+
+                master_camera = None
+                if accepted:
+                    master_camera = max(
+                        accepted,
+                        key=lambda camera: _full_calibration_quality_score(
+                            accepted[camera].calibration,
+                        ),
+                    )
+                master_gate_passed = (
+                    master_camera is not None
+                    and _passes_full_calibration_master_gate(
+                        accepted[master_camera].calibration,
+                        workflow_pattern,
+                        self.configuration.calibration_thresholds,
+                    )
+                )
+                with self._camera_management_lock:
+                    if master_camera is not None:
+                        current_master = self._get_session_camera(master_camera)
+                        try:
+                            master_status = self.camera_runtime.get_status(master_camera)
+                        except CameraUnavailableError:
+                            master_status = None
+                        if (
+                            current_master is None
+                            or current_master.state is not SessionCameraState.OPEN
+                            or not isinstance(master_status, CameraStatus)
+                            or master_status.runtime_status is not RuntimeStatus.AVAILABLE
+                            or current_master.calibration_status is not CalibrationStatus.CALIBRATED
+                        ):
+                            master_camera = None
+                    if master_camera is None:
+                        master_gate_passed = False
+                    self._calibration_master_camera = master_camera
+                return FullCalibrationResult(master_camera, master_gate_passed, reports)
+            finally:
+                with self._calibration_capture_lock:
+                    self._calibration_capture_count -= 1
+                    if self._calibration_capture_count == 0:
+                        self._calibration_pattern_presented.clear()
+
     def verify(
         self,
         logical_name: str | None = None,
@@ -2360,6 +2700,29 @@ class MultiVisionService:
     ) -> RedCircleOverlay:
         with self._camera_management_lock:
             return self.point_service.point_from_camera(logical_name, camera_point)
+
+    @property
+    def calibration_master_camera(self) -> str | None:
+        """Return the latest usable full-calibration master for this session."""
+        with self._camera_management_lock:
+            master_camera = self._calibration_master_camera
+            if master_camera is None:
+                return None
+            camera = self._get_session_camera(master_camera)
+            try:
+                status = self.camera_runtime.get_status(master_camera)
+            except CameraUnavailableError:
+                status = None
+            if (
+                camera is None
+                or camera.state is not SessionCameraState.OPEN
+                or not isinstance(status, CameraStatus)
+                or status.runtime_status is not RuntimeStatus.AVAILABLE
+                or camera.calibration_status is not CalibrationStatus.CALIBRATED
+            ):
+                self._calibration_master_camera = None
+                return None
+            return master_camera
 
     def get_calibration_metrics(self, logical_name: str) -> CalibrationMetrics | None:
         status = self.get_camera_status(logical_name)
@@ -2485,16 +2848,22 @@ class MultiVisionService:
             raise InvalidAvailableAreaError(
                 f'Camera {camera.slot_id!r} has no usable calibrated area',
             )
-        # Keep this footprint identical to the native-frame region accepted by
-        # pointing; the calibration's tag-supported hull remains quality metadata.
+        # Global captures support the native frame; local captures must stay inside
+        # the observed tag hull instead of silently extrapolating.
         camera_frame = CoordinateBounds(
             0.0,
             0.0,
             float(native_resolution.width),
             float(native_resolution.height),
         )
+        calibrated_region = (
+            calibration.valid_region
+            if isinstance(calibration, PersistedCalibration)
+            and calibration.calibration_scope != CalibrationScope.GLOBAL.value
+            else camera_frame
+        )
         available_area = calculate_available_projector_area(
-            camera_frame,
+            calibrated_region,
             native_resolution,
             camera_to_projector,
             self._projector_output_descriptor.projector_resolution,
@@ -2711,80 +3080,144 @@ class MultiVisionService:
                 )
             # Allow the projector and camera exposure pipeline to settle after presentation.
             time.sleep(CALIBRATION_PATTERN_SETTLE_SECONDS)
-            get_consecutive_frames = getattr(
-                self.camera_runtime,
-                'get_consecutive_frames',
-                None,
+            capture = self._capture_camera_correspondences(
+                status,
+                expected_calibration=expected_calibration,
             )
-            if callable(get_consecutive_frames) and (
-                CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS > 0
-            ):
-                captured_frames = get_consecutive_frames(
-                    status.logical_name,
-                    CALIBRATION_CAPTURE_CANDIDATE_FRAME_COUNT,
-                    CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS,
-                )
-                if not isinstance(captured_frames, Sequence) or len(captured_frames) < 3:
-                    raise CalibrationError(
-                        'Camera runtime returned invalid consecutive calibration frames',
-                    )
-                if any(not isinstance(frame, Frame) for frame in captured_frames):
-                    raise CalibrationError(
-                        'Camera runtime returned invalid consecutive calibration frames',
-                    )
-                stable_frames = _select_stable_frame_window(
-                    captured_frames,
-                    self.configuration.calibration_thresholds
-                    .max_capture_white_balance_delta,
-                    window_size=CALIBRATION_CAPTURE_CANDIDATE_FRAME_COUNT,
-                )
-                detected_frames = tuple(
-                    self._get_correspondences_from_frame(status, frame)
-                    for frame in stable_frames
-                )
-                selected_frames = _select_camera_frame_window(
-                    detected_frames,
-                    self.calibration_pattern,
-                    self.configuration.calibration_thresholds,
-                    status.native_resolution,
-                    expected_calibration,
-                )
-                aggregated, noise = _aggregate_camera_correspondences(selected_frames)
-                _validate_camera_capture_noise(
-                    noise,
-                    self.configuration.calibration_thresholds,
-                )
-                self._last_camera_capture_noise = noise
-                return aggregated
-
-            deadline = time.monotonic() + CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS
-            candidates: list[CameraCorrespondences] = []
-            last_error: CalibrationError | None = None
-            while True:
-                try:
-                    candidates.append(self._get_correspondences(status, None))
-                except CalibrationError as ex:
-                    last_error = ex
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(0.25)
-            if candidates:
-                selected_candidates = candidates[-3:]
-                aggregated, noise = _aggregate_camera_correspondences(selected_candidates)
-                _validate_camera_capture_noise(
-                    noise,
-                    self.configuration.calibration_thresholds,
-                )
-                self._last_camera_capture_noise = noise
-                return aggregated
-            if last_error is not None:
-                raise last_error
-            raise CalibrationError('No calibration correspondences were detected')
+            self._last_camera_capture_noise = capture.noise
+            return capture.correspondences
         finally:
             with self._calibration_capture_lock:
                 self._calibration_capture_count -= 1
                 if self._calibration_capture_count == 0:
                     self._calibration_pattern_presented.clear()
+
+    def _capture_camera_correspondences(
+        self,
+        status: CameraStatus,
+        *,
+        expected_calibration: PersistedCalibration | None = None,
+        allow_local: bool = False,
+    ) -> _CalibrationCapture:
+        thresholds = self.configuration.calibration_thresholds
+        get_consecutive_frames = getattr(
+            self.camera_runtime,
+            'get_consecutive_frames',
+            None,
+        )
+        if callable(get_consecutive_frames) and CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS > 0:
+            captured_frames = get_consecutive_frames(
+                status.logical_name,
+                CALIBRATION_CAPTURE_CANDIDATE_FRAME_COUNT,
+                CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS,
+            )
+            if not isinstance(captured_frames, Sequence) or len(captured_frames) < 3:
+                raise CalibrationError(
+                    'Camera runtime returned invalid consecutive calibration frames',
+                )
+            if any(not isinstance(frame, Frame) for frame in captured_frames):
+                raise CalibrationError(
+                    'Camera runtime returned invalid consecutive calibration frames',
+                )
+            stable_frames = _select_stable_frame_window(
+                captured_frames,
+                thresholds.max_capture_white_balance_delta,
+                window_size=CALIBRATION_CAPTURE_CANDIDATE_FRAME_COUNT,
+            )
+            detected_frames = tuple(
+                self._get_correspondences_from_frame(status, frame)
+                for frame in stable_frames
+            )
+            selected_frames = _select_camera_frame_window(
+                detected_frames,
+                self.calibration_pattern,
+                thresholds,
+                status.native_resolution,
+                expected_calibration,
+                minimum_common_marker_count=1 if allow_local else 2,
+                minimum_common_corner_count=4 if allow_local else 8,
+            )
+            aggregated, noise = _aggregate_camera_correspondences(
+                selected_frames,
+                minimum_common_marker_count=1 if allow_local else 2,
+                minimum_common_corner_count=4 if allow_local else 8,
+            )
+            _validate_camera_capture_noise(noise, thresholds)
+            return _CalibrationCapture(aggregated, noise)
+
+        deadline = time.monotonic() + CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS
+        candidates: list[CameraCorrespondences] = []
+        last_error: CalibrationError | None = None
+        previous_frame_counter: int | None = None
+        snapshot = getattr(self.camera_runtime, 'snapshot', None)
+        while True:
+            try:
+                if callable(snapshot):
+                    frame = snapshot(status.logical_name)
+                    if not isinstance(frame, Frame):
+                        raise CalibrationError('Camera runtime returned an invalid snapshot')
+                    if (
+                        previous_frame_counter is not None
+                        and frame.frame_counter <= previous_frame_counter
+                    ):
+                        raise CalibrationError(
+                            'Calibration capture did not receive fresh camera frames',
+                        )
+                    previous_frame_counter = frame.frame_counter
+                    candidates.append(self._get_correspondences_from_frame(status, frame))
+                else:
+                    candidates.append(self._get_correspondences(status, None))
+            except CalibrationError as ex:
+                last_error = ex
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+        if (
+            callable(snapshot)
+            and CALIBRATION_PATTERN_CAPTURE_TIMEOUT_SECONDS > 0
+            and len(candidates) < 3
+        ):
+            raise CalibrationError(
+                'Calibration capture did not receive three fresh camera frames',
+            )
+        if candidates:
+            selected_candidates = candidates[-3:]
+            aggregated, noise = _aggregate_camera_correspondences(
+                selected_candidates,
+                minimum_common_marker_count=1 if allow_local else 2,
+                minimum_common_corner_count=4 if allow_local else 8,
+            )
+            _validate_camera_capture_noise(noise, thresholds)
+            return _CalibrationCapture(aggregated, noise)
+        if last_error is not None:
+            raise last_error
+        raise CalibrationError('No calibration correspondences were detected')
+
+    def _capture_calibration_bursts(
+        self,
+        statuses: Sequence[CameraStatus],
+        *,
+        expected_calibrations: Mapping[str, PersistedCalibration] | None = None,
+        allow_local: bool = False,
+    ) -> dict[str, _CalibrationCapture | str]:
+        expected = expected_calibrations or {}
+        captures: dict[str, _CalibrationCapture | str] = {}
+        with ThreadPoolExecutor(max_workers=max(1, len(statuses))) as executor:
+            futures = {
+                status.logical_name: executor.submit(
+                    self._capture_camera_correspondences,
+                    status,
+                    expected_calibration=expected.get(status.logical_name),
+                    allow_local=allow_local,
+                )
+                for status in statuses
+            }
+            for logical_name, future in futures.items():
+                try:
+                    captures[logical_name] = future.result()
+                except Exception as ex:  # noqa: BLE001 (one camera must not abort the run).
+                    captures[logical_name] = str(ex)
+        return captures
 
     def _get_correspondences(
         self,
@@ -2823,7 +3256,8 @@ class MultiVisionService:
         detector = self.detector
         if detector is None:
             detector = OpenCVArucoDetector(self.calibration_pattern.marker_family)
-        detected_markers = detect_fiducials(frame.data, detector)
+        with self._detector_lock:
+            detected_markers = detect_fiducials(frame.data, detector)
         return assemble_correspondences(
             detected_markers,
             self.calibration_pattern,
@@ -2993,6 +3427,9 @@ def _select_camera_frame_window(
     thresholds: CalibrationThresholds,
     camera_resolution: Resolution | None,
     expected_calibration: PersistedCalibration | None = None,
+    *,
+    minimum_common_marker_count: int = 2,
+    minimum_common_corner_count: int = 8,
 ) -> tuple[CameraCorrespondences, ...]:
     if camera_resolution is None:
         raise CalibrationError('Camera resolution is unavailable for calibration capture')
@@ -3008,7 +3445,11 @@ def _select_camera_frame_window(
         for frame in window[1:]:
             common_marker_ids.intersection_update(frame.unique_marker_ids)
         try:
-            aggregated, window_noise = _aggregate_camera_correspondences(window)
+            aggregated, window_noise = _aggregate_camera_correspondences(
+                window,
+                minimum_common_marker_count=minimum_common_marker_count,
+                minimum_common_corner_count=minimum_common_corner_count,
+            )
         except CalibrationError:
             continue
         noise_score = window_noise.p95_sigma_pixels if window_noise is not None else 0.0
@@ -3096,6 +3537,9 @@ def _select_camera_frame_window(
 
 def _aggregate_camera_correspondences(
     frames: Sequence[CameraCorrespondences],
+    *,
+    minimum_common_marker_count: int = 2,
+    minimum_common_corner_count: int = 8,
 ) -> tuple[CameraCorrespondences, _CameraCaptureNoise | None]:
     if len(frames) == 0:
         raise CalibrationError('No calibration correspondences were detected')
@@ -3104,7 +3548,7 @@ def _aggregate_camera_correspondences(
 
     marker_counts = tuple(len(frame.unique_marker_ids) for frame in frames)
     minimum_common_marker_count = max(
-        2,
+        minimum_common_marker_count,
         math.ceil(0.5 * statistics.median(marker_counts)),
     )
     common_marker_ids = set(frames[0].unique_marker_ids)
@@ -3130,7 +3574,7 @@ def _aggregate_camera_correspondences(
             and all(corner_key in corner_map for corner_map in frame_corner_maps)
         ),
     )
-    if len(common_corner_keys) < 8:
+    if len(common_corner_keys) < minimum_common_corner_count:
         raise CalibrationError(
             'Calibration frames do not contain enough common target corners',
         )
@@ -3357,6 +3801,55 @@ def _normalise_injected_metric_frames(
     )
 
 
+def _full_calibration_quality_score(
+    calibration: PersistedCalibration | None,
+) -> tuple[float, ...]:
+    if calibration is None:
+        return (0.0, 0.0, 0.0, float('-inf'), float('-inf'))
+    metrics = calibration.metrics
+    return (
+        float(metrics.unique_tag_count),
+        metrics.spatial_coverage,
+        metrics.inlier_ratio,
+        -metrics.mean_reprojection_error,
+        -metrics.max_reprojection_error,
+        -(metrics.capture_p95_sigma_pixels or 0.0),
+    )
+
+
+def _attach_camera_capture_noise(
+    result: CalibrationResult,
+    noise: _CameraCaptureNoise | None,
+) -> CalibrationResult:
+    if noise is None:
+        return result
+    return result._replace(
+        metrics=result.metrics._replace(
+            capture_median_sigma_pixels=noise.median_sigma_pixels,
+            capture_p95_sigma_pixels=noise.p95_sigma_pixels,
+            capture_max_sigma_pixels=noise.max_sigma_pixels,
+        ),
+    )
+
+
+def _passes_full_calibration_master_gate(
+    calibration: PersistedCalibration | None,
+    pattern: CalibrationPattern,
+    thresholds: CalibrationThresholds,
+) -> bool:
+    if calibration is None or calibration.calibration_scope != CalibrationScope.GLOBAL.value:
+        return False
+    metrics = calibration.metrics
+    minimum_tag_count = math.ceil(0.8 * len(pattern.markers))
+    return (
+        metrics.unique_tag_count >= minimum_tag_count
+        and metrics.spatial_coverage >= thresholds.min_spatial_coverage
+        and metrics.inlier_ratio >= thresholds.min_inlier_ratio
+        and metrics.mean_reprojection_error <= thresholds.max_mean_reprojection_error
+        and metrics.max_reprojection_error <= thresholds.max_reprojection_error
+    )
+
+
 def _same_camera_calibration(first: object, second: object) -> bool:
     """Compare the camera geometry used by a capture, not object identity."""
     for field_name in (
@@ -3385,6 +3878,7 @@ def _build_projector_calibration_pattern(
             projector_resolution.width - margin,
             projector_resolution.height - margin,
         ),
+        marker_family=PROJECTOR_CALIBRATION_MARKER_FAMILY,
     )
 
 
@@ -3547,6 +4041,7 @@ def _is_tracking_calibration_usable(
     if isinstance(calibration, PersistedCalibration) and (
         calibration.camera_id != camera.slot_id
         or calibration.version != calibration_version
+        or calibration.calibration_scope != CalibrationScope.GLOBAL.value
     ):
         return False
     try:

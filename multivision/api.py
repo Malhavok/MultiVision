@@ -536,6 +536,10 @@ def create_app(
             owned_service.get_camera_status(request.camera).calibration_status,
         )
 
+    @app.post('/calibration/full')
+    def full_calibration() -> dict[str, Any]:
+        return _json_safe(owned_service.full_calibrate().to_data())
+
     @app.post('/calibration/verify')
     def verify_calibration(request: CalibrationRequest | None = None) -> dict[str, Any]:
         request = CalibrationRequest() if request is None else request

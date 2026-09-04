@@ -6,6 +6,7 @@ from unittest.mock import patch
 from multivision.application import (
     AREA_COLOURS,
     MultiVisionService,
+    _CalibrationCapture,
     _aggregate_camera_correspondences,
 )
 from multivision.calibration import CalibrationMetrics, CalibrationResult
@@ -23,6 +24,7 @@ from multivision.fiducials import (
 )
 from multivision.config import Configuration
 from multivision.geometry import HomographyPair, Point2D
+from multivision.metric_target import METRIC_TARGET
 from multivision.overlays import (
     CircleRequest,
     GridRequest,
@@ -34,6 +36,7 @@ from multivision.service import PointOverlayService
 from multivision.session import FrameMetadata, SessionCameraRegistry
 from multivision.spatial import SpatialState
 from multivision.types import (
+    CalibrationScope,
     CalibrationStatus,
     CameraStatus,
     DeviceInfo,
@@ -79,6 +82,55 @@ class CameraCaptureAggregationTest(unittest.TestCase):
         assert len(aggregated.correspondences) == 8
         assert noise is not None
         assert noise.median_sigma_pixels > 0
+
+
+class FullCalibrationWorkflowTest(unittest.TestCase):
+    def test_projector_and_metric_patterns_use_different_tag_families(self) -> None:
+        service = MultiVisionService(Configuration())
+
+        assert service.calibration_pattern.marker_family != METRIC_TARGET.marker_family
+
+    def test_one_tag_fallback_is_verified_as_local_low_confidence(self) -> None:
+        runtime = CalibrationSessionRuntime((0,))
+        service = MultiVisionService(
+            Configuration(projector_resolution=Resolution(1000, 700)),
+            camera_runtime=runtime,  # type: ignore[arg-type]
+        )
+        marker = service.calibration_pattern.markers[0]
+        correspondences = CameraCorrespondences(
+            tuple(
+                FiducialCorrespondence(
+                    corner.marker_id,
+                    corner.corner_index,
+                    corner.projector_position,
+                    Point2D(
+                        corner.projector_position.x * 0.4 + 20,
+                        corner.projector_position.y * 0.4 + 30,
+                    ),
+                )
+                for corner in marker.corner_metadata
+            ),
+            'camera-0',
+        )
+        capture = _CalibrationCapture(correspondences, None)
+
+        with (
+            patch.object(service._calibration_pattern_presented, 'wait', return_value=True),
+            patch('multivision.application.time.sleep'),
+            patch.object(
+                service,
+                '_capture_calibration_bursts',
+                side_effect=[{'camera-0': capture}, {'camera-0': capture}],
+            ),
+            patch.object(service.calibration_store, 'save'),
+        ):
+            result = service.full_calibrate()
+
+        camera_result = result.cameras['camera-0']
+        assert camera_result.status is CalibrationStatus.CALIBRATED
+        assert camera_result.calibration_scope is CalibrationScope.LOCAL_LOW_CONFIDENCE
+        assert result.master_camera == 'camera-0'
+        assert not result.master_gate_passed
 
 
 class CameraCalibrationCaptureTimingTest(unittest.TestCase):

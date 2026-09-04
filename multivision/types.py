@@ -29,6 +29,12 @@ class CalibrationStatus(str, Enum):
     STALE = 'STALE'
 
 
+class CalibrationScope(str, Enum):
+    GLOBAL = 'global'
+    LOCAL = 'local'
+    LOCAL_LOW_CONFIDENCE = 'local_low_confidence'
+
+
 class CalibrationStage(str, Enum):
     UNCALIBRATED = 'UNCALIBRATED'
     UNVERIFIED = 'UNVERIFIED'
