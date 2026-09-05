@@ -1,17 +1,37 @@
 import math
 import unittest
 
+import cv2
+
 from multivision.geometry import CoordinateBounds, Point2D
 from multivision.pattern import (
     APRILTAG_36H11,
     CalibrationPattern,
     SUPPORTED_MARKER_COUNTS,
+    SUPPORTED_TAG_DICTIONARIES,
     build_calibration_pattern,
+    validate_tag_dictionary,
 )
 from multivision.types import Resolution
 
 
 class CalibrationPatternTest(unittest.TestCase):
+    def test_tag_dictionary_validation_tracks_all_opencv_predefined_dictionaries(self) -> None:
+        opencv_dictionary_names = {
+            dictionary_name
+            for dictionary_name in dir(cv2.aruco)
+            if dictionary_name.startswith('DICT_')
+            and isinstance(getattr(cv2.aruco, dictionary_name), int)
+        }
+
+        assert opencv_dictionary_names <= SUPPORTED_TAG_DICTIONARIES, (
+            f'{opencv_dictionary_names - SUPPORTED_TAG_DICTIONARIES=}'
+        )
+        for dictionary_name in sorted(opencv_dictionary_names):
+            assert validate_tag_dictionary(dictionary_name) == dictionary_name, (
+                f'{dictionary_name=}'
+            )
+
     def test_default_pattern_has_unique_markers_across_the_projector(self) -> None:
         pattern = build_calibration_pattern(Resolution(1920, 1080))
 

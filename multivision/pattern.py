@@ -8,6 +8,7 @@ from collections.abc import (
     Sequence,
     Set,
 )
+from functools import cache
 from numbers import Real
 from typing import NamedTuple
 
@@ -20,16 +21,7 @@ from multivision.types import (
 
 APRILTAG_36H11 = 'DICT_APRILTAG_36h11'
 PROJECTOR_CALIBRATION_MARKER_FAMILY = 'DICT_APRILTAG_36h10'
-APRILTAG_FAMILIES = frozenset(
-    {
-        'DICT_APRILTAG_16h5',
-        'DICT_APRILTAG_25h9',
-        PROJECTOR_CALIBRATION_MARKER_FAMILY,
-        APRILTAG_36H11,
-    },
-)
 DICT_5X5_1000 = 'DICT_5X5_1000'
-SUPPORTED_TAG_DICTIONARIES = APRILTAG_FAMILIES | {DICT_5X5_1000}
 DEFAULT_TAG_DICTIONARY = DICT_5X5_1000
 DEFAULT_MARKER_COUNT = 20
 SUPPORTED_MARKER_COUNTS = frozenset({9, 10, 11, 12, 20})
@@ -94,8 +86,47 @@ class CalibrationPattern(NamedTuple):
         raise KeyError(marker_id)
 
 
+@cache
+def _get_supported_tag_dictionaries() -> frozenset[str]:
+    """Discover predefined dictionaries exposed by the installed OpenCV."""
+    try:
+        import cv2
+    except ImportError:
+        return frozenset()
+
+    aruco = getattr(cv2, 'aruco', None)
+    if aruco is None:
+        return frozenset()
+
+    dictionary_names: set[str] = set()
+    for dictionary_name in dir(aruco):
+        if not dictionary_name.startswith('DICT_'):
+            continue
+        dictionary_constant = getattr(aruco, dictionary_name, None)
+        if (
+            not isinstance(dictionary_constant, int)
+            or isinstance(dictionary_constant, bool)
+        ):
+            continue
+        try:
+            dictionary = aruco.getPredefinedDictionary(dictionary_constant)
+        except Exception:  # noqa: BLE001 (OpenCV is an external boundary).
+            continue
+        if dictionary is not None:
+            dictionary_names.add(dictionary_name)
+    return frozenset(dictionary_names)
+
+
+SUPPORTED_TAG_DICTIONARIES = _get_supported_tag_dictionaries()
+APRILTAG_FAMILIES = frozenset(
+    dictionary_name
+    for dictionary_name in SUPPORTED_TAG_DICTIONARIES
+    if dictionary_name.startswith('DICT_APRILTAG_')
+)
+
+
 def validate_tag_dictionary(dictionary_name: object) -> str:
-    """Validate one supported OpenCV dictionary name."""
+    """Validate one predefined dictionary exposed by the installed OpenCV."""
     if (
         not isinstance(dictionary_name, str)
         or dictionary_name not in SUPPORTED_TAG_DICTIONARIES

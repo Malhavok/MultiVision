@@ -28,10 +28,11 @@ frames, track detections or mutate overlays, calibration records or other
 persistent state.
 
 Generic tag inspection has its own `tag_dictionary` configuration. Its default
-is `DICT_5X5_1000`; the validated canonical set also includes the currently
-supported AprilTag-family names. Request overrides use the same validated
-names. Unsupported names are rejected explicitly, and a supported dictionary
-whose OpenCV constant is unavailable is an explicit detector error.
+is `DICT_5X5_1000`; validation discovers every predefined `DICT_*` dictionary
+exposed by the installed `cv2.aruco` module rather than maintaining a project
+allowlist. Request overrides use the same validation. Unsupported names,
+including names whose OpenCV predefined factory is unavailable, are rejected
+explicitly before detection.
 
 Calibration-pattern detection remains independently configured by
 `calibration_pattern.marker_family`, including its existing default. The
