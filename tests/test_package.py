@@ -45,6 +45,7 @@ class PackageTest(unittest.TestCase):
     def test_package_imports(self) -> None:
         package = importlib.import_module('multivision')
         assert package.__name__ == 'multivision'
+        assert package.__version__ == '0.3.0', f'{package.__version__=}'
         assert RuntimeStatus.UNAVAILABLE.value == 'UNAVAILABLE'
         assert CalibrationStatus.UNVERIFIED.value == 'UNVERIFIED'
 

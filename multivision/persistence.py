@@ -71,6 +71,7 @@ class PersistedCalibration:
     timestamp: float
     valid_region: tuple[Point2D, ...]
     calibration_scope: str
+    camera_device_id: str | None
 
     def __init__(
         self,
@@ -86,6 +87,7 @@ class PersistedCalibration:
         projector_output_descriptor: ProjectorOutputDescriptor | None = None,
         projector_output_identity: str | None = None,
         calibration_scope: str = 'global',
+        camera_device_id: str | None = None,
     ) -> None:
         _validate_camera_id(camera_id)
         _validate_resolution(camera_resolution, 'camera_resolution')
@@ -111,6 +113,11 @@ class PersistedCalibration:
             raise CalibrationError('Calibration scope is invalid')
         if not is_finite_real(timestamp):
             raise CalibrationError('Calibration timestamp must be a finite number')
+        if camera_device_id is not None and (
+            not isinstance(camera_device_id, str)
+            or not camera_device_id.strip()
+        ):
+            raise CalibrationError('Camera device ID must be a non-empty string')
         object.__setattr__(self, 'camera_id', camera_id)
         object.__setattr__(self, 'camera_resolution', camera_resolution)
         object.__setattr__(self, 'projector_resolution', projector_resolution)
@@ -126,6 +133,7 @@ class PersistedCalibration:
         object.__setattr__(self, 'timestamp', float(timestamp))
         object.__setattr__(self, 'valid_region', _normalise_region(valid_region))
         object.__setattr__(self, 'calibration_scope', calibration_scope)
+        object.__setattr__(self, 'camera_device_id', camera_device_id)
 
     @property
     def calibration_version(self) -> int:
@@ -147,6 +155,7 @@ class PersistedCalibration:
         projector_output_descriptor: ProjectorOutputDescriptor | None = None,
         projector_output_identity: str | None = None,
         calibration_scope: str = 'global',
+        camera_device_id: str | None = None,
     ) -> 'PersistedCalibration':
         if not isinstance(result, CalibrationResult):
             raise CalibrationError('result must be CalibrationResult')
@@ -166,6 +175,7 @@ class PersistedCalibration:
             projector_output_descriptor,
             projector_output_identity,
             calibration_scope,
+            camera_device_id,
         )
 
     @classmethod
@@ -208,6 +218,7 @@ class PersistedCalibration:
             _parse_region(data['valid_region']),
             projector_output_descriptor,
             calibration_scope=data.get('calibration_scope', 'global'),
+            camera_device_id=data.get('camera_device_id'),
         )
 
     def to_data(self) -> dict[str, Any]:
@@ -228,6 +239,7 @@ class PersistedCalibration:
             'timestamp': self.timestamp,
             'valid_region': [_point_to_data(point) for point in self.valid_region],
             'calibration_scope': self.calibration_scope,
+            'camera_device_id': self.camera_device_id,
         }
 
 

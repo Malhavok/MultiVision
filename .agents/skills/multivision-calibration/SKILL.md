@@ -42,6 +42,19 @@ operator runbook, not a second implementation of calibration.
 3. If health succeeds, reuse the existing process. Do not restart it merely to
    run another calibration.
 
+4. If `calibration.json` exists, ask the Driver whether to load the saved
+   calibration before starting a new capture. Never load it silently. If the
+   Driver agrees, run:
+
+   ```sh
+   bin/multivision calibration load --input calibration.json
+   ```
+
+   The load assumes the cameras, projector output, resolutions and physical
+   geometry are unchanged; the service validates those authorities and rejects
+   incompatible records without recapturing anything. If the Driver declines,
+   leave the current session calibration state unchanged.
+
 ## Camera/projector calibration
 
 Use one service-owned full run instead of calibrating cameras one by one:

@@ -39,3 +39,4 @@ htmlcov/
 
 plans/*.md.state.json*
 metric-target.svg
+calibration.json

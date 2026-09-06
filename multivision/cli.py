@@ -14,6 +14,12 @@ import uuid
 from collections.abc import Callable, Sequence
 from typing import Any, NamedTuple
 
+from multivision.calibration_document import (
+    DEFAULT_CALIBRATION_DOCUMENT_PATH,
+    load_calibration_document,
+    save_calibration_document,
+)
+
 
 DEFAULT_SERVICE_URL = 'http://127.0.0.1:8000'
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -118,6 +124,21 @@ class MultiVisionClient:
 
     def get_spatial_state(self) -> ServiceResponse:
         return self.get('/spatial-state')
+
+    def get_calibration_status(self) -> ServiceResponse:
+        return self.get('/calibration/status')
+
+    def load_calibration_status(self, status: dict[str, Any]) -> ServiceResponse:
+        return self.post('/calibration/status', status)
+
+    def load_calibration_document(self, document: dict[str, Any]) -> ServiceResponse:
+        return self.post('/calibration/load', document)
+
+    def get_metric_calibration_status(self) -> ServiceResponse:
+        return self.get('/metric/calibration/status')
+
+    def load_metric_calibration_status(self, status: dict[str, Any]) -> ServiceResponse:
+        return self.post('/metric/calibration/status', status)
 
     def put(
         self,
@@ -306,6 +327,26 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_parser.set_defaults(command_handler='calibration_verify')
     status_parser = calibration_subparsers.add_parser('status', help='show calibration status')
     status_parser.set_defaults(command_handler='calibration_status')
+    save_parser = calibration_subparsers.add_parser(
+        'save',
+        help='save camera and metric calibration to a JSON document',
+    )
+    save_parser.add_argument(
+        '--output',
+        type=_parse_output_path,
+        default=DEFAULT_CALIBRATION_DOCUMENT_PATH,
+    )
+    save_parser.set_defaults(command_handler='calibration_save')
+    load_parser = calibration_subparsers.add_parser(
+        'load',
+        help='load camera and metric calibration from a JSON document',
+    )
+    load_parser.add_argument(
+        '--input',
+        type=_parse_output_path,
+        default=DEFAULT_CALIBRATION_DOCUMENT_PATH,
+    )
+    load_parser.set_defaults(command_handler='calibration_load')
     pattern_parser = calibration_subparsers.add_parser(
         'pattern',
         help='show or hide the calibration pattern',
@@ -649,6 +690,8 @@ def _run_command(
         'full_calibration': _full_calibration,
         'calibration_verify': _calibration_verify,
         'calibration_status': _calibration_status,
+        'calibration_save': _calibration_save,
+        'calibration_load': _calibration_load,
         'calibration_pattern_show': _calibration_pattern_show,
         'calibration_pattern_hide': _calibration_pattern_hide,
         'snapshot': _snapshot,
@@ -764,7 +807,35 @@ def _calibration_status(
     client: MultiVisionClient,
     _arguments: argparse.Namespace,
 ) -> ServiceResponse:
-    return client.get('/calibration/status')
+    return client.get_calibration_status()
+
+
+def _calibration_save(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    camera_status = _get_json_object(
+        client.get_calibration_status(),
+        'camera calibration status',
+    )
+    metric_status = _get_json_object(
+        client.get_metric_calibration_status(),
+        'metric calibration status',
+    )
+    save_calibration_document(arguments.output, camera_status, metric_status)
+    return ServiceResponse(
+        200,
+        'application/json',
+        json.dumps({'saved': str(arguments.output)}).encode('utf-8'),
+    )
+
+
+def _calibration_load(
+    client: MultiVisionClient,
+    arguments: argparse.Namespace,
+) -> ServiceResponse:
+    document = load_calibration_document(arguments.input)
+    return client.load_calibration_document(document)
 
 
 def _calibration_pattern_show(
@@ -1014,7 +1085,7 @@ def _metric_status(
     client: MultiVisionClient,
     _arguments: argparse.Namespace,
 ) -> ServiceResponse:
-    return client.get('/metric/calibration/status')
+    return client.get_metric_calibration_status()
 
 
 def _metric_rotation(

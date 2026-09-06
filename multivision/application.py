@@ -17,6 +17,10 @@ from typing import (
 )
 
 from multivision.benchmarking import BenchmarkMetrics, measure_timing
+from multivision.calibration_document import (
+    CALIBRATION_DOCUMENT_FORMAT,
+    CALIBRATION_DOCUMENT_VERSION,
+)
 from multivision.calibration import (
     CalibrationMetrics,
     CalibrationResult,
@@ -1655,6 +1659,208 @@ class MultiVisionService:
                 stage = CalibrationStage.UNCALIBRATED
             return stage, metric_status, camera_statuses
 
+    def load_calibration_status(
+        self,
+        status_data: Mapping[str, object],
+    ) -> dict[str, PersistedCalibration]:
+        """Load camera records without repeating capture or verification."""
+        records = _parse_persisted_calibrations(status_data)
+        with self._camera_management_lock:
+            cameras_by_slot = self._validate_camera_calibration_records(records)
+            previous_cameras = {
+                camera_id: (camera.calibration_status, camera.calibration)
+                for camera_id, camera in cameras_by_slot.items()
+                if camera_id in records
+            }
+            applied_camera_ids: list[str] = []
+            try:
+                for camera_id, record in records.items():
+                    self._set_session_calibration(
+                        camera_id,
+                        CalibrationStatus.CALIBRATED,
+                        record,
+                    )
+                    applied_camera_ids.append(camera_id)
+            except Exception:
+                for camera_id in reversed(applied_camera_ids):
+                    status, calibration = previous_cameras[camera_id]
+                    self._set_session_calibration(camera_id, status, calibration)
+                raise
+        return records
+
+    def load_metric_calibration_status(
+        self,
+        status_data: Mapping[str, object],
+    ) -> MetricCalibrationRecord:
+        """Load the shared metric record without repeating target capture."""
+        record = _parse_metric_calibration_status(status_data)
+        if record.projector_output_descriptor != self._projector_output_descriptor:
+            raise CalibrationError(
+                'Metric calibration belongs to another projector output',
+            )
+
+        with self._camera_management_lock:
+            if record.observation_camera_slot is not None:
+                camera = self._get_session_camera(record.observation_camera_slot)
+                if camera is None or not isinstance(
+                    camera.calibration,
+                    PersistedCalibration,
+                ):
+                    raise CalibrationError(
+                        'Metric calibration source camera is not calibrated',
+                    )
+                camera_calibration = camera.calibration
+                if camera.calibration_status is not CalibrationStatus.CALIBRATED:
+                    raise CalibrationError(
+                        'Metric calibration source camera is not trusted',
+                    )
+                if (
+                    record.observation_camera_id is not None
+                    and record.observation_camera_id != camera_calibration.camera_id
+                ):
+                    raise CalibrationError(
+                        'Metric calibration source camera does not match the record',
+                    )
+                if (
+                    record.observation_camera_calibration_version is not None
+                    and record.observation_camera_calibration_version
+                    != camera_calibration.version
+                ):
+                    raise CalibrationError(
+                        'Metric calibration source camera version does not match the record',
+                    )
+                if (
+                    record.observation_camera_calibration_timestamp is not None
+                    and record.observation_camera_calibration_timestamp
+                    != camera_calibration.timestamp
+                ):
+                    raise CalibrationError(
+                        'Metric calibration source camera timestamp does not match the record',
+                    )
+            self.overlay_registry.invalidate_metric()
+            self.metric_calibration_registry.load(record)
+            self._metric_capture_generation += 1
+            self._invalidate_spatial_metric_state()
+            self._metric_ruler = None
+        return record
+
+    def load_calibration_document(
+        self,
+        document: Mapping[str, object],
+    ) -> None:
+        """Validate and apply a complete camera/metric snapshot atomically."""
+        if not isinstance(document, Mapping):
+            raise CalibrationError('Calibration document must be an object')
+        if document.get('format') != CALIBRATION_DOCUMENT_FORMAT:
+            raise CalibrationError('Calibration document has an unsupported format')
+        if (
+            type(document.get('version')) is not int
+            or document.get('version') != CALIBRATION_DOCUMENT_VERSION
+        ):
+            raise CalibrationError('Calibration document has an unsupported version')
+        camera_status = document.get('camera')
+        metric_status = document.get('metric')
+        records = _parse_persisted_calibrations(camera_status)
+        metric_record = _parse_metric_calibration_status(metric_status)
+        if metric_record.projector_output_descriptor != self._projector_output_descriptor:
+            raise CalibrationError('Metric calibration belongs to another projector output')
+
+        with self._camera_management_lock:
+            cameras_by_slot = self._validate_camera_calibration_records(records)
+            source_camera = cameras_by_slot.get(metric_record.observation_camera_slot)
+            if source_camera is None:
+                raise CalibrationError('Metric source camera is absent from calibration document')
+            source_record = records[metric_record.observation_camera_slot]
+            if (
+                metric_record.observation_camera_id != source_record.camera_id
+                or metric_record.observation_camera_calibration_version != source_record.version
+                or metric_record.observation_camera_calibration_timestamp != source_record.timestamp
+            ):
+                raise CalibrationError('Metric source-camera provenance does not match the document')
+
+            previous_cameras = {
+                camera_id: (camera.calibration_status, camera.calibration)
+                for camera_id, camera in cameras_by_slot.items()
+            }
+            camera_ids_to_clear = [
+                camera_id
+                for camera_id, camera in cameras_by_slot.items()
+                if camera_id not in records
+                and (
+                    camera.calibration is not None
+                    or camera.calibration_status is not CalibrationStatus.UNCALIBRATED
+                )
+            ]
+            previous_metric = self.metric_calibration_registry.get_record()
+            applied_camera_ids: list[str] = []
+            try:
+                for camera_id, record in records.items():
+                    self._set_session_calibration(
+                        camera_id,
+                        CalibrationStatus.CALIBRATED,
+                        record,
+                    )
+                    applied_camera_ids.append(camera_id)
+                for camera_id in camera_ids_to_clear:
+                    self._set_session_calibration(
+                        camera_id,
+                        CalibrationStatus.UNCALIBRATED,
+                        None,
+                    )
+                    applied_camera_ids.append(camera_id)
+                self.overlay_registry.invalidate_metric()
+                self.metric_calibration_registry.load(metric_record)
+                self._metric_capture_generation += 1
+                self._invalidate_spatial_metric_state()
+                self._metric_ruler = None
+            except Exception:
+                for camera_id in reversed(applied_camera_ids):
+                    status, calibration = previous_cameras[camera_id]
+                    self._set_session_calibration(camera_id, status, calibration)
+                self.metric_calibration_registry.restore(previous_metric)
+                raise
+
+    def _validate_camera_calibration_records(
+        self,
+        records: Mapping[str, PersistedCalibration],
+    ) -> dict[str, SessionCamera]:
+        cameras = self._get_session_cameras()
+        if cameras is None:
+            raise CameraUnavailableError('Camera runtime returned no session cameras')
+        cameras_by_slot = {camera.slot_id: camera for camera in cameras}
+        for camera_id, record in records.items():
+            camera = cameras_by_slot.get(camera_id)
+            if camera is None:
+                raise CameraSlotNotFoundError(
+                    f'Calibration refers to unknown camera slot {camera_id!r}',
+                )
+            if camera.state is not SessionCameraState.OPEN:
+                raise CameraUnavailableError(
+                    f'Camera {camera_id!r} must be open to load calibration',
+                )
+            if camera.device_info is None or (
+                camera.device_info.native_resolution != record.camera_resolution
+            ):
+                raise CalibrationError(
+                    f'Camera {camera_id!r} resolution does not match calibration',
+                )
+            if (
+                record.camera_device_id is not None
+                and record.camera_device_id != camera.device_info.device_id
+            ):
+                raise CalibrationError(
+                    f'Camera {camera_id!r} device identity does not match calibration',
+                )
+            if record.projector_output_descriptor != self._projector_output_descriptor:
+                raise CalibrationError(
+                    f'Camera {camera_id!r} calibration belongs to another projector output',
+                )
+            if record.version != self.configuration.calibration_version:
+                raise CalibrationError(
+                    f'Camera {camera_id!r} calibration version is stale',
+                )
+        return cameras_by_slot
+
     def get_calibration_stage(self) -> CalibrationStage:
         """Return the highest complete calibration stage for the session."""
         stage, _metric_status, _camera_statuses = self.get_calibration_status_snapshot()
@@ -2585,6 +2791,11 @@ class MultiVisionService:
                         projector_output_descriptor=self._projector_output_descriptor,
                         camera_id=session_camera.slot_id,
                         calibration_scope=scope.value,
+                        camera_device_id=(
+                            session_camera.device_info.device_id
+                            if session_camera.device_info is not None
+                            else None
+                        ),
                     )
                     candidates[status.logical_name] = (
                         status,
@@ -3050,6 +3261,11 @@ class MultiVisionService:
                 version=self.configuration.calibration_version,
                 projector_output_descriptor=self._projector_output_descriptor,
                 camera_id=current_camera.slot_id,
+                camera_device_id=(
+                    current_camera.device_info.device_id
+                    if current_camera.device_info is not None
+                    else None
+                ),
             )
             self._set_session_calibration(
                 current_camera.slot_id,
@@ -3476,7 +3692,7 @@ class MultiVisionService:
         self,
         slot_id: str,
         calibration_status: CalibrationStatus,
-        calibration: PersistedCalibration,
+        calibration: object,
     ) -> None:
         self.overlay_registry.invalidate_camera(slot_id)
         self._invalidate_spatial_camera(slot_id)
@@ -3494,6 +3710,49 @@ class MultiVisionService:
             raise SessionCameraError(
                 'Camera runtime returned an invalid calibrated session camera',
             )
+
+
+def _parse_persisted_calibrations(
+    status_data: object,
+) -> dict[str, PersistedCalibration]:
+    if not isinstance(status_data, Mapping):
+        raise CalibrationError('Calibration status must be an object')
+    raw_calibrations = status_data.get('calibrations')
+    if not isinstance(raw_calibrations, Mapping):
+        raise CalibrationError('Calibration status must contain calibrations')
+    records: dict[str, PersistedCalibration] = {}
+    for camera_id, raw_record in raw_calibrations.items():
+        if not isinstance(camera_id, str):
+            raise CalibrationError('Calibration IDs must be strings')
+        if not isinstance(raw_record, Mapping):
+            raise CalibrationError(f'Calibration {camera_id!r} must be an object')
+        try:
+            record = PersistedCalibration.from_data(raw_record)
+        except (KeyError, TypeError, ValueError) as ex:
+            raise CalibrationError(
+                f'Calibration {camera_id!r} contains invalid fields',
+            ) from ex
+        if record.camera_id != camera_id:
+            raise CalibrationError('Calibration key does not match camera_id')
+        records[camera_id] = record
+    return records
+
+
+def _parse_metric_calibration_status(
+    status_data: object,
+) -> MetricCalibrationRecord:
+    if not isinstance(status_data, Mapping):
+        raise CalibrationError('Metric calibration status must be an object')
+    raw_record = status_data.get('calibration')
+    if not isinstance(raw_record, Mapping):
+        raise CalibrationError('Metric calibration status must contain calibration')
+    try:
+        record = MetricCalibrationRecord.from_data(raw_record)
+    except (KeyError, TypeError, ValueError) as ex:
+        raise CalibrationError('Metric calibration contains invalid fields') from ex
+    if record.state is not MetricCalibrationStatus.CALIBRATED:
+        raise CalibrationError('Only CALIBRATED metric records can be loaded')
+    return record
 
 
 class _CameraCaptureNoise(NamedTuple):

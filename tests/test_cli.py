@@ -84,6 +84,51 @@ class CliTest(unittest.TestCase):
             ('DELETE', 'http://service.test/overlay', None),
         ]
 
+    def test_calibration_save_and_load_use_the_public_status_routes(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None]] = []
+        camera_status = {
+            'calibrations': {
+                'camera-0': {'camera_id': 'camera-0', 'version': 1, 'timestamp': 2.0},
+            },
+        }
+        metric_status = {
+            'state': 'CALIBRATED',
+            'calibration': {
+                'state': 'CALIBRATED',
+                'observation_camera_slot': 'camera-0',
+                'observation_camera_id': 'camera-0',
+                'observation_camera_calibration_version': 1,
+                'observation_camera_calibration_timestamp': 2.0,
+            },
+        }
+
+        def request_sender(
+            method: str,
+            url: str,
+            payload: dict[str, Any] | None,
+            _timeout_seconds: float,
+        ) -> ServiceResponse:
+            requests.append((method, url, payload))
+            if method == 'GET' and url == 'http://service.test/calibration/status':
+                return ServiceResponse(200, 'application/json', json.dumps(camera_status).encode())
+            if method == 'GET' and url == 'http://service.test/metric/calibration/status':
+                return ServiceResponse(200, 'application/json', json.dumps(metric_status).encode())
+            return ServiceResponse(200, 'application/json', b'{"ok": true}')
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = pathlib.Path(temporary_directory) / 'calibration.json'
+            client = MultiVisionClient('http://service.test', request_sender=request_sender)
+
+            assert main(['calibration', 'save', '--output', str(path)], client) == 0
+            assert main(['calibration', 'load', '--input', str(path)], client) == 0
+
+        assert [(method, url) for method, url, _payload in requests] == [
+            ('GET', 'http://service.test/calibration/status'),
+            ('GET', 'http://service.test/metric/calibration/status'),
+            ('POST', 'http://service.test/calibration/load'),
+        ]
+        assert requests[2][2] == {'format': 'multivision-calibration', 'version': 1, 'camera': camera_status, 'metric': metric_status}
+
     def test_full_calibration_is_one_http_command(self) -> None:
         requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
 

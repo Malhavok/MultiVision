@@ -168,6 +168,31 @@ class MetricCalibrationRequest(BaseModel):
     correspondences: list[MetricCorrespondenceRequest] | None = None
 
 
+class CalibrationStatusLoadRequest(BaseModel):
+    """A camera calibration status snapshot to trust without recapture."""
+
+    model_config = ConfigDict(extra='allow')
+
+    calibrations: dict[str, dict[str, Any]]
+
+
+class MetricCalibrationStatusLoadRequest(BaseModel):
+    """A metric calibration status snapshot to trust without recapture."""
+
+    model_config = ConfigDict(extra='allow')
+
+    calibration: dict[str, Any]
+
+
+class CalibrationDocumentLoadRequest(BaseModel):
+    """A complete camera and metric calibration snapshot."""
+
+    format: Literal['multivision-calibration']
+    version: int
+    camera: CalibrationStatusLoadRequest
+    metric: MetricCalibrationStatusLoadRequest
+
+
 MetricUnitLiteral = Literal['mm', 'cm', 'in']
 
 
@@ -334,7 +359,7 @@ def create_app(
 
     app = FastAPI(
         title='MultiVision',
-        version='0.1.0',
+        version='0.3.0',
         lifespan=lifespan,
     )
     app.state.multivision_service = owned_service
@@ -591,8 +616,42 @@ def create_app(
         record = owned_service.calibrate_metric(request.camera, correspondences)
         return _json_safe(_metric_calibration_to_data(record))
 
+    @app.post('/calibration/load')
+    def load_calibration_document(
+        request: CalibrationDocumentLoadRequest,
+    ) -> dict[str, str]:
+        owned_service.load_calibration_document(request.model_dump())
+        return {'status': 'loaded'}
+
+    @app.post('/calibration/status')
+    def load_calibration_status(
+        request: CalibrationStatusLoadRequest,
+    ) -> dict[str, Any]:
+        owned_service.load_calibration_status(request.model_dump())
+        stage, metric_status, statuses = owned_service.get_calibration_status_snapshot()
+        return {
+            'calibration': stage.value,
+            'metric_calibration': metric_status.value,
+            'cameras': {
+                status.logical_name: status.calibration_status.value
+                for status in statuses
+            },
+            'calibrations': {
+                camera_id: calibration.to_data()
+                for camera_id, calibration in owned_service.get_calibration_records().items()
+            },
+        }
+
     @app.get('/metric/calibration/status')
     def get_metric_calibration_status() -> dict[str, Any]:
+        status, record = owned_service.get_metric_status_snapshot()
+        return _json_safe(_metric_status_to_data(status, record, owned_service))
+
+    @app.post('/metric/calibration/status')
+    def load_metric_calibration_status(
+        request: MetricCalibrationStatusLoadRequest,
+    ) -> dict[str, Any]:
+        owned_service.load_metric_calibration_status(request.model_dump())
         status, record = owned_service.get_metric_status_snapshot()
         return _json_safe(_metric_status_to_data(status, record, owned_service))
 

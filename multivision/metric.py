@@ -112,6 +112,129 @@ class MetricCalibrationRecord(NamedTuple):
     validation_records: tuple[MetricValidationRecord, ...] = ()
     latest_physical_validation_error_mm: float | None = None
 
+    @classmethod
+    def from_data(
+        cls: type['MetricCalibrationRecord'],
+        data: Mapping[str, Any],
+    ) -> 'MetricCalibrationRecord':
+        if not isinstance(data, Mapping):
+            raise ValueError('Metric calibration must be an object')
+        required_fields = (
+            'state',
+            'projector_output_descriptor',
+            'projector_to_surface',
+            'surface_to_projector',
+            'target_format',
+            'target_version',
+            'marker_family',
+            'metrics',
+        )
+        if any(field_name not in data for field_name in required_fields):
+            raise ValueError('Metric calibration is missing required fields')
+        state = MetricCalibrationStatus(data['state'])
+        descriptor_data = data['projector_output_descriptor']
+        if not isinstance(descriptor_data, Mapping):
+            raise ValueError('Metric calibration descriptor must be an object')
+        resolution_data = descriptor_data.get('projector_resolution')
+        if not isinstance(resolution_data, Mapping) or any(
+            field_name not in resolution_data for field_name in ('width', 'height')
+        ):
+            raise ValueError('Metric calibration resolution must be an object')
+        descriptor = ProjectorOutputDescriptor(
+            Resolution(resolution_data['width'], resolution_data['height']),
+            descriptor_data.get('output_identity', 'default'),
+        )
+        projector_to_surface = validate_homography(data['projector_to_surface'])
+        supplied_inverse = validate_homography(data['surface_to_projector'])
+        expected_inverse = validate_homography(invert_homography(projector_to_surface))
+        if not _homographies_match(supplied_inverse, expected_inverse):
+            raise ValueError('Metric calibration homographies are not inverses')
+        homography = MetricHomographyPair(projector_to_surface, supplied_inverse)
+        metrics_data = data['metrics']
+        metric_fields = (
+            'unique_target_fiducial_count',
+            'correspondence_corner_count',
+            'ransac_inlier_count',
+            'inlier_ratio',
+            'mean_fit_error_mm',
+            'max_fit_error_mm',
+            'target_page_spatial_coverage',
+        )
+        if not isinstance(metrics_data, Mapping) or any(
+            field_name not in metrics_data for field_name in metric_fields
+        ):
+            raise ValueError('Metric calibration metrics must be an object')
+        metrics = MetricCalibrationMetrics(*(metrics_data[field] for field in metric_fields))
+        validation_data = data.get('validation_records', ())
+        if not isinstance(validation_data, (list, tuple)):
+            raise ValueError('Metric validation records must be an array')
+        validation_fields = (
+            'requested_length_mm',
+            'observed_length_mm',
+            'absolute_error_mm',
+            'timestamp',
+        )
+        if any(
+            not isinstance(validation, Mapping)
+            or any(field_name not in validation for field_name in validation_fields)
+            for validation in validation_data
+        ):
+            raise ValueError('Metric validation records contain invalid fields')
+        validation_records = tuple(
+            MetricValidationRecord(*(validation[field] for field in validation_fields))
+            for validation in validation_data
+        )
+        source_fields = (
+            'observation_camera_slot',
+            'observation_camera_id',
+            'observation_camera_calibration_version',
+            'observation_camera_calibration_timestamp',
+        )
+        if any(data.get(field_name) is None for field_name in source_fields):
+            raise ValueError('Metric calibration is missing source-camera provenance')
+        record = cls(
+            state,
+            descriptor,
+            homography,
+            data.get('observation_camera_slot'),
+            data.get('observation_camera_id'),
+            data.get('observation_camera_calibration_version'),
+            data.get('observation_camera_calibration_timestamp'),
+            data['target_format'],
+            data['target_version'],
+            data['marker_family'],
+            metrics,
+            data.get('timestamp'),
+            validation_records,
+            data.get('latest_physical_validation_error_mm'),
+        )
+        if not isinstance(record.observation_camera_slot, str):
+            raise ValueError('Metric source camera slot must be a string')
+        if not isinstance(record.observation_camera_id, str):
+            raise ValueError('Metric source camera ID must be a string')
+        if (
+            not isinstance(record.observation_camera_calibration_version, int)
+            or isinstance(record.observation_camera_calibration_version, bool)
+        ):
+            raise ValueError('Metric source camera version must be an integer')
+        if not is_finite_real(record.observation_camera_calibration_timestamp):
+            raise ValueError('Metric source camera timestamp must be finite')
+        if record.timestamp is not None and not is_finite_real(record.timestamp):
+            raise ValueError('Metric calibration timestamp must be finite')
+        _validate_metric_calibration_result(
+            MetricCalibrationResult(
+                homography,
+                metrics,
+                descriptor.projector_resolution,
+                record.target_format,
+                record.target_version,
+                record.marker_family,
+                record.observation_camera_id,
+            ),
+        )
+        _validate_metric_validation_records(record)
+        return record
+
     @property
     def projector_resolution(self) -> Resolution:
         return self.projector_output_descriptor.projector_resolution
@@ -260,6 +383,44 @@ class MetricCalibrationRegistry:
             self._projector_output_descriptor = projector_output_descriptor
             self._record = record
         return record
+
+    def load(self, record: MetricCalibrationRecord) -> MetricCalibrationRecord:
+        """Load a trusted record after validating its current output authority."""
+        if not isinstance(record, MetricCalibrationRecord):
+            raise ValueError('record must be MetricCalibrationRecord')
+        if record.state is not MetricCalibrationStatus.CALIBRATED:
+            raise ValueError('Only CALIBRATED metric records can be loaded')
+        if (
+            self._projector_output_descriptor is not None
+            and record.projector_output_descriptor != self._projector_output_descriptor
+        ):
+            raise ValueError(
+                'Metric calibration descriptor does not match the active projector output',
+            )
+        if record.homography is None or record.metrics is None:
+            raise ValueError('Metric calibration record is incomplete')
+        _validate_metric_calibration_result(
+            MetricCalibrationResult(
+                record.homography,
+                record.metrics,
+                record.projector_resolution,
+                record.target_format,
+                record.target_version,
+                record.marker_family,
+                record.observation_camera_id,
+            ),
+        )
+        _validate_metric_validation_records(record)
+        with self._lock:
+            self._record = record
+        return record
+
+    def restore(self, record: MetricCalibrationRecord | None) -> None:
+        """Restore a previously captured registry value during a transaction rollback."""
+        if record is not None and not isinstance(record, MetricCalibrationRecord):
+            raise ValueError('record must be MetricCalibrationRecord or None')
+        with self._lock:
+            self._record = record
 
     def update_projector_descriptor(
         self,
@@ -414,16 +575,7 @@ def _validate_metric_calibration_result(
         )
     except (InvalidHomographyError, TypeError, ValueError) as ex:
         raise ValueError('Metric result contains invalid homography matrices') from ex
-    if not all(
-        math.isclose(
-            expected_surface_to_projector[row_idx][column_idx],
-            surface_to_projector[row_idx][column_idx],
-            rel_tol=1e-6,
-            abs_tol=1e-6,
-        )
-        for row_idx in range(3)
-        for column_idx in range(3)
-    ):
+    if not _homographies_match(expected_surface_to_projector, surface_to_projector):
         raise ValueError('Metric result homography matrices are not inverses')
 
     if not is_valid_resolution(result.projector_resolution):
@@ -484,6 +636,37 @@ def _validate_metric_calibration_result(
 def _validate_metric_descriptor(descriptor: object) -> None:
     if not isinstance(descriptor, ProjectorOutputDescriptor):
         raise ValueError('projector_output_descriptor must be ProjectorOutputDescriptor')
+
+
+def _homographies_match(
+    first: tuple[tuple[float, float, float], ...],
+    second: tuple[tuple[float, float, float], ...],
+) -> bool:
+    scale: float | None = None
+    for row_idx in range(3):
+        for column_idx in range(3):
+            first_value = first[row_idx][column_idx]
+            second_value = second[row_idx][column_idx]
+            if abs(second_value) <= 1e-12:
+                if abs(first_value) > 1e-6:
+                    return False
+                continue
+            scale = first_value / second_value
+            break
+        if scale is not None:
+            break
+    if scale is None:
+        return False
+    return all(
+        abs(first[row_idx][column_idx] - scale * second[row_idx][column_idx])
+        <= 1e-6 * max(
+            1.0,
+            abs(first[row_idx][column_idx]),
+            abs(scale * second[row_idx][column_idx]),
+        )
+        for row_idx in range(3)
+        for column_idx in range(3)
+    )
 
 
 class MetricHomographyPair(NamedTuple):

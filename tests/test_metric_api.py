@@ -171,6 +171,17 @@ class ApiMetricRuntime:
             Resolution(640, 480),
         )
 
+    def get_statuses(self) -> list[CameraStatus]:
+        return [self.get_status(camera.slot_id) for camera in self.registry.get_cameras()]
+
+    def set_calibration(
+        self,
+        slot_id: str,
+        status: CalibrationStatus,
+        calibration: object,
+    ) -> object:
+        return self.registry.set_calibration(slot_id, status, calibration)
+
 
 def _camera_calibration() -> PersistedCalibration:
     identity_matrix = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
@@ -208,6 +219,42 @@ def _calibration_record() -> MetricCalibrationRecord:
         metrics,
         1.0,
     )
+
+
+def _metric_status_payload(record: MetricCalibrationRecord) -> dict[str, object]:
+    return {
+        'calibration': {
+            'state': record.state.value,
+            'projector_to_surface': [list(row) for row in record.projector_to_surface],
+            'surface_to_projector': [list(row) for row in record.surface_to_projector],
+            'projector_output_descriptor': {
+                'projector_resolution': {
+                    'width': record.projector_resolution.width,
+                    'height': record.projector_resolution.height,
+                },
+                'output_identity': record.output_identity,
+            },
+            'observation_camera_slot': record.observation_camera_slot,
+            'observation_camera_id': 'camera-0',
+            'observation_camera_calibration_version': record.observation_camera_calibration_version,
+            'observation_camera_calibration_timestamp': record.observation_camera_calibration_timestamp,
+            'target_format': record.target_format,
+            'target_version': record.target_version,
+            'marker_family': record.marker_family,
+            'metrics': {
+                'unique_target_fiducial_count': record.metrics.unique_target_fiducial_count,
+                'correspondence_corner_count': record.metrics.correspondence_corner_count,
+                'ransac_inlier_count': record.metrics.ransac_inlier_count,
+                'inlier_ratio': record.metrics.inlier_ratio,
+                'mean_fit_error_mm': record.metrics.mean_fit_error_mm,
+                'max_fit_error_mm': record.metrics.max_fit_error_mm,
+                'target_page_spatial_coverage': record.metrics.target_page_spatial_coverage,
+            },
+            'timestamp': record.timestamp,
+            'validation_records': [],
+            'latest_physical_validation_error_mm': None,
+        },
+    }
 
 
 def _assert_json_finite(value: Any) -> None:
@@ -289,6 +336,42 @@ def test_metric_api_delegates_and_serialises_json_safe_data() -> None:
     _assert_json_finite(status_data)
     _assert_json_finite(ruler_data)
     _assert_json_finite(optional_observation_data)
+
+
+def test_calibration_status_routes_load_existing_camera_and_metric_records() -> None:
+    runtime = ApiMetricRuntime()
+    service = MultiVisionService(
+        Configuration(projector_resolution=Resolution(640, 480)),
+        camera_runtime=runtime,  # type: ignore[arg-type]
+    )
+    camera_payload = {
+        'calibrations': {'camera-0': _camera_calibration().to_data()},
+    }
+    metric_record = _calibration_record()._replace(observation_camera_id='camera-0')
+
+    with TestClient(create_app(service, manage_lifecycle=False)) as client:
+        camera_response = client.post('/calibration/status', json=camera_payload)
+        metric_response = client.post(
+            '/metric/calibration/status',
+            json=_metric_status_payload(metric_record),
+        )
+        combined_response = client.post(
+            '/calibration/load',
+            json={
+                'format': 'multivision-calibration',
+                'version': 1,
+                'camera': camera_payload,
+                'metric': _metric_status_payload(metric_record),
+            },
+        )
+
+    assert camera_response.status_code == 200, f'{camera_response.json()=}'
+    assert camera_response.json()['calibrations']['camera-0']['version'] == 1
+    assert metric_response.status_code == 200, f'{metric_response.json()=}'
+    assert metric_response.json()['state'] == 'CALIBRATED'
+    assert combined_response.status_code == 200, f'{combined_response.json()=}'
+    assert service.metric_calibration is not None
+    assert service.metric_calibration.observation_camera_slot == 'camera-0'
 
 
 def test_metric_status_keeps_current_descriptor_when_record_is_stale() -> None:
