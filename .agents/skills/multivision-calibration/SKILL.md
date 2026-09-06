@@ -21,6 +21,8 @@ operator runbook, not a second implementation of calibration.
 - Keep the service running after a successful operation.
 - A camera/projector calibration and metric surface calibration are separate
   operations. Never substitute one for the other.
+- Runtime tracking processes only cameras with a current usable calibration and
+  runs at the default 10 Hz rate.
 
 ## Start or reuse the service
 

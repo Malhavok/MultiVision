@@ -129,7 +129,7 @@ class Configuration:
     tag_dictionary: str = DEFAULT_TAG_DICTIONARY
     fiducial_groups: Mapping[str, FiducialGroup] = field(default_factory=dict)
     fiducial_history_length: int = 8
-    fiducial_tracking_rate_hz: float = 30.0
+    fiducial_tracking_rate_hz: float = 10.0
     fiducial_grace_period_seconds: float = 5.0
     fiducial_protection_margin_mm: float = 5.0
     fiducial_update_deadband_mm: float = 5.0
@@ -245,7 +245,7 @@ class Configuration:
             tag_dictionary=tag_dictionary,
             fiducial_groups=fiducial_groups,
             fiducial_history_length=data.get('fiducial_history_length', 8),
-            fiducial_tracking_rate_hz=data.get('fiducial_tracking_rate_hz', 30.0),
+            fiducial_tracking_rate_hz=data.get('fiducial_tracking_rate_hz', 10.0),
             fiducial_grace_period_seconds=data.get('fiducial_grace_period_seconds', 5.0),
             fiducial_protection_margin_mm=data.get(
                 'fiducial_protection_margin_mm',

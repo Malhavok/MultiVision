@@ -758,7 +758,7 @@ supported marker families and replace the example sizes with measured values:
     "tokens": {"dictionary": "DICT_APRILTAG_36h11", "marker_size_mm": 25.0}
   },
   "fiducial_history_length": 8,
-  "fiducial_tracking_rate_hz": 30.0,
+  "fiducial_tracking_rate_hz": 10.0,
   "fiducial_grace_period_seconds": 5.0,
   "fiducial_protection_margin_mm": 5.0,
   "preview_mode": "active",

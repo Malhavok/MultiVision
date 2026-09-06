@@ -41,7 +41,7 @@ The new validated startup values are:
 | Field | Default | Accepted values |
 | --- | ---: | --- |
 | `fiducial_history_length` | `8` | positive integer, at most `32` |
-| `fiducial_tracking_rate_hz` | `30.0` | finite `1.0..60.0` |
+| `fiducial_tracking_rate_hz` | `10.0` | finite `1.0..60.0` |
 | `fiducial_grace_period_seconds` | `5.0` | finite `0.1..60.0` |
 | `fiducial_protection_margin_mm` | `5.0` | finite `0.1..1000.0` |
 | `max_batch_operations` | `100` | positive integer, at most `1000` |

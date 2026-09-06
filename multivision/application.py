@@ -1403,7 +1403,7 @@ class MultiVisionService:
             tuple(
                 camera_slot
                 for camera_slot, state in camera_states.items()
-                if state.is_available and state.is_open
+                if state.is_available and state.is_open and state.is_calibrated
             ),
         )
         if len(frames_by_camera) > 0:

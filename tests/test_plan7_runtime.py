@@ -211,6 +211,34 @@ def test_tracking_worker_uses_retained_frames_and_all_configured_groups() -> Non
     }, f'{service.spatial_state=}'
 
 
+def test_tracking_cycle_requests_only_calibrated_cameras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _Runtime()
+    runtime.registry = SessionCameraRegistry.from_devices(
+        [
+            DeviceInfo('device-0', 'Camera 0', 0, Resolution(640, 480)),
+            DeviceInfo('device-1', 'Camera 1', 1, Resolution(640, 480)),
+        ],
+    )
+    service = _make_service(runtime, [])
+    requested_camera_slots: list[tuple[str, ...]] = []
+
+    def capture_tracking_frames(camera_slots: tuple[str, ...]) -> dict[str, Frame]:
+        requested_camera_slots.append(camera_slots)
+        return {}
+
+    monkeypatch.setattr(
+        service,
+        '_get_tracking_frames',
+        capture_tracking_frames,
+    )
+
+    service._get_tracking_cycle()
+
+    assert requested_camera_slots == [('camera-0',)], f'{requested_camera_slots=}'
+
+
 def test_newer_tracking_cycle_wins_when_cycles_overlap() -> None:
     runtime = _Runtime()
     service = _make_service(runtime, [])

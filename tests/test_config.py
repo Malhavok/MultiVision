@@ -19,7 +19,7 @@ def test_realtime_configuration_defaults() -> None:
 
     assert configuration.fiducial_groups == {}, f'{configuration.fiducial_groups=}'
     assert configuration.fiducial_history_length == 8, f'{configuration=}'
-    assert configuration.fiducial_tracking_rate_hz == 30.0, f'{configuration=}'
+    assert configuration.fiducial_tracking_rate_hz == 10.0, f'{configuration=}'
     assert configuration.fiducial_grace_period_seconds == 5.0, f'{configuration=}'
     assert configuration.fiducial_protection_margin_mm == 5.0, f'{configuration=}'
     assert configuration.max_batch_operations == 100, f'{configuration=}'
