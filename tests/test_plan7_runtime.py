@@ -25,7 +25,7 @@ from multivision.metric import MetricCalibrationStatus
 from multivision.overlays import ArrowRequest
 from multivision.server import ApiServerRuntime
 from multivision.session import SessionCameraRegistry
-from multivision.spatial import SpatialState, SpatialTracker
+from multivision.spatial import CameraGeneration, SpatialState, SpatialTracker
 from multivision.types import (
     CalibrationStatus,
     CameraStatus,
@@ -192,6 +192,93 @@ def test_status_polling_does_not_clear_other_spatial_authority() -> None:
     assert service._get_calibration_status(status) is CalibrationStatus.UNCALIBRATED
     assert service._spatial_state.metric_calibration is authority, (
         f'{service._spatial_state=}'
+    )
+
+
+def test_status_polling_preserves_spatial_authority_for_other_cameras() -> None:
+    runtime = _Runtime()
+    service = _make_service(runtime, [])
+    authority = service.metric_calibration_registry.get_record()
+    assert authority is not None, f'{authority=}'
+    identity = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    observations = (
+        build_fiducial_observation(
+            DetectedMarker(
+                4,
+                (
+                    Point2D(10, 10),
+                    Point2D(20, 10),
+                    Point2D(20, 20),
+                    Point2D(10, 20),
+                ),
+            ),
+            'alpha',
+            10.0,
+            identity,
+            camera_slot='camera-0',
+            camera_calibration_generation=1,
+            frame_counter=1,
+            received_monotonic_seconds=time.monotonic(),
+            metric_calibration=authority,
+        ),
+        build_fiducial_observation(
+            DetectedMarker(
+                5,
+                (
+                    Point2D(30, 30),
+                    Point2D(40, 30),
+                    Point2D(40, 40),
+                    Point2D(30, 40),
+                ),
+            ),
+            'beta',
+            10.0,
+            identity,
+            camera_slot='camera-1',
+            camera_calibration_generation=1,
+            frame_counter=1,
+            received_monotonic_seconds=time.monotonic(),
+            metric_calibration=authority,
+        ),
+    )
+    spatial_state = service.spatial_tracker.update(
+        observations,
+        metric_calibration=authority,
+        camera_states={
+            'camera-0': CameraGeneration(0, 1),
+            'camera-1': CameraGeneration(0, 1),
+        },
+    )
+    service._spatial_state = spatial_state
+    service._tracker_published_spatial_state = spatial_state
+    unavailable_status = CameraStatus(
+        'camera-0',
+        'device-0',
+        RuntimeStatus.UNAVAILABLE,
+        CalibrationStatus.UNCALIBRATED,
+        Resolution(640, 480),
+        1,
+    )
+
+    with patch.object(runtime, 'get_status', return_value=unavailable_status):
+        service.get_camera_status('camera-0')
+    runtime.get_statuses = lambda: [unavailable_status]  # type: ignore[attr-defined]
+    service.get_camera_statuses()
+
+    assert service.spatial_state.get_observation('beta', 5) is not None, (
+        f'{service.spatial_state=}'
+    )
+    assert service.spatial_state.metric_calibration is authority, (
+        f'{service.spatial_state=}'
+    )
+
+    service.close_camera('camera-0')
+
+    assert service.spatial_state.get_observation('beta', 5) is not None, (
+        f'{service.spatial_state=}'
+    )
+    assert service.spatial_state.metric_calibration is authority, (
+        f'{service.spatial_state=}'
     )
 
 

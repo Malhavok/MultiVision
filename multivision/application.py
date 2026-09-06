@@ -1591,7 +1591,6 @@ class MultiVisionService:
             _validate_camera_status(runtime_status, resolved_slot)
             if runtime_status.runtime_status is not RuntimeStatus.AVAILABLE:
                 self.overlay_registry.invalidate_camera(resolved_slot)
-                self._invalidate_spatial_state()
             calibration_status = self._get_calibration_status(runtime_status)
             return runtime_status._replace(calibration_status=calibration_status)
 
@@ -1620,7 +1619,6 @@ class MultiVisionService:
                     self.overlay_registry.invalidate_camera(
                         self._resolve_camera_reference(status.logical_name),
                     )
-                    self._invalidate_spatial_state()
                 calibration_status = self._get_calibration_status(status)
                 checked_statuses.append(status._replace(calibration_status=calibration_status))
             return checked_statuses
@@ -1828,7 +1826,7 @@ class MultiVisionService:
         with self._camera_management_lock:
             # Reject an in-flight detector before the runtime releases its handle.
             self.overlay_registry.invalidate_camera(slot_id)
-            self._invalidate_spatial_state()
+            self._invalidate_spatial_camera(slot_id)
             self.point_service.clear_overlay_for_camera(slot_id)
             camera = self.camera_runtime.close_camera(slot_id)
             if not isinstance(camera, SessionCamera):
@@ -1843,7 +1841,7 @@ class MultiVisionService:
         """Reopen one closed session slot with fresh spatial state."""
         with self._camera_management_lock:
             self.overlay_registry.invalidate_camera(slot_id)
-            self._invalidate_spatial_state()
+            self._invalidate_spatial_camera(slot_id)
             self.point_service.clear_overlay_for_camera(slot_id)
             camera = self.camera_runtime.open_camera(slot_id)
             if not isinstance(camera, SessionCamera):
@@ -2112,7 +2110,7 @@ class MultiVisionService:
             )
             for camera_id in sorted(camera_dependencies - camera_authorities.keys()):
                 self.overlay_registry.invalidate_camera(camera_id)
-                self._invalidate_spatial_state()
+                self._invalidate_spatial_camera(camera_id)
         metric_is_usable = self.metric_calibration_registry.is_usable(
             self._projector_output_descriptor,
         )
@@ -2303,7 +2301,15 @@ class MultiVisionService:
                     self._projector_output_descriptor,
                 )
                 if current_states != dict(spatial_state.camera_generations):
-                    self._invalidate_spatial_state()
+                    changed_camera_slots = set(current_states) | set(
+                        spatial_state.camera_generations,
+                    )
+                    for camera_slot in sorted(changed_camera_slots):
+                        if current_states.get(camera_slot) == spatial_state.camera_generations.get(
+                            camera_slot,
+                        ):
+                            continue
+                        self._invalidate_spatial_camera(camera_slot)
                     return
         if spatial_state.metric_calibration is not None and not self.metric_calibration_registry.is_usable(
             self._projector_output_descriptor,
@@ -2325,6 +2331,15 @@ class MultiVisionService:
                     generation=spatial_state.generation + 1,
                 )
                 self._tracker_published_spatial_state = None
+
+    def _invalidate_spatial_camera(self, camera_slot: str) -> None:
+        """Drop one camera's spatial evidence while preserving other authorities."""
+        with self._tracking_control_lock:
+            self._tracking_generation += 1
+            spatial_state = self._spatial_tracker.invalidate_camera(camera_slot)
+            with self._render_state_lock:
+                self._spatial_state = spatial_state
+                self._tracker_published_spatial_state = spatial_state
 
     def _invalidate_spatial_state(self) -> None:
         """Invalidate spatial evidence and reject every in-flight tracking pass."""
@@ -2820,7 +2835,7 @@ class MultiVisionService:
     def _clear_area_before_calibration(self, logical_name: str) -> None:
         resolved_slot = self._resolve_camera_reference(logical_name)
         self.overlay_registry.invalidate_camera(resolved_slot)
-        self._invalidate_spatial_state()
+        self._invalidate_spatial_camera(resolved_slot)
         session_camera = self._get_session_camera(resolved_slot)
         if session_camera is None or not session_camera.area_enabled:
             return
@@ -3464,7 +3479,7 @@ class MultiVisionService:
         calibration: PersistedCalibration,
     ) -> None:
         self.overlay_registry.invalidate_camera(slot_id)
-        self._invalidate_spatial_state()
+        self._invalidate_spatial_camera(slot_id)
         set_calibration = getattr(self.camera_runtime, 'set_calibration', None)
         if not callable(set_calibration):
             raise SessionCameraError(
