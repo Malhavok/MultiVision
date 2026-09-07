@@ -378,6 +378,37 @@ class CliTest(unittest.TestCase):
             'http://service.test/overlays/id/123e4567-e89b-42d3-a456-426614174000'
         )
 
+    def test_overlay_batch_rejects_missing_kind_before_http(self) -> None:
+        requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
+        client = MultiVisionClient(
+            'http://service.test',
+            request_sender=lambda method, url, payload, timeout: (
+                requests.append((method, url, payload, timeout))
+                or ServiceResponse(200, 'application/json', b'{}')
+            ),
+        )
+        batch_spec = {
+            'operations': [
+                {
+                    'op': 'create',
+                    'request': {
+                        'start': {'space': 'projector_px', 'x': 1, 'y': 2},
+                        'end': {'space': 'projector_px', 'x': 90, 'y': 70},
+                    },
+                },
+            ],
+        }
+        error_output = io.StringIO()
+        with redirect_stderr(error_output):
+            result = main(
+                ['overlays', 'batch', '--spec-json', json.dumps(batch_spec)],
+                client,
+            )
+
+        assert result == 1
+        assert 'request.kind is required' in error_output.getvalue()
+        assert requests == [], f'{requests=}'
+
     def test_intensity_and_spatial_inspection_commands_delegate_to_http(self) -> None:
         requests: list[tuple[str, str, dict[str, Any] | None, float]] = []
 

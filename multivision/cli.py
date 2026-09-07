@@ -23,6 +23,7 @@ from multivision.calibration_document import (
 
 DEFAULT_SERVICE_URL = 'http://127.0.0.1:8000'
 DEFAULT_TIMEOUT_SECONDS = 30.0
+OVERLAY_KINDS = ('grid', 'circle', 'rect', 'text', 'line', 'ruler', 'arrow')
 
 
 class ServiceResponse(NamedTuple):
@@ -383,7 +384,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     clear_parser = overlay_subparsers.add_parser('clear', help='clear the current overlay')
     clear_parser.set_defaults(command_handler='overlay_clear')
-    for overlay_kind in ('grid', 'circle', 'rect', 'text', 'line', 'ruler', 'arrow'):
+    for overlay_kind in OVERLAY_KINDS:
         create_overlay_parser = overlay_subparsers.add_parser(
             overlay_kind,
             help=f'create a {overlay_kind} overlay',
@@ -934,7 +935,8 @@ def _overlays_batch(
     client: MultiVisionClient,
     arguments: argparse.Namespace,
 ) -> ServiceResponse:
-    return client.apply_overlay_batch(arguments.spec_json)
+    specification = _validate_overlay_batch_spec(arguments.spec_json)
+    return client.apply_overlay_batch(specification)
 
 
 def _intensity_get(
@@ -986,6 +988,45 @@ def _spatial_state(
     _arguments: argparse.Namespace,
 ) -> ServiceResponse:
     return client.get_spatial_state()
+
+
+def _validate_overlay_batch_spec(specification: dict[str, Any]) -> dict[str, Any]:
+    operations = specification.get('operations')
+    if not isinstance(operations, list) or len(operations) == 0:
+        raise ValueError('Invalid overlay batch: operations must be a non-empty list')
+
+    for operation_idx, operation in enumerate(operations):
+        if not isinstance(operation, dict):
+            raise ValueError(
+                f'Invalid overlay batch operation {operation_idx}: must be an object',
+            )
+        operation_name = operation.get('op')
+        if operation_name == 'remove':
+            continue
+        if operation_name not in ('create', 'update'):
+            raise ValueError(
+                f'Invalid overlay batch operation {operation_idx}: '
+                'op must be create, update or remove',
+            )
+        request = operation.get('request')
+        if not isinstance(request, dict):
+            raise ValueError(
+                f'Invalid overlay batch operation {operation_idx}: '
+                'request must be an object',
+            )
+        overlay_kind = request.get('kind')
+        if not isinstance(overlay_kind, str):
+            raise ValueError(
+                f'Invalid overlay batch operation {operation_idx}: '
+                'request.kind is required',
+            )
+        if overlay_kind not in OVERLAY_KINDS:
+            raise ValueError(
+                f'Invalid overlay batch operation {operation_idx}: '
+                f'unknown request.kind {overlay_kind!r}',
+            )
+
+    return specification
 
 
 def _validate_overlay_spec(
